@@ -178,7 +178,7 @@ def pace_line(w: dict, total_sec: int) -> str:
     projected = pct / frac           # estimated usage at end of window
 
     if projected <= 75:
-        icon, verdict = "🟢", f"偏慢可加速"
+        icon, verdict = "🔴", f"偏慢可加速"
     elif projected <= 100:
         icon, verdict = "🟢", f"节奏正常"
     elif projected <= 120:
