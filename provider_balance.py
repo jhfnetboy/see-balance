@@ -158,14 +158,8 @@ def today_target_line(w: dict, baseline_pct, fixed_daily_target=None) -> str:
     else:
         status = "进度正常"
 
-    if baseline_pct is not None:
-        today_used = max(0.0, pct - float(baseline_pct)) if pct >= float(baseline_pct) else pct
-        today_str  = f"  今日已用{today_used:.1f}%"
-    else:
-        today_str = ""
-
     return (f"     进度应达  {target_now:5.1f}%  {bar}"
-            f"  日均+{daily_rate:.1f}%  {status}{today_str}")
+            f"  日均+{daily_rate:.1f}%  {status}")
 
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
