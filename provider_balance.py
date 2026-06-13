@@ -127,6 +127,35 @@ def window_pct_bar(w):
     bar   = "█" * bar_n + "░" * (20 - bar_n)
     return f"{pct:5.1f}%  {bar}  {reset}"
 
+def pace_line(w: dict, total_sec: int) -> str:
+    """Return a pace-assessment line for a rate-limited usage window.
+
+    Compares actual usage against how much should have been used given elapsed
+    time, then projects what the final usage will be at the current rate.
+    """
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return ""
+    pct      = float(w["pct"])
+    remaining = max(0.0, w["reset_at"] - time.time())
+    elapsed   = max(0.0, total_sec - remaining)
+    if elapsed < total_sec * 0.05:   # < 5% elapsed — too early to judge
+        return ""
+    frac      = elapsed / total_sec
+    projected = pct / frac           # estimated usage at end of window
+
+    if projected <= 75:
+        icon, verdict = "🟢", f"偏慢可加速"
+    elif projected <= 100:
+        icon, verdict = "🟢", f"节奏正常"
+    elif projected <= 120:
+        icon, verdict = "🟡", f"偏快需注意"
+    else:
+        icon, verdict = "🔴", f"超速需节约"
+
+    return (f"       {icon} {verdict}"
+            f"  已过{frac*100:.0f}%时间 用了{pct:.1f}%"
+            f"  预计到期用{projected:.0f}%")
+
 def parse_reset(value):
     if value is None: return None
     if isinstance(value, (int, float)): return int(value)
@@ -315,7 +344,11 @@ def render_all(ds, cx, cl, prev_snap):
     else:
         if cx.get("plan"): lines.append(f"     plan        {cx['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
+        p = pace_line(cx.get("five_hour", {}), 5 * 3600)
+        if p: lines.append(p)
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
+        p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
+        if p: lines.append(p)
     lines.append("")
 
     lines.append("  🟣 Claude Code")
@@ -324,7 +357,11 @@ def render_all(ds, cx, cl, prev_snap):
     else:
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
+        p = pace_line(cl.get("five_hour", {}), 5 * 3600)
+        if p: lines.append(p)
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
+        p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
+        if p: lines.append(p)
     lines.append("")
     lines.append("═" * 54)
     return "\n".join(lines)
@@ -346,6 +383,7 @@ def render_compact(data, prev_snap):
                 parts.append(f"(spent {spent} CNY ≈ ${round(spent*0.14,6)})")
         print("  ".join(parts))
 
+    totals = {"five_hour": 5 * 3600, "weekly": 7 * 24 * 3600}
     for label, provider in [("CX", cx), ("CL", cl)]:
         if "error" in provider:
             print(f"{label} ⚠ {provider['error']}")
@@ -356,7 +394,9 @@ def render_compact(data, prev_snap):
                 w = provider.get(key)
                 if w:
                     mins = max(0, int((w["reset_at"] - time.time()) / 60)) if w.get("reset_at") else 0
-                    parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m reset)")
+                    p    = pace_line(w, totals[key])
+                    pace = ("  " + p.strip()) if p else ""
+                    parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m reset){pace}")
             print("  ".join(parts))
 
 # ── Main ──────────────────────────────────────────────────────────────────────
