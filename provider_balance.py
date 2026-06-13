@@ -163,13 +163,21 @@ def today_target_line(w: dict, baseline_pct, fixed_daily_target=None) -> str:
     bar_n = int(round(fill_pct / 5))
     bar   = "█" * bar_n + "░" * (20 - bar_n)
 
-    deficit_str = (f"滞后{deficit:.1f}%" if deficit > 1.0
-                   else f"超前{abs(deficit):.1f}%" if deficit < -1.0
-                   else "节奏准确")
+    if baseline_pct is not None:
+        remaining_today = target_today - pct
+        if remaining_today > 0.5:
+            status = f"还需{remaining_today:.1f}%"
+        elif remaining_today < -0.5:
+            status = f"已超{abs(remaining_today):.1f}% ✓"
+        else:
+            status = "今日达标 ✓"
+    else:
+        status = ""
 
     return (f"     今日应达  {target_today:5.1f}%  {bar}"
-            f"  日增+{daily_target:.1f}%  {deficit_str}"
-            + (f"  今日已用{today_used:.1f}%" if baseline_pct is not None else ""))
+            f"  日增+{daily_target:.1f}%  今日已用{today_used:.1f}%  {status}".rstrip()
+            if baseline_pct is not None else
+            f"     今日应达  {target_today:5.1f}%  {bar}  日增+{daily_target:.1f}%")
 
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
