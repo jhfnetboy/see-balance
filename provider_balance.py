@@ -127,6 +127,40 @@ def window_pct_bar(w):
     bar   = "█" * bar_n + "░" * (20 - bar_n)
     return f"{pct:5.1f}%  {bar}  {reset}"
 
+def daily_line_7d(w: dict, baseline_pct) -> str:
+    """Daily target / today-used / gap for a 7-day window."""
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return ""
+    pct            = float(w["pct"])
+    remaining_sec  = max(0.0, w["reset_at"] - time.time())
+    remaining_days = remaining_sec / 86400
+    if remaining_days < 0.05:
+        return ""
+    daily_target = max(0.0, 100.0 - pct) / remaining_days
+    parts = [f"📅 每日需用 {daily_target:.1f}%"]
+
+    if baseline_pct is not None:
+        today_used = round(pct - baseline_pct, 1) if pct >= baseline_pct else round(pct, 1)
+        gap        = daily_target - today_used
+        parts.append(f"今日已用 {today_used:.1f}%")
+        parts.append(f"还差 {gap:.1f}%" if gap > 0.5
+                     else ("超出 {:.1f}% ✓".format(abs(gap)) if gap < -0.5 else "已达标 ✓"))
+    return "       " + "  ".join(parts)
+
+def daily_line_5h(w: dict) -> str:
+    """Per-hour target for a 5-hour window (resets too often for daily tracking)."""
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return ""
+    remaining_sec = max(0.0, w["reset_at"] - time.time())
+    remaining_h   = remaining_sec / 3600
+    if remaining_h < 0.5:        # < 30 min left — not actionable
+        return ""
+    remaining_pct = max(0.0, 100.0 - float(w["pct"]))
+    hourly_target = remaining_pct / remaining_h
+    if hourly_target > 100:      # impossible — window nearly exhausted
+        return ""
+    return f"       📅 每小时需用 {hourly_target:.1f}%  (剩余 {remaining_h:.1f}h)"
+
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
 
@@ -320,7 +354,7 @@ def fetch_claude():
 
 # ── Render ────────────────────────────────────────────────────────────────────
 
-def render_all(ds, cx, cl, prev_snap):
+def render_all(ds, cx, cl, prev_snap, today_bl: dict):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
 
@@ -346,9 +380,13 @@ def render_all(ds, cx, cl, prev_snap):
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
         p = pace_line(cx.get("five_hour", {}), 5 * 3600)
         if p: lines.append(p)
+        d = daily_line_5h(cx.get("five_hour", {}))
+        if d: lines.append(d)
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
         p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
+        d = daily_line_7d(cx.get("weekly", {}), today_bl.get("codex_weekly"))
+        if d: lines.append(d)
     lines.append("")
 
     lines.append("  🟣 Claude Code")
@@ -359,14 +397,18 @@ def render_all(ds, cx, cl, prev_snap):
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
         p = pace_line(cl.get("five_hour", {}), 5 * 3600)
         if p: lines.append(p)
+        d = daily_line_5h(cl.get("five_hour", {}))
+        if d: lines.append(d)
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
+        d = daily_line_7d(cl.get("weekly", {}), today_bl.get("claude_weekly"))
+        if d: lines.append(d)
     lines.append("")
     lines.append("═" * 54)
     return "\n".join(lines)
 
-def render_compact(data, prev_snap):
+def render_compact(data, prev_snap, today_bl: dict):
     ds = data.get("deepseek", {})
     cx = data.get("codex", {})
     cl = data.get("claude", {})
@@ -383,8 +425,10 @@ def render_compact(data, prev_snap):
                 parts.append(f"(spent {spent} CNY ≈ ${round(spent*0.14,6)})")
         print("  ".join(parts))
 
-    totals = {"five_hour": 5 * 3600, "weekly": 7 * 24 * 3600}
-    for label, provider in [("CX", cx), ("CL", cl)]:
+    totals    = {"five_hour": 5 * 3600, "weekly": 7 * 24 * 3600}
+    bl_keys   = {"codex": "codex", "claude": "claude"}
+    providers = [("CX", cx, "codex"), ("CL", cl, "claude")]
+    for label, provider, pkey in providers:
         if "error" in provider:
             print(f"{label} ⚠ {provider['error']}")
         else:
@@ -395,8 +439,11 @@ def render_compact(data, prev_snap):
                 if w:
                     mins = max(0, int((w["reset_at"] - time.time()) / 60)) if w.get("reset_at") else 0
                     p    = pace_line(w, totals[key])
-                    pace = ("  " + p.strip()) if p else ""
-                    parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m reset){pace}")
+                    pace = (" " + p.strip()) if p else ""
+                    if key == "weekly":
+                        d = daily_line_7d(w, today_bl.get(f"{pkey}_weekly"))
+                        pace += (" " + d.strip()) if d else ""
+                    parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}")
             print("  ".join(parts))
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -423,19 +470,40 @@ def main():
                 interval_min = int(float(args[idx + 1]))
         except: pass
 
-    state = {"prev_snap": load_state()}
+    state = {"full": load_state()}
 
     def do_query():
-        prev = state["prev_snap"]
-        data = collect()
-        save_state(data)
+        full      = state["full"]
+        prev_data = {k: full[k] for k in ("deepseek", "codex", "claude") if k in full}
+        data      = collect()
+
+        # ── Daily baselines ───────────────────────────────────────────────────
+        today     = datetime.now().strftime("%Y-%m-%d")
+        baselines = full.get("daily_baselines", {})
+        if today not in baselines:
+            entry = {}
+            for prov in ("codex", "claude"):
+                for win in ("five_hour", "weekly"):
+                    pct = data.get(prov, {}).get(win, {}).get("pct")
+                    if pct is not None:
+                        entry[f"{prov}_{win}"] = float(pct)
+            baselines[today] = entry
+            for old in sorted(baselines)[:-7]:   # keep 7 days
+                del baselines[old]
+
+        to_save = dict(data)
+        to_save["daily_baselines"] = baselines
+        save_state(to_save)
+        state["full"] = to_save
+
+        today_bl = baselines.get(today, {})
+
         if json_mode:
             print(json.dumps(data, indent=2, ensure_ascii=False))
         elif compact:
-            render_compact(data, prev)
+            render_compact(data, prev_data, today_bl)
         else:
-            print(render_all(data["deepseek"], data["codex"], data["claude"], prev))
-        state["prev_snap"] = data
+            print(render_all(data["deepseek"], data["codex"], data["claude"], prev_data, today_bl))
 
     do_query()
 
@@ -444,7 +512,7 @@ def main():
         try:
             while True:
                 time.sleep(interval_min * 60)
-                state["prev_snap"] = load_state()
+                state["full"] = load_state()
                 do_query()
         except KeyboardInterrupt:
             print("\n👋 Stopped.")
