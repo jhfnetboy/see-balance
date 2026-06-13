@@ -127,8 +127,8 @@ def window_pct_bar(w):
     bar   = "█" * bar_n + "░" * (20 - bar_n)
     return f"{pct:5.1f}%  {bar}  {reset}"
 
-def daily_line_7d(w: dict, baseline_pct) -> str:
-    """Daily target / today-used / gap for a 7-day window."""
+def today_target_line(w: dict, baseline_pct) -> str:
+    """Third row: 今日应达 X%  [bar]  日增+Y%  deficit — same format as 5h/7d rows."""
     if not w or w.get("pct") is None or not w.get("reset_at"):
         return ""
     pct            = float(w["pct"])
@@ -136,30 +136,30 @@ def daily_line_7d(w: dict, baseline_pct) -> str:
     remaining_days = remaining_sec / 86400
     if remaining_days < 0.05:
         return ""
-    daily_target = max(0.0, 100.0 - pct) / remaining_days
-    parts = [f"📅 每日需用 {daily_target:.1f}%"]
 
+    total_sec     = 7 * 24 * 3600
+    elapsed_frac  = max(0.0, (total_sec - remaining_sec) / total_sec)
+    daily_target  = max(0.0, 100.0 - pct) / remaining_days  # daily increment needed
+    target_today  = pct + daily_target                        # cumulative % by end of today
+    deficit       = elapsed_frac * 100 - pct                 # positive = behind
+
+    # Bar: today_used / daily_target (how much of today's quota done)
     if baseline_pct is not None:
-        today_used = round(pct - baseline_pct, 1) if pct >= baseline_pct else round(pct, 1)
-        gap        = daily_target - today_used
-        parts.append(f"今日已用 {today_used:.1f}%")
-        parts.append(f"还差 {gap:.1f}%" if gap > 0.5
-                     else ("超出 {:.1f}% ✓".format(abs(gap)) if gap < -0.5 else "已达标 ✓"))
-    return "       " + "  ".join(parts)
+        today_used = max(0.0, pct - float(baseline_pct)) if pct >= float(baseline_pct) else pct
+        fill_pct   = min(100.0, (today_used / daily_target * 100) if daily_target > 0 else 0)
+    else:
+        today_used = 0.0
+        fill_pct   = 0.0
+    bar_n = int(round(fill_pct / 5))
+    bar   = "█" * bar_n + "░" * (20 - bar_n)
 
-def daily_line_5h(w: dict) -> str:
-    """Per-hour target for a 5-hour window (resets too often for daily tracking)."""
-    if not w or w.get("pct") is None or not w.get("reset_at"):
-        return ""
-    remaining_sec = max(0.0, w["reset_at"] - time.time())
-    remaining_h   = remaining_sec / 3600
-    if remaining_h < 0.5:        # < 30 min left — not actionable
-        return ""
-    remaining_pct = max(0.0, 100.0 - float(w["pct"]))
-    hourly_target = remaining_pct / remaining_h
-    if hourly_target > 100:      # impossible — window nearly exhausted
-        return ""
-    return f"       📅 每小时需用 {hourly_target:.1f}%  (剩余 {remaining_h:.1f}h)"
+    deficit_str = (f"滞后{deficit:.1f}%" if deficit > 1.0
+                   else f"超前{abs(deficit):.1f}%" if deficit < -1.0
+                   else "节奏准确")
+
+    return (f"     今日应达  {target_today:5.1f}%  {bar}"
+            f"  日增+{daily_target:.1f}%  {deficit_str}"
+            + (f"  今日已用{today_used:.1f}%" if baseline_pct is not None else ""))
 
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
@@ -380,12 +380,10 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
         p = pace_line(cx.get("five_hour", {}), 5 * 3600)
         if p: lines.append(p)
-        d = daily_line_5h(cx.get("five_hour", {}))
-        if d: lines.append(d)
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
         p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
-        d = daily_line_7d(cx.get("weekly", {}), today_bl.get("codex_weekly"))
+        d = today_target_line(cx.get("weekly", {}), today_bl.get("codex_weekly"))
         if d: lines.append(d)
     lines.append("")
 
@@ -397,12 +395,10 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
         p = pace_line(cl.get("five_hour", {}), 5 * 3600)
         if p: lines.append(p)
-        d = daily_line_5h(cl.get("five_hour", {}))
-        if d: lines.append(d)
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
-        d = daily_line_7d(cl.get("weekly", {}), today_bl.get("claude_weekly"))
+        d = today_target_line(cl.get("weekly", {}), today_bl.get("claude_weekly"))
         if d: lines.append(d)
     lines.append("")
     lines.append("═" * 54)
@@ -441,7 +437,7 @@ def render_compact(data, prev_snap, today_bl: dict):
                     p    = pace_line(w, totals[key])
                     pace = (" " + p.strip()) if p else ""
                     if key == "weekly":
-                        d = daily_line_7d(w, today_bl.get(f"{pkey}_weekly"))
+                        d = today_target_line(w, today_bl.get(f"{pkey}_weekly"))
                         pace += (" " + d.strip()) if d else ""
                     parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}")
             print("  ".join(parts))
