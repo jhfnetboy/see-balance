@@ -378,8 +378,6 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
     else:
         if cx.get("plan"): lines.append(f"     plan        {cx['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
-        p = pace_line(cx.get("five_hour", {}), 5 * 3600)
-        if p: lines.append(p)
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
         p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
@@ -393,8 +391,6 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
     else:
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
-        p = pace_line(cl.get("five_hour", {}), 5 * 3600)
-        if p: lines.append(p)
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
