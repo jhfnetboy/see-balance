@@ -128,56 +128,44 @@ def window_pct_bar(w):
     return f"{pct:5.1f}%  {bar}  {reset}"
 
 def today_target_line(w: dict, baseline_pct, fixed_daily_target=None) -> str:
-    """Third row: 今日应达 X%  [bar]  日增+Y%  deficit — same format as 5h/7d rows.
+    """Third row: 进度应达 = elapsed_frac × 100% (linear schedule position right now).
 
-    target_today is anchored to the day's first query (fixed_daily_target from baseline)
-    so it doesn't drift as the user consumes quota throughout the day.
+    Tells you where you *should* be on a straight 100%/7d curve.
+    Completely independent of actual usage or baseline.
     """
     if not w or w.get("pct") is None or not w.get("reset_at"):
         return ""
     pct           = float(w["pct"])
     remaining_sec = max(0.0, w["reset_at"] - time.time())
-    remaining_days = remaining_sec / 86400
-    if remaining_days < 0.05:
+    total_sec     = 7 * 24 * 3600
+    if remaining_sec > total_sec * 0.99:
         return ""
 
-    total_sec    = 7 * 24 * 3600
     elapsed_frac = max(0.0, (total_sec - remaining_sec) / total_sec)
-    deficit      = elapsed_frac * 100 - pct   # positive = behind
+    target_now   = elapsed_frac * 100          # linear schedule: should be here right now
+    daily_rate   = 100.0 / 7                   # 14.28% per day
 
-    # Use today's fixed daily_target from baseline so target_today stays stable all day
-    if fixed_daily_target is not None and baseline_pct is not None:
-        daily_target = float(fixed_daily_target)
-        target_today = float(baseline_pct) + daily_target
-    else:
-        daily_target = max(0.0, 100.0 - pct) / remaining_days
-        target_today = pct + daily_target
-
-    # Bar: today_used / daily_target
-    if baseline_pct is not None:
-        today_used = max(0.0, pct - float(baseline_pct)) if pct >= float(baseline_pct) else pct
-        fill_pct   = min(100.0, (today_used / daily_target * 100) if daily_target > 0 else 0)
-    else:
-        today_used = 0.0
-        fill_pct   = 0.0
+    # Bar: current_pct vs target_now (full bar = on or ahead of schedule)
+    fill_pct = min(100.0, (pct / target_now * 100) if target_now > 0 else 100.0)
     bar_n = int(round(fill_pct / 5))
     bar   = "█" * bar_n + "░" * (20 - bar_n)
 
-    if baseline_pct is not None:
-        remaining_today = target_today - pct
-        if remaining_today > 0.5:
-            status = f"还需{remaining_today:.1f}%"
-        elif remaining_today < -0.5:
-            status = f"已超{abs(remaining_today):.1f}% ✓"
-        else:
-            status = "今日达标 ✓"
+    diff = pct - target_now
+    if diff > 1.0:
+        status = f"超前{diff:.1f}% ✓"
+    elif diff < -1.0:
+        status = f"还差{abs(diff):.1f}%"
     else:
-        status = ""
+        status = "进度正常"
 
-    return (f"     今日应达  {target_today:5.1f}%  {bar}"
-            f"  日增+{daily_target:.1f}%  今日已用{today_used:.1f}%  {status}".rstrip()
-            if baseline_pct is not None else
-            f"     今日应达  {target_today:5.1f}%  {bar}  日增+{daily_target:.1f}%")
+    if baseline_pct is not None:
+        today_used = max(0.0, pct - float(baseline_pct)) if pct >= float(baseline_pct) else pct
+        today_str  = f"  今日已用{today_used:.1f}%"
+    else:
+        today_str = ""
+
+    return (f"     进度应达  {target_now:5.1f}%  {bar}"
+            f"  日均+{daily_rate:.1f}%  {status}{today_str}")
 
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
