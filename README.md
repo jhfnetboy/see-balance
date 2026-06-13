@@ -43,23 +43,13 @@ python3 ~/bin/provider_balance.py --json       # 原始 JSON
 
 ## 输出示例
 
-```
-══════════  Provider Balance  •  2025-06-13 11:30:00  ══════════
+![screenshot](screenshot.jpg)
 
-  🔵 DeepSeek API
-     status      ✓ online
-     CNY left    42.50   (topped_up: 40.00  granted: 2.50)
-
-  🟢 Codex (Plus)
-     5h used      23.4%  ████░░░░░░░░░░░░░░░░  resets in 2h15m
-     7d used       8.1%  █░░░░░░░░░░░░░░░░░░░  resets in 4d12h00m
-
-  🟣 Claude Code
-     5h used      45.0%  █████████░░░░░░░░░░░  resets in 1h30m
-     7d used      31.2%  ██████░░░░░░░░░░░░░░  resets in 5d08h00m
-
-══════════════════════════════════════════════════════
-```
+每个 provider 显示三行进度条：
+- **5h used** — 5小时窗口用量
+- **7d used** — 7天窗口用量
+- **今日应达** — 今日结束时的累计目标（已含亏欠补偿）+ 今日进度
+- 节奏评估：🟢 节奏正常 / 🟡 偏快需注意 / 🔴 超速需节约 / 🔴 偏慢可加速
 
 ## 状态缓存
 
