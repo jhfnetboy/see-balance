@@ -127,23 +127,33 @@ def window_pct_bar(w):
     bar   = "█" * bar_n + "░" * (20 - bar_n)
     return f"{pct:5.1f}%  {bar}  {reset}"
 
-def today_target_line(w: dict, baseline_pct) -> str:
-    """Third row: 今日应达 X%  [bar]  日增+Y%  deficit — same format as 5h/7d rows."""
+def today_target_line(w: dict, baseline_pct, fixed_daily_target=None) -> str:
+    """Third row: 今日应达 X%  [bar]  日增+Y%  deficit — same format as 5h/7d rows.
+
+    target_today is anchored to the day's first query (fixed_daily_target from baseline)
+    so it doesn't drift as the user consumes quota throughout the day.
+    """
     if not w or w.get("pct") is None or not w.get("reset_at"):
         return ""
-    pct            = float(w["pct"])
-    remaining_sec  = max(0.0, w["reset_at"] - time.time())
+    pct           = float(w["pct"])
+    remaining_sec = max(0.0, w["reset_at"] - time.time())
     remaining_days = remaining_sec / 86400
     if remaining_days < 0.05:
         return ""
 
-    total_sec     = 7 * 24 * 3600
-    elapsed_frac  = max(0.0, (total_sec - remaining_sec) / total_sec)
-    daily_target  = max(0.0, 100.0 - pct) / remaining_days  # daily increment needed
-    target_today  = pct + daily_target                        # cumulative % by end of today
-    deficit       = elapsed_frac * 100 - pct                 # positive = behind
+    total_sec    = 7 * 24 * 3600
+    elapsed_frac = max(0.0, (total_sec - remaining_sec) / total_sec)
+    deficit      = elapsed_frac * 100 - pct   # positive = behind
 
-    # Bar: today_used / daily_target (how much of today's quota done)
+    # Use today's fixed daily_target from baseline so target_today stays stable all day
+    if fixed_daily_target is not None and baseline_pct is not None:
+        daily_target = float(fixed_daily_target)
+        target_today = float(baseline_pct) + daily_target
+    else:
+        daily_target = max(0.0, 100.0 - pct) / remaining_days
+        target_today = pct + daily_target
+
+    # Bar: today_used / daily_target
     if baseline_pct is not None:
         today_used = max(0.0, pct - float(baseline_pct)) if pct >= float(baseline_pct) else pct
         fill_pct   = min(100.0, (today_used / daily_target * 100) if daily_target > 0 else 0)
@@ -379,7 +389,7 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
         if cx.get("plan"): lines.append(f"     plan        {cx['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
-        d = today_target_line(cx.get("weekly", {}), today_bl.get("codex_weekly"))
+        d = today_target_line(cx.get("weekly", {}), today_bl.get("codex_weekly"), today_bl.get("codex_weekly_daily_target"))
         if d: lines.append(d)
         p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
@@ -392,7 +402,7 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
-        d = today_target_line(cl.get("weekly", {}), today_bl.get("claude_weekly"))
+        d = today_target_line(cl.get("weekly", {}), today_bl.get("claude_weekly"), today_bl.get("claude_weekly_daily_target"))
         if d: lines.append(d)
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
@@ -433,7 +443,7 @@ def render_compact(data, prev_snap, today_bl: dict):
                     p    = pace_line(w, totals[key])
                     pace = (" " + p.strip()) if p else ""
                     if key == "weekly":
-                        d = today_target_line(w, today_bl.get(f"{pkey}_weekly"))
+                        d = today_target_line(w, today_bl.get(f"{pkey}_weekly"), today_bl.get(f"{pkey}_weekly_daily_target"))
                         pace += (" " + d.strip()) if d else ""
                     parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}")
             print("  ".join(parts))
@@ -476,9 +486,18 @@ def main():
             entry = {}
             for prov in ("codex", "claude"):
                 for win in ("five_hour", "weekly"):
-                    pct = data.get(prov, {}).get(win, {}).get("pct")
-                    if pct is not None:
-                        entry[f"{prov}_{win}"] = float(pct)
+                    w   = data.get(prov, {}).get(win, {})
+                    pct = w.get("pct")
+                    if pct is None:
+                        continue
+                    entry[f"{prov}_{win}"] = float(pct)
+                    if win == "weekly":
+                        reset_at = w.get("reset_at")
+                        if reset_at:
+                            rd = max(0.0, (reset_at - time.time()) / 86400)
+                            if rd > 0.05:
+                                dt = max(0.0, 100.0 - float(pct)) / rd
+                                entry[f"{prov}_weekly_daily_target"] = round(dt, 2)
             baselines[today] = entry
             for old in sorted(baselines)[:-7]:   # keep 7 days
                 del baselines[old]
