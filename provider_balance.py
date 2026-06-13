@@ -158,7 +158,7 @@ def today_target_line(w: dict, baseline_pct, fixed_daily_target=None) -> str:
     else:
         status = "进度正常"
 
-    return (f"     进度应达  {target_now:5.1f}%  {bar}"
+    return (f"     进度应达    {target_now:5.1f}%  {bar}"
             f"  日均+{daily_rate:.1f}%  {status}")
 
 def pace_line(w: dict, total_sec: int) -> str:
