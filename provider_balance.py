@@ -20,7 +20,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import json, os, ssl, subprocess, sys, time
+import json, os, socket, ssl, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -41,16 +41,21 @@ if not _PROXY_URL and ENV_FILE.exists():
             _PROXY_URL = _line.split("=", 1)[1].strip().strip('"').strip("'")
             if _PROXY_URL: break
 
-if _PROXY_URL:
-    from urllib.request import ProxyHandler, build_opener, install_opener
-    install_opener(build_opener(ProxyHandler({"https": _PROXY_URL, "http": _PROXY_URL})))
-
 # ── SSL ───────────────────────────────────────────────────────────────────────
 try:
     import certifi
     SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 except ImportError:
     SSL_CTX = ssl.create_default_context()
+
+# Build a single opener combining proxy + SSL context so urlopen() calls stay
+# proxy-aware even when an SSL context is needed (passing context= to urlopen
+# directly would bypass install_opener and create a proxy-less opener).
+from urllib.request import ProxyHandler, HTTPSHandler, build_opener, install_opener
+_handlers = [HTTPSHandler(context=SSL_CTX)]
+if _PROXY_URL:
+    _handlers.insert(0, ProxyHandler({"https": _PROXY_URL, "http": _PROXY_URL}))
+install_opener(build_opener(*_handlers))
 
 HTTP_TIMEOUT           = 15
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -61,7 +66,7 @@ CLAUDE_CODE_USER_AGENT = "claude-code/2.1.121"
 def http_get(url, headers=None):
     req = Request(url, headers=headers or {})
     try:
-        with urlopen(req, timeout=HTTP_TIMEOUT, context=SSL_CTX) as resp:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             raw = resp.read()
             try:    return resp.status, json.loads(raw)
             except: return resp.status, None
@@ -69,14 +74,14 @@ def http_get(url, headers=None):
         raw = e.read()
         try:    return e.code, json.loads(raw)
         except: return e.code, None
-    except (URLError, TimeoutError) as e:
+    except (URLError, TimeoutError, socket.timeout, OSError) as e:
         return 0, {"_transport_error": str(e)}
 
 def http_post(url, headers=None, body=None):
     data = json.dumps(body).encode() if body else None
     req  = Request(url, data=data, method="POST", headers=headers or {})
     try:
-        with urlopen(req, timeout=HTTP_TIMEOUT, context=SSL_CTX) as resp:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
             raw = resp.read()
             try:    return resp.status, json.loads(raw)
             except: return resp.status, None
@@ -84,7 +89,7 @@ def http_post(url, headers=None, body=None):
         raw = e.read()
         try:    return e.code, json.loads(raw)
         except: return e.code, None
-    except (URLError, TimeoutError) as e:
+    except (URLError, TimeoutError, socket.timeout, OSError) as e:
         return 0, {"_transport_error": str(e)}
 
 # ── Config helpers ────────────────────────────────────────────────────────────
@@ -236,16 +241,28 @@ def fetch_codex():
                            headers={"Authorization": f"Bearer {token}"})
     if status == 401: return {"error": "codex auth expired (run: codex login)"}
     if status != 200 or not isinstance(obj, dict):
-        err = obj.get("_transport_error", f"http {status}") if isinstance(obj, dict) else f"http {status}"
+        raw = obj.get("_transport_error", f"http {status}") if isinstance(obj, dict) else f"http {status}"
+        err = "timeout (需要代理访问 chatgpt.com)" if "timed out" in raw else raw
         return {"error": err}
 
+    # Classify windows by their length, not by position: plans differ in which
+    # windows they have (e.g. prolite returns only a 7d window as primary_window
+    # and secondary_window=null), so primary/secondary ≠ 5h/7d.
     rl = obj.get("rate_limit") or {}
-    def w(key):
-        d   = rl.get(key) or {}
-        pct = d.get("used_percent", 0)
-        return {"pct": round(max(0.0, min(100.0, float(pct))), 1),
-                "reset_at": parse_reset(d.get("reset_at"))}
-    return {"plan": obj.get("plan_type"), "five_hour": w("primary_window"), "weekly": w("secondary_window")}
+    windows = {}
+    for key in ("primary_window", "secondary_window"):
+        d = rl.get(key)
+        if not isinstance(d, dict): continue
+        secs = d.get("limit_window_seconds")
+        if secs == 5 * 3600:        slot = "five_hour"
+        elif secs == 7 * 24 * 3600: slot = "weekly"
+        elif secs is None:          slot = "five_hour" if key == "primary_window" else "weekly"
+        else:                       continue
+        pct = d.get("used_percent", 0) or 0
+        windows[slot] = {"pct": round(max(0.0, min(100.0, float(pct))), 1),
+                         "reset_at": parse_reset(d.get("reset_at"))}
+    return {"plan": obj.get("plan_type"),
+            "five_hour": windows.get("five_hour"), "weekly": windows.get("weekly")}
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
@@ -372,20 +389,20 @@ def render_all(ds, cx, cl, prev_snap, today_bl: dict):
                 lines.append(f"     spent       {spent} CNY  ≈  ${round(spent * 0.14, 4)} USD since last check")
     lines.append("")
 
-    lines.append("  🟢 Codex (Plus)")
+    lines.append("  🟢 Codex")
     if "error" in cx:
         lines.append(f"     ⚠ {cx['error']}")
     else:
         if cx.get("plan"): lines.append(f"     plan        {cx['plan']}")
-        lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour'))}")
-        lines.append(f"     7d used     {window_pct_bar(cx.get('weekly'))}")
-        d = today_target_line(cx.get("weekly", {}), today_bl.get("codex_weekly"), today_bl.get("codex_weekly_daily_target"))
+        lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour')) if cx.get('five_hour') else '— (当前套餐无 5h 窗口)'}")
+        lines.append(f"     7d used     {window_pct_bar(cx.get('weekly')) if cx.get('weekly') else '— (当前套餐无 7d 窗口)'}")
+        d = today_target_line(cx.get("weekly") or {}, today_bl.get("codex_weekly"), today_bl.get("codex_weekly_daily_target"))
         if d: lines.append(d)
-        p = pace_line(cx.get("weekly", {}), 7 * 24 * 3600)
+        p = pace_line(cx.get("weekly") or {}, 7 * 24 * 3600)
         if p: lines.append(p)
     lines.append("")
 
-    lines.append("  🟣 Claude Code")
+    lines.append("  🟣 Claude Code (Max 200)")
     if "error" in cl:
         lines.append(f"     ⚠ {cl['error']}")
     else:
@@ -476,7 +493,7 @@ def main():
             entry = {}
             for prov in ("codex", "claude"):
                 for win in ("five_hour", "weekly"):
-                    w   = data.get(prov, {}).get(win, {})
+                    w   = data.get(prov, {}).get(win) or {}
                     pct = w.get("pct")
                     if pct is None:
                         continue
