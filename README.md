@@ -1,6 +1,6 @@
 # see-balance
 
-查看 DeepSeek / Codex / Claude Code 三个 AI provider 的余额和用量。
+查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) 四个 AI provider 的余额和用量。
 
 ## 安装
 
@@ -27,6 +27,7 @@ DEEPSEEK_API_KEY=sk-your-key-here
 - **DeepSeek key**：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
 - **Codex**：自动读取 `~/.codex/auth.json`（运行 `codex login` 生成）
 - **Claude Code**：自动读取 macOS Keychain（`claude /login` 登录后自动写入）
+- **Antigravity (AGY)**：自动读取 macOS Keychain / Google OAuth 凭据，识别 Google One Pro / AI Pro 套餐与 AI Credits，并通过本地日志自动统计每日 1,500 次模型请求进度与滑动窗口用量。
 
 ## 使用
 
@@ -45,11 +46,12 @@ python3 ~/bin/provider_balance.py --json       # 原始 JSON
 
 ![screenshot](screenshot.jpg)
 
-每个 provider 显示三行进度条：
-- **5h used** — 5小时窗口用量
-- **7d used** — 7天窗口用量
-- **今日应达** — 今日结束时的累计目标（已含亏欠补偿）+ 今日进度
-- 节奏评估：🟢 节奏正常 / 🟡 偏快需注意 / 🔴 超速需节约 / 🔴 偏慢可加速
+每个 provider 显示进度条与节奏分析：
+- **5h used / reqs** — 5小时窗口用量或频次
+- **7d used / daily used** — 7天窗口或每日用量（含 AGY 当日 1,500 次请求进度）
+- **进度应达** — 线性时间进度应达百分比 + 当前进度超前/还差评估
+- **节奏评估** — 🟢 节奏正常 / 🟡 偏快需注意 / 🔴 超速需节约 / 🔴 偏慢可加速（附已过时间、当前消耗与到期预计）
+- **增量消费** — 显示两次查询之间的新增请求与花费统计
 
 ## 状态缓存
 
