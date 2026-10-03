@@ -212,6 +212,8 @@ def burn_advice(w, rate, alt_hint=None):
 
     if reset_in_h is None:
         return line, f"     建议         按此速率还能撑 {exhaust_h:.1f}h"
+    if reset_in_h < 0.25:   # 还剩 <15 分钟，建议已无意义（马上就是新窗口）
+        return line, None
     if exhaust_h < reset_in_h:
         tail = alt_hint if alt_hint else "建议降速或换池"
         return line, (f"     建议         ⚠ 按此速率 {exhaust_h:.1f}h 后见底，"
@@ -365,6 +367,8 @@ def pace_line(w: dict, total_sec: int) -> str:
     remaining = max(0.0, w["reset_at"] - time.time())
     elapsed   = max(0.0, total_sec - remaining)
     if elapsed < total_sec * 0.05:   # < 5% elapsed — too early to judge
+        return ""
+    if remaining < total_sec * 0.03:  # 窗口快重置了，此刻的节奏判断没意义
         return ""
     frac      = elapsed / total_sec
     projected = pct / frac           # estimated usage at end of window
