@@ -28,7 +28,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-STATE_FILE = Path.home() / ".see-balance" / "state.json"
+STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
 ENV_FILE   = Path.home() / ".see-balance.env"
 
 # ── Proxy ─────────────────────────────────────────────────────────────────────
@@ -120,6 +120,188 @@ def load_state():
 def save_state(snapshot):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+
+# ── 实测消耗（历史采样 + 速率）───────────────────────────────────────────────
+#
+# state.json 里维护一个 history 数组（每次查询追一条压扁的样本）。速率只从
+# 历史里算 —— 不靠猜测，也不依赖上次查询的差值（那个只能看“最近几分钟”）。
+
+HISTORY_MAX_SEC  = 14 * 86400   # 历史保留 14 天
+HISTORY_MAX_ROWS = 4000         # 并限制条数
+RATE_LOOKBACK_MAX_SEC = 12 * 3600   # 速率最多回看 12h（更早的窗口已重置）
+
+
+def history_sample(data: dict) -> dict:
+    """把一次快照压成历史样本（只留算速率要用的字段）。"""
+    def pct(prov: str, key: str):
+        return ((data.get(prov) or {}).get(key) or {}).get("pct")
+    return {
+        "ts":             int(data.get("ts") or time.time()),
+        "deepseek_cny":   (data.get("deepseek") or {}).get("cny_left"),
+        "codex_weekly":   pct("codex", "weekly"),
+        "claude_5h":      pct("claude", "five_hour"),
+        "claude_weekly":  pct("claude", "weekly"),
+        "agy_gemini_5h":  pct("agy", "gemini_5h"),
+        "agy_gemini_weekly": pct("agy", "gemini_weekly"),
+        "agy_3p_5h":      pct("agy", "3p_5h"),
+        "agy_3p_weekly":  pct("agy", "3p_weekly"),
+    }
+
+
+def _hist_series(hist, key, lookback_sec, increasing=True):
+    """取 key 在 lookback 内的样本序列；碰到“重置”（值反向跳）就只留那之后的一段。"""
+    now   = time.time()
+    pts   = []
+    for h in (hist or []):
+        ts = h.get("ts")
+        v  = h.get(key)
+        if ts is None or v is None or now - float(ts) > lookback_sec:
+            continue
+        pts.append((float(ts), float(v)))
+    pts.sort()
+    if len(pts) < 2:
+        return []
+    seg = [pts[-1]]
+    for i in range(len(pts) - 2, -1, -1):
+        prev_v, last_v = pts[i][1], seg[-1][1]
+        reset = (prev_v > last_v + 1e-9) if increasing else (prev_v < last_v - 1e-9)
+        if reset:
+            break
+        seg.append(pts[i])
+    seg.reverse()
+    return seg
+
+
+def burn_rate(hist, key, window_sec, increasing=True):
+    """窗口内实测消耗速率（%/h 或 CNY/h）。没有足够样本就返回 None。"""
+    lookback = min(window_sec, RATE_LOOKBACK_MAX_SEC)
+    seg = _hist_series(hist, key, lookback, increasing=increasing)
+    if len(seg) < 2:
+        return None
+    (t0, v0), (t1, v1) = seg[0], seg[-1]
+    hours = (t1 - t0) / 3600.0
+    if hours < 0.05:          # 跨度 < 3 分钟，噪声大于信号
+        return None
+    delta    = v1 - v0
+    per_hour = (-delta if not increasing else delta) / hours
+    return {"per_hour": per_hour, "delta": delta, "hours": hours,
+            "from": v0, "to": v1, "samples": len(seg), "since_ts": int(t0)}
+
+
+def burn_advice(w, rate, alt_hint=None):
+    """返回 (实测消耗行, 进展建议行) 二元组（已是完整行，含缩进）；没有则 None。
+
+    建议就是把速率翻译成“能不能撑到重置”—— 这是唯一有用的结论。
+    """
+    if not w or w.get("pct") is None:
+        return None, None
+    pct  = float(w["pct"])
+    left = max(0.0, 100.0 - pct)
+    reset_in_h = (max(0.0, w["reset_at"] - time.time()) / 3600.0) if w.get("reset_at") else None
+
+    if not rate or rate["per_hour"] <= 0.005:
+        if rate:
+            return (f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）",
+                    "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
+        return None, None
+
+    ph        = rate["per_hour"]
+    exhaust_h = left / ph
+    line      = (f"     实测消耗     +{ph:.1f}%/h（剩余 {left:.1f}%，近 {rate['hours']:.1f}h，"
+                 f"{rate['samples']} 样本）")
+
+    if reset_in_h is None:
+        return line, f"     建议         按此速率还能撑 {exhaust_h:.1f}h"
+    if exhaust_h < reset_in_h:
+        tail = alt_hint if alt_hint else "建议降速或换池"
+        return line, (f"     建议         ⚠ 按此速率 {exhaust_h:.1f}h 后见底，"
+                      f"比重置早 {reset_in_h - exhaust_h:.1f}h —— {tail}")
+    projected = min(100.0, pct + ph * reset_in_h)
+    verdict   = "✓ 撑得到重置" if projected < 97 else "⚠ 刚好卡在重置前"
+    return line, (f"     建议         {verdict}（还剩 {reset_in_h:.1f}h，届时约用 {projected:.0f}%）")
+
+
+HIST_KEY_BY_WINDOW = {
+    ("codex",  "weekly"):        "codex_weekly",
+    ("claude", "five_hour"):    "claude_5h",
+    ("claude", "weekly"):       "claude_weekly",
+    ("agy",    "gemini_5h"):    "agy_gemini_5h",
+    ("agy",    "gemini_weekly"): "agy_gemini_weekly",
+    ("agy",    "3p_5h"):        "agy_3p_5h",
+    ("agy",    "3p_weekly"):    "agy_3p_weekly",
+}
+
+
+def history_summary(hist):
+    """给 --json / 其它脚本用的速率摘要（不含渲染）。"""
+    out = {"samples": len(hist or []), "span_hours": None, "burns": {}}
+    ts_all = sorted(float(h["ts"]) for h in (hist or []) if h.get("ts"))
+    if len(ts_all) >= 2:
+        out["span_hours"] = round((ts_all[-1] - ts_all[0]) / 3600.0, 2)
+    for key, window_sec, inc in (("deepseek_cny", 24 * 3600, False),
+                                 ("codex_weekly", 7 * 24 * 3600, True),
+                                 ("claude_5h", 5 * 3600, True),
+                                 ("claude_weekly", 7 * 24 * 3600, True),
+                                 ("agy_gemini_5h", 5 * 3600, True),
+                                 ("agy_gemini_weekly", 7 * 24 * 3600, True),
+                                 ("agy_3p_5h", 5 * 3600, True),
+                                 ("agy_3p_weekly", 7 * 24 * 3600, True)):
+        r = burn_rate(hist, key, window_sec, increasing=inc)
+        if not r:
+            continue
+        out["burns"][key] = {"per_hour": round(r["per_hour"], 4), "hours": round(r["hours"], 2),
+                             "samples": r["samples"], "from": r["from"], "to": r["to"]}
+    return out
+
+
+def rate_suffix(hist, pkey, key, pct=None):
+    """紧凑模式的一行后缀：` ⇣+1.2%/h≈12h`（按实测速率还有 12h 见底）。"""
+    hk = HIST_KEY_BY_WINDOW.get((pkey, key))
+    if not hk:
+        return ""
+    window_sec = 5 * 3600 if (key.endswith("5h") or key == "five_hour") else 7 * 24 * 3600
+    r = burn_rate(hist, hk, window_sec)
+    if not r or r["per_hour"] <= 0.005:
+        return ""
+    text = f" ⇣+{r['per_hour']:.1f}%/h"
+    if pct is not None:
+        text += f"≈{(100.0 - float(pct)) / r['per_hour']:.0f}h"
+    return text
+
+
+def deepseek_lines(ds, hist):
+    """DeepSeek 是现金：看的是 ¥/h 和“今日将花多少”。"""
+    if not ds or "cny_left" not in ds:
+        return None, None
+    rate = burn_rate(hist, "deepseek_cny", 24 * 3600, increasing=False)
+    if not rate or rate["per_hour"] <= 0.0005:
+        return None, None
+    ph  = rate["per_hour"]
+    now = time.time()
+    day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    left_today_h = max(0.0, (day_start + 86400 - now) / 3600.0)
+    spent_today, best_ts = None, None
+    for h in (hist or []):
+        ts, v = h.get("ts"), h.get("deepseek_cny")
+        if ts is None or v is None or float(ts) < day_start:
+            continue
+        if best_ts is None or float(ts) < best_ts:
+            best_ts, spent_today = float(ts), float(v)
+    spent = (spent_today - float(ds["cny_left"])) if spent_today is not None else None
+    line  = f"     实测消耗     ¥{ph:.3f}/h（近 {rate['hours']:.1f}h，{rate['samples']} 样本）"
+    if spent is None:
+        return line, None
+    projected = spent + ph * left_today_h
+    cap = os.environ.get("SEE_BALANCE_CNY_DAILY_CAP")
+    if cap:
+        try:
+            capv = float(cap)
+            verdict = "✓ 安全" if projected < capv else "⚠ 会超"
+            return line, f"     建议         今日已花 ¥{spent:.2f}，按此速率将花 ¥{projected:.2f}（闸门 ¥{capv:.2f} {verdict}）"
+        except ValueError:
+            pass
+    return line, (f"     建议         今日已花 ¥{spent:.2f}，按此速率今日将花 ¥{projected:.2f}"
+                  "（设 SEE_BALANCE_CNY_DAILY_CAP 后会给闸门判定）")
 
 # ── Render helpers ────────────────────────────────────────────────────────────
 
@@ -566,6 +748,8 @@ def _probe_agy(token):
             tier_info = {
                 "tier_id": pt.get("id") or ct.get("id"),
                 "tier_name": pt.get("name") or ct.get("name"),
+                "paid_tier_id": pt.get("id"),
+                "current_tier_id": ct.get("id"),
                 "credits": credits_obj.get("creditAmount"),
                 "upgrade_text": ct.get("upgradeSubscriptionText") or "",
                 "project": data.get("cloudaicompanionProject") or project,
@@ -577,6 +761,7 @@ def _probe_agy(token):
         return None, "backend connect failed"
 
     windows = {}
+    groups_meta = {}
     for host in ["https://daily-cloudcode-pa.googleapis.com", "https://cloudcode-pa.googleapis.com"]:
         url = host + "/v1internal:retrieveUserQuotaSummary"
         body = {"project": project}
@@ -584,36 +769,72 @@ def _probe_agy(token):
         if status == 401:
             return None, "http 401"
         if status == 200 and isinstance(qdata, dict):
-            buckets = qdata.get("buckets") or []
-            for b in buckets:
-                w_str = (b.get("window") or b.get("bucketId") or "").lower()
-                rem_frac = b.get("remainingFraction")
-                pct = round(max(0.0, min(100.0, (1.0 - float(rem_frac)) * 100)), 1) if rem_frac is not None else 0.0
-                w_dict = {"pct": pct, "reset_at": parse_reset(b.get("resetTime") or b.get("reset_time"))}
-                if "5h" in w_str or "five" in w_str:
-                    windows["five_hour"] = w_dict
-                elif "7d" in w_str or "seven" in w_str or "week" in w_str:
-                    windows["weekly"] = w_dict
-                elif "day" in w_str or "daily" in w_str or "24h" in w_str:
-                    windows["daily"] = w_dict
+            # 真实结构是 groups[].buckets[]，不是顶层 buckets —— 读错路径会一个桶
+            # 都拿不到，然后退回本地日志的假配额（2026-10-03 修）。
+            found = []
+            for grp in (qdata.get("groups") or []):
+                gname = grp.get("displayName") or "?"
+                groups_meta[gname] = grp.get("description") or ""
+                for b in (grp.get("buckets") or []):
+                    found.append((gname, b))
+            for b in (qdata.get("buckets") or []):   # 兼容极少数顶层返回
+                found.append((None, b))
+
+            for gname, b in found:
+                bid  = str(b.get("bucketId") or "").lower()
+                wstr = str(b.get("window") or b.get("bucketId") or "").lower()
+                # 组归属：3p-* = Claude/GPT 模型池，其余算 Gemini 池
+                pool = "3p" if bid.startswith("3p") or "claude" in (gname or "").lower() else "gemini"
+                if "5h" in wstr or "five" in wstr:
+                    win = "5h"
+                elif "week" in wstr or "7d" in wstr or "seven" in wstr:
+                    win = "weekly"
+                elif "day" in wstr or "24h" in wstr:
+                    win = "daily"
+                else:
+                    continue
+                rem = b.get("remainingFraction")
+                pct = round(max(0.0, min(100.0, (1.0 - float(rem)) * 100)), 1) if rem is not None else None
+                windows[f"{pool}_{win}"] = {
+                    "pct": pct,
+                    "reset_at": parse_reset(b.get("resetTime") or b.get("reset_time")),
+                    "bucket_id": b.get("bucketId"),
+                    "display_name": b.get("displayName"),
+                    "remaining_fraction": rem,
+                    "note": b.get("description"),
+                }
             break
 
     local_usage = _get_agy_local_usage()
-    if not windows.get("daily") and local_usage:
-        windows["daily"] = local_usage.get("daily")
 
-    plan_name = tier_info.get("tier_name")
-    if "1,500" in (tier_info.get("upgrade_text") or "") or tier_info.get("tier_id") == "free-tier":
-        plan_name = "Google AI Pro (1,500 reqs/day)"
-    elif not plan_name:
-        plan_name = "Google One"
+    # 别名：five_hour / weekly 指向 Gemini 池（agy 默认烧的那个），保持
+    # render_compact 与每日基线统计不炸。Antigravity 服务端没有 daily 桶，
+    # 所以 daily 别名通常为 None —— 本地计数另走 local_reqs_today。
+    for alias, key in (("five_hour", "gemini_5h"), ("weekly", "gemini_weekly"), ("daily", "gemini_daily")):
+        if key in windows:
+            windows[alias] = windows[key]
+
+    # 别再拿 upgrade_text 里的 "1,500 reqs/day" 当套餐配额：那是 free-tier 推销
+    # Gemini CLI / Code Assist 的话术，跟 Antigravity agent 的真实配额不是一回事。
+    # 真实配额 = 服务端 5h + weekly 的 remainingFraction 桶（按 token 成本扣）。
+    plan_name = tier_info.get("tier_name") or "Antigravity"
+    if not tier_info.get("paid_tier_id"):
+        plan_name += "（free）"
 
     return {
         "plan": plan_name,
         "tier_id": tier_info.get("tier_id"),
+        "paid_tier_id": tier_info.get("paid_tier_id"),
+        "current_tier_id": tier_info.get("current_tier_id"),
+        "groups": groups_meta,
         "credits": tier_info.get("credits"),
         "upgrade_text": tier_info.get("upgrade_text"),
-        "five_hour_reqs": local_usage.get("five_hour_reqs") if local_usage else 0,
+        "five_hour_reqs": (local_usage or {}).get("five_hour_reqs", 0),
+        "local_reqs_today": ((local_usage or {}).get("daily") or {}).get("used"),
+        "gemini_5h": windows.get("gemini_5h"),
+        "gemini_weekly": windows.get("gemini_weekly"),
+        "3p_5h": windows.get("3p_5h"),
+        "3p_weekly": windows.get("3p_weekly"),
         "five_hour": windows.get("five_hour"),
         "weekly": windows.get("weekly"),
         "daily": windows.get("daily"),
@@ -648,7 +869,7 @@ def fetch_agy():
 
 # ── Render ────────────────────────────────────────────────────────────────────
 
-def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
+def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict, hist=None):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
 
@@ -664,6 +885,9 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
             if pv > cv:
                 spent = round(pv - cv, 4)
                 lines.append(f"     spent       {spent} CNY  ≈  ${round(spent * 0.14, 4)} USD since last check")
+        b, a = deepseek_lines(ds, hist)
+        if b: lines.append(b)
+        if a: lines.append(a)
     lines.append("")
 
     lines.append("  🟢 Codex")
@@ -677,6 +901,9 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
         if d: lines.append(d)
         p = pace_line(cx.get("weekly") or {}, 7 * 24 * 3600)
         if p: lines.append(p)
+        b, a = burn_advice(cx.get("weekly"), burn_rate(hist, "codex_weekly", 7 * 24 * 3600))
+        if b: lines.append(b)
+        if a: lines.append(a)
     lines.append("")
 
     lines.append("  🟣 Claude Code (Max 200)")
@@ -690,6 +917,12 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
         if d: lines.append(d)
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
+        b, a = burn_advice(cl.get("weekly"), burn_rate(hist, "claude_weekly", 7 * 24 * 3600))
+        if b: lines.append(b)
+        if a: lines.append(a)
+        b, a = burn_advice(cl.get("five_hour"), burn_rate(hist, "claude_5h", 5 * 3600))
+        if b: lines.append(b)
+        if a: lines.append(a)
     lines.append("")
 
     lines.append("  🔴 Antigravity (AGY)")
@@ -704,29 +937,45 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
             lines.append(f"     credits     {agy['credits']} available")
         else:
             lines.append("     credits     0 available (/credits to add more)")
-        if agy.get("five_hour"):
-            lines.append(f"     5h used     {window_pct_bar(agy['five_hour'])}")
-        elif agy.get("five_hour_reqs"):
-            lines.append(f"     5h reqs     {agy['five_hour_reqs']} reqs (past 5 hours)")
-        else:
-            lines.append("     5h used     — (当前套餐无 5h 限制)")
-        if agy.get("daily"):
-            lines.append(f"     daily used  {window_pct_bar(agy['daily'])}")
-            d = today_target_line(agy.get("daily") or {}, baseline_pct=today_bl.get("agy_daily"), total_sec=86400, daily_rate=100.0)
-            if d: lines.append(d)
-            p = pace_line(agy.get("daily") or {}, 86400)
-            if p: lines.append(p)
-        if agy.get("weekly"):
-            lines.append(f"     7d used     {window_pct_bar(agy['weekly'])}")
-            d = today_target_line(agy.get("weekly") or {}, today_bl.get("agy_weekly"), today_bl.get("agy_weekly_daily_target"))
-            if d: lines.append(d)
-            p = pace_line(agy.get("weekly") or {}, 7 * 24 * 3600)
-            if p: lines.append(p)
+        def _pool(title, key5h, keywk, w5h, wk):
+            if not w5h and not wk:
+                return
+            lines.append("     ▸ " + title)
+            if w5h:
+                lines.append("     5h used     " + window_pct_bar(w5h))
+                p = pace_line(w5h, 5 * 3600)
+                if p: lines.append(p)
+                b, a = burn_advice(w5h, burn_rate(hist, key5h, 5 * 3600))
+                if b: lines.append(b)
+                if a: lines.append(a)
+            if wk:
+                lines.append("     7d used     " + window_pct_bar(wk))
+                d = today_target_line(wk, today_bl.get("agy_weekly"),
+                                      today_bl.get("agy_weekly_daily_target"))
+                if d: lines.append(d)
+                p = pace_line(wk, 7 * 24 * 3600)
+                if p: lines.append(p)
+                b, a = burn_advice(wk, burn_rate(hist, keywk, 7 * 24 * 3600), alt_hint=alt_hint)
+                if b: lines.append(b)
+                if a: lines.append(a)
+
+        # 两个池互不相通：Gemini 池见底时，3P 池还是完整的
+        g_left  = 100.0 - float((agy.get("gemini_weekly") or {}).get("pct") or 0.0)
+        p3_left = 100.0 - float((agy.get("3p_weekly")     or {}).get("pct") or 0.0)
+        alt_hint = None
+        if g_left < 30.0 and p3_left >= 30.0:
+            alt_hint = "agy 的 Claude·GPT 池仍有余量 → `--agent antigravity --model <claude/gpt 模型 id>`"
+        _pool("Gemini 池 (Gemini Flash / Pro)", "agy_gemini_5h", "agy_gemini_weekly",
+              agy.get("gemini_5h"), agy.get("gemini_weekly"))
+        _pool("Claude·GPT 池 (3p: Opus / Sonnet / GPT-OSS)", "agy_3p_5h", "agy_3p_weekly",
+              agy.get("3p_5h"), agy.get("3p_weekly"))
+        if agy.get("local_reqs_today") is not None:
+            lines.append("     本地计数     " + str(agy["local_reqs_today"]) + " reqs today / "
+                         + str(agy.get("five_hour_reqs", 0)) + " in past 5h"
+                         + "   (仅本地日志，非服务端配额)")
         if prev_snap and "error" not in prev_snap.get("agy", {"error": ""}):
-            p_daily = (prev_snap.get("agy") or {}).get("daily") or {}
-            c_daily = agy.get("daily") or {}
-            p_used = p_daily.get("used")
-            c_used = c_daily.get("used")
+            p_used = (prev_snap.get("agy") or {}).get("local_reqs_today")
+            c_used = agy.get("local_reqs_today")
             if p_used is not None and c_used is not None and c_used > p_used:
                 lines.append(f"     consumed    +{c_used - p_used} reqs since last check")
         if agy.get("note"):
@@ -735,7 +984,7 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict):
     lines.append("═" * 54)
     return "\n".join(lines)
 
-def render_compact(data, prev_snap, today_bl: dict):
+def render_compact(data, prev_snap, today_bl: dict, hist=None):
     ds  = data.get("deepseek", {})
     cx  = data.get("codex", {})
     cl  = data.get("claude", {})
@@ -754,7 +1003,6 @@ def render_compact(data, prev_snap, today_bl: dict):
         print("  ".join(parts))
 
     totals    = {"five_hour": 5 * 3600, "weekly": 7 * 24 * 3600, "daily": 24 * 3600}
-    bl_keys   = {"codex": "codex", "claude": "claude", "agy": "agy"}
     providers = [("CX", cx, "codex"), ("CL", cl, "claude"), ("AGY", agy, "agy")]
     for label, provider, pkey in providers:
         if "error" in provider:
@@ -763,11 +1011,24 @@ def render_compact(data, prev_snap, today_bl: dict):
             plan  = f"[{provider.get('plan','?')}]" if provider.get("plan") else ""
             parts = [f"{label} {plan}".strip()]
             has_window = False
-            for key, lbl in [("five_hour", "5h"), ("daily", "day"), ("weekly", "7d")]:
+            if pkey == "agy":
+                # 两个独立池分开报，别把 Gemini 池的余量当成整个 agy 的余量
+                spec = [("gemini_5h", "G-5h"), ("gemini_weekly", "G-7d"),
+                        ("3p_5h", "3P-5h"), ("3p_weekly", "3P-7d")]
+            else:
+                spec = [("five_hour", "5h"), ("daily", "day"), ("weekly", "7d")]
+            for key, lbl in spec:
                 w = provider.get(key)
                 if w:
                     has_window = True
                     mins = max(0, int((w["reset_at"] - time.time()) / 60)) if w.get("reset_at") else 0
+                    if pkey == "agy":
+                        window_sec = 5 * 3600 if key.endswith("5h") else 7 * 24 * 3600
+                        p    = pace_line(w, window_sec)
+                        pace = (" " + p.strip()) if p else ""
+                        parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}"
+                                     + rate_suffix(hist, pkey, key, w.get("pct")))
+                        continue
                     p    = pace_line(w, totals[key])
                     pace = (" " + p.strip()) if p else ""
                     if key == "weekly":
@@ -777,7 +1038,8 @@ def render_compact(data, prev_snap, today_bl: dict):
                         d = today_target_line(w, today_bl.get(f"{pkey}_daily"), total_sec=totals[key], daily_rate=100.0)
                         pace += (" " + d.strip()) if d else ""
                     req_str = f" ({w['used']}/{w['limit']} reqs)" if "used" in w and "limit" in w else ""
-                    parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}")
+                    parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}"
+                                 + rate_suffix(hist, pkey, key, w.get("pct")))
             if not has_window:
                 if provider.get("credits") is not None:
                     parts.append(f"credits: {provider['credits']}")
@@ -817,6 +1079,12 @@ def main():
         prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy") if k in full}
         data      = collect()
 
+        # ── History（实测消耗速率的数据源）──────────────────────────────────
+        hist = full.get("history") or []
+        hist.append(history_sample(data))
+        cutoff = time.time() - HISTORY_MAX_SEC
+        hist = [h for h in hist if float(h.get("ts") or 0) >= cutoff][-HISTORY_MAX_ROWS:]
+
         # ── Daily baselines ───────────────────────────────────────────────────
         today     = datetime.now().strftime("%Y-%m-%d")
         baselines = full.get("daily_baselines", {})
@@ -844,17 +1112,19 @@ def main():
 
         to_save = dict(data)
         to_save["daily_baselines"] = baselines
+        to_save["history"] = hist
         save_state(to_save)
         state["full"] = to_save
 
         today_bl = baselines.get(today, {})
 
         if json_mode:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+            print(json.dumps({**data, "history_summary": history_summary(hist)}, indent=2, ensure_ascii=False))
         elif compact:
-            render_compact(data, prev_data, today_bl)
+            render_compact(data, prev_data, today_bl, hist)
         else:
-            print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], prev_data, today_bl))
+            print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"],
+                             prev_data, today_bl, hist))
 
     do_query()
 
