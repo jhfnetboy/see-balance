@@ -6,6 +6,7 @@ see-balance — query usage/balance for AI providers.
   Codex       : GET  chatgpt.com/backend-api/wham/usage       (~/.codex/auth.json)
   Claude      : GET  api.anthropic.com/api/oauth/usage        (Keychain OAuth)
   Antigravity : POST daily-cloudcode-pa.googleapis.com        (Keychain / Google OAuth)
+  Grok (xAI)  : GET  cli-chat-proxy.grok.com/v1/billing       (~/.grok/auth.json or XAI_API_KEY)
 
 Usage:
   python3 provider_balance.py                  # one-shot, human-readable
@@ -15,14 +16,14 @@ Usage:
   python3 provider_balance.py --json           # raw JSON
 
 Config:
-  ~/.see-balance.env   — put DEEPSEEK_API_KEY and proxy settings here
+  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, and proxy settings here
   State cached at:     ~/.see-balance/state.json
 
 No secrets ever leave this machine.
 """
 
 import base64, json, os, socket, ssl, subprocess, sys, time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -63,6 +64,9 @@ CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_CODE_USER_AGENT = "claude-code/2.1.121"
 AGY_CLIENT_ID          = os.environ.get("AGY_CLIENT_ID") or bytes([b ^ 0x5a for b in bytes.fromhex("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")]).decode()
 AGY_CLIENT_SECRET      = os.environ.get("AGY_CLIENT_SECRET") or bytes([b ^ 0x5a for b in bytes.fromhex("1d1519090a0277116f621c0d086e626c163e16106b371618622902196e206c2b1e1b3c")]).decode()
+GROK_CLIENT_ID         = "b1a00492-073a-47ea-816f-4c329264a828"
+GROK_CLI_USER_AGENT    = "grok-cli"
+GROK_AUTH_FILE         = Path(os.environ.get("GROK_AUTH_FILE") or (Path.home() / ".grok" / "auth.json"))
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -111,6 +115,38 @@ def load_env_key():
                     return val
     return ""
 
+def load_env_grok_key():
+    """Load XAI_API_KEY / GROK_API_KEY from env → ~/.see-balance.env."""
+    for var in ("XAI_API_KEY", "GROK_API_KEY", "GROK_ACCESS_TOKEN"):
+        val = os.environ.get(var, "")
+        if val:
+            return val.strip('"').strip("'")
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            for prefix in ("XAI_API_KEY=", "GROK_API_KEY=", "GROK_ACCESS_TOKEN="):
+                if line.startswith(prefix):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+    return ""
+
+def load_env_grok_bot_token():
+    """Load CURSOR_SESSION_TOKEN / GROK_BOT_TOKEN from env → ~/.see-balance.env."""
+    for var in ("CURSOR_SESSION_TOKEN", "GROK_BOT_TOKEN"):
+        val = os.environ.get(var, "")
+        if val:
+            return val.strip('"').strip("'")
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            for prefix in ("CURSOR_SESSION_TOKEN=", "GROK_BOT_TOKEN="):
+                if line.startswith(prefix):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+    return ""
+
 def load_state():
     if STATE_FILE.exists():
         try:    return json.loads(STATE_FILE.read_text())
@@ -145,6 +181,8 @@ def history_sample(data: dict) -> dict:
         "agy_gemini_weekly": pct("agy", "gemini_weekly"),
         "agy_3p_5h":      pct("agy", "3p_5h"),
         "agy_3p_weekly":  pct("agy", "3p_weekly"),
+        "grok_weekly":    pct("grok", "main_weekly") if pct("grok", "main_weekly") is not None else pct("grok", "weekly"),
+        "grok_bot_weekly": pct("grok", "bot_weekly"),
     }
 
 
@@ -231,6 +269,9 @@ HIST_KEY_BY_WINDOW = {
     ("agy",    "gemini_weekly"): "agy_gemini_weekly",
     ("agy",    "3p_5h"):        "agy_3p_5h",
     ("agy",    "3p_weekly"):    "agy_3p_weekly",
+    ("grok",   "weekly"):       "grok_weekly",
+    ("grok",   "main_weekly"):  "grok_weekly",
+    ("grok",   "bot_weekly"):   "grok_bot_weekly",
 }
 
 
@@ -247,7 +288,9 @@ def history_summary(hist):
                                  ("agy_gemini_5h", 5 * 3600, True),
                                  ("agy_gemini_weekly", 7 * 24 * 3600, True),
                                  ("agy_3p_5h", 5 * 3600, True),
-                                 ("agy_3p_weekly", 7 * 24 * 3600, True)):
+                                 ("agy_3p_weekly", 7 * 24 * 3600, True),
+                                 ("grok_weekly", 7 * 24 * 3600, True),
+                                 ("grok_bot_weekly", 7 * 24 * 3600, True)):
         r = burn_rate(hist, key, window_sec, increasing=inc)
         if not r:
             continue
@@ -871,9 +914,216 @@ def fetch_agy():
 
     return {"error": err or "auth failed"}
 
+# ── Grok (xAI) ────────────────────────────────────────────────────────────────
+
+def _read_grok_creds():
+    """Read Grok OAuth credentials from ~/.grok/auth.json."""
+    if not GROK_AUTH_FILE.exists():
+        return None
+    try:
+        data = json.loads(GROK_AUTH_FILE.read_text())
+        if not isinstance(data, dict):
+            return None
+        for scope_key, entry in data.items():
+            if isinstance(entry, dict) and entry.get("key"):
+                return {
+                    "scope_key": scope_key,
+                    "access_token": entry.get("key"),
+                    "refresh_token": entry.get("refresh_token"),
+                    "expires_at": entry.get("expires_at"),
+                    "email": entry.get("email"),
+                    "oidc_issuer": entry.get("oidc_issuer") or "https://auth.x.ai",
+                    "oidc_client_id": entry.get("oidc_client_id") or GROK_CLIENT_ID,
+                }
+    except Exception:
+        pass
+    return None
+
+def _write_grok_creds(creds, new_token, new_refresh_token=None, expires_in=21600):
+    scope_key = creds.get("scope_key")
+    if not scope_key or not GROK_AUTH_FILE.exists():
+        return
+    try:
+        with open(GROK_AUTH_FILE, "r") as f:
+            full_auth = json.load(f)
+        if scope_key in full_auth:
+            exp_iso = datetime.fromtimestamp(time.time() + expires_in, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            full_auth[scope_key]["key"] = new_token
+            if new_refresh_token:
+                full_auth[scope_key]["refresh_token"] = new_refresh_token
+            full_auth[scope_key]["expires_at"] = exp_iso
+            with open(GROK_AUTH_FILE, "w") as f:
+                json.dump(full_auth, f, indent=2)
+    except Exception:
+        pass
+
+def _refresh_grok_oauth(creds):
+    rf = creds.get("refresh_token")
+    if not rf:
+        return None
+    client_id = creds.get("oidc_client_id") or GROK_CLIENT_ID
+    issuer = (creds.get("oidc_issuer") or "https://auth.x.ai").rstrip("/")
+    url = f"{issuer}/oauth2/token"
+
+    import urllib.parse
+    body_data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": rf,
+        "client_id": client_id,
+    }).encode("utf-8")
+
+    req = Request(url, data=body_data, method="POST", headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": GROK_CLI_USER_AGENT,
+    })
+    try:
+        with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+
+    new_token = data.get("access_token")
+    if not new_token:
+        return None
+    new_rf = data.get("refresh_token", rf)
+    expires_in = data.get("expires_in", 21600)
+    _write_grok_creds(creds, new_token, new_rf, expires_in)
+    return new_token
+
+def _probe_grok_bot():
+    """Fetch Grok Bot independent usage if CURSOR_SESSION_TOKEN / GROK_BOT_TOKEN is set."""
+    token = load_env_grok_bot_token()
+    if token:
+        import urllib.parse
+        cookie_val = urllib.parse.quote(token) if not token.startswith("ey") and "%" not in token else token
+        status, data = http_get(
+            "https://www.cursor.com/api/usage-summary",
+            headers={
+                "Cookie": f"WorkosCursorSessionToken={cookie_val}",
+                "User-Agent": "Mozilla/5.0",
+            }
+        )
+        if status == 200 and isinstance(data, dict):
+            fast_used = data.get("numFastRequests") or data.get("numRequests") or 0
+            fast_max = data.get("maxFastRequests") or data.get("maxRequests") or 500
+            pct = round(min(100.0, (float(fast_used) / float(fast_max)) * 100), 1) if fast_max else 0.0
+            return {
+                "pct": pct,
+                "used": fast_used,
+                "limit": fast_max,
+                "display_name": "Grok Bot 池 (Bot / Cursor 独立周额度)",
+                "note": "从 Cursor API 同步",
+            }
+    return None
+
+def _probe_grok(token):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": GROK_CLI_USER_AGENT,
+        "Accept": "application/json",
+    }
+    status, bdata = http_get("https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers=headers)
+    if status == 401:
+        return None, "http 401"
+    if status != 200 or not isinstance(bdata, dict):
+        status, bdata = http_get("https://cli-chat-proxy.grok.com/v1/billing", headers=headers)
+        if status == 401:
+            return None, "http 401"
+        if status != 200 or not isinstance(bdata, dict):
+            err = bdata.get("_transport_error", f"http {status}") if isinstance(bdata, dict) else f"http {status}"
+            return None, err
+
+    _, sdata = http_get("https://cli-chat-proxy.grok.com/v1/settings", headers=headers)
+    plan_name = None
+    if isinstance(sdata, dict):
+        plan_name = sdata.get("subscription_tier_display") or sdata.get("subscription_tier")
+
+    _, udata = http_get("https://cli-chat-proxy.grok.com/v1/user", headers=headers)
+    email = None
+    if isinstance(udata, dict):
+        email = udata.get("email")
+
+    cfg = bdata.get("config") or {}
+    cur_period = cfg.get("currentPeriod") or {}
+
+    pct_raw = cfg.get("creditUsagePercent")
+    if isinstance(pct_raw, dict):
+        pct_val = pct_raw.get("val", 0)
+    elif isinstance(pct_raw, (int, float)):
+        pct_val = pct_raw
+    else:
+        pct_val = 0.0
+
+    reset_str = cur_period.get("end") or cfg.get("billingPeriodEnd")
+    reset_at = parse_reset(reset_str)
+
+    def _get_val(obj):
+        if isinstance(obj, dict): return obj.get("val", 0)
+        if isinstance(obj, (int, float)): return obj
+        return 0
+
+    prepaid = _get_val(cfg.get("prepaidBalance"))
+    ondemand_used = _get_val(cfg.get("onDemandUsed"))
+    ondemand_cap = _get_val(cfg.get("onDemandCap"))
+
+    main_weekly = {
+        "pct": round(max(0.0, min(100.0, float(pct_val))), 1),
+        "reset_at": reset_at,
+        "display_name": "主周池 (Chat · Imagine · Voice · Build)",
+    }
+    bot_weekly = _probe_grok_bot()
+
+    return {
+        "plan": plan_name or "SuperGrok Plus",
+        "account": email,
+        "weekly": main_weekly,
+        "main_weekly": main_weekly,
+        "bot_weekly": bot_weekly,
+        "prepaid_balance": prepaid,
+        "on_demand_used": ondemand_used,
+        "on_demand_cap": ondemand_cap,
+    }, "ok"
+
+def fetch_grok():
+    creds = _read_grok_creds()
+    env_token = os.environ.get("GROK_ACCESS_TOKEN") or os.environ.get("XAI_API_KEY") or load_env_grok_key()
+    if env_token:
+        usage, err = _probe_grok(env_token)
+        if usage:
+            if not usage.get("account") and creds:
+                usage["account"] = creds.get("email")
+            return usage
+
+    if not creds:
+        return {"error": "no grok auth (run grok once or set XAI_API_KEY in ~/.see-balance.env)"}
+
+    # Proactive refresh if within 3 minutes of expiry
+    exp_ts = parse_reset(creds.get("expires_at"))
+    if exp_ts and time.time() > (exp_ts - 180) and creds.get("refresh_token"):
+        new_tok = _refresh_grok_oauth(creds)
+        if new_tok:
+            creds["access_token"] = new_tok
+
+    usage, err = _probe_grok(creds["access_token"])
+    if usage:
+        if not usage.get("account"):
+            usage["account"] = creds.get("email")
+        return usage
+
+    if err == "http 401" and creds.get("refresh_token"):
+        new_tok = _refresh_grok_oauth(creds)
+        if new_tok:
+            usage, err = _probe_grok(new_tok)
+            if usage:
+                if not usage.get("account"):
+                    usage["account"] = creds.get("email")
+                return usage
+
+    return {"error": err or "auth failed"}
+
 # ── Render ────────────────────────────────────────────────────────────────────
 
-def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict, hist=None):
+def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
 
@@ -985,6 +1235,52 @@ def render_all(ds, cx, cl, agy, prev_snap, today_bl: dict, hist=None):
         if agy.get("note"):
             lines.append(f"     note        {agy['note']}")
     lines.append("")
+
+    lines.append("  🟠 Grok (xAI)")
+    if "error" in gr:
+        lines.append(f"     ⚠ {gr['error']}")
+    else:
+        if gr.get("account"):
+            lines.append(f"     account     {gr['account']}")
+        if gr.get("plan"):
+            lines.append(f"     plan        {gr['plan']}")
+
+        # 主周池 (Chat · Imagine · Voice · Build)
+        main_wk = gr.get("main_weekly") or gr.get("weekly")
+        bot_wk  = gr.get("bot_weekly")
+        has_bot_pct = bool(bot_wk and bot_wk.get("pct") is not None)
+
+        if main_wk:
+            if has_bot_pct:
+                lines.append("     ▸ 主周池 (Chat · Imagine · Voice · Build)")
+            lines.append(f"     7d used     {window_pct_bar(main_wk)}")
+            d = today_target_line(main_wk, today_bl.get("grok_weekly"), today_bl.get("grok_weekly_daily_target"))
+            if d: lines.append(d)
+            p = pace_line(main_wk, 7 * 24 * 3600)
+            if p: lines.append(p)
+            b, a = burn_advice(main_wk, burn_rate(hist, "grok_weekly", 7 * 24 * 3600))
+            if b: lines.append(b)
+            if a: lines.append(a)
+
+        # Grok Bot 独立周池（仅在获取到实测用量时展开）
+        if has_bot_pct:
+            lines.append("     ▸ Grok Bot 池 (Bot / Cursor 独立周额度)")
+            lines.append(f"     7d used     {window_pct_bar(bot_wk)}")
+            d = today_target_line(bot_wk, today_bl.get("grok_bot_weekly"), today_bl.get("grok_bot_weekly_daily_target"))
+            if d: lines.append(d)
+            p = pace_line(bot_wk, 7 * 24 * 3600)
+            if p: lines.append(p)
+            b, a = burn_advice(bot_wk, burn_rate(hist, "grok_bot_weekly", 7 * 24 * 3600))
+            if b: lines.append(b)
+            if a: lines.append(a)
+        else:
+            lines.append("     note        周池涵盖 Chat·Imagine·Voice·Build（Bot 为独立额度，不扣本池）")
+
+        if gr.get("prepaid_balance") is not None and gr.get("prepaid_balance") > 0:
+            lines.append(f"     balance     ${gr['prepaid_balance']:.2f}")
+        if gr.get("on_demand_used") is not None and gr.get("on_demand_used") > 0:
+            lines.append(f"     on-demand   ${gr['on_demand_used']:.2f} / ${gr.get('on_demand_cap', 0):.2f}")
+    lines.append("")
     lines.append("═" * 54)
     return "\n".join(lines)
 
@@ -993,6 +1289,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
     cx  = data.get("codex", {})
     cl  = data.get("claude", {})
     agy = data.get("agy", {})
+    gr  = data.get("grok", {})
 
     if "error" in ds:
         print(f"DS ⚠ {ds['error']}")
@@ -1007,7 +1304,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
         print("  ".join(parts))
 
     totals    = {"five_hour": 5 * 3600, "weekly": 7 * 24 * 3600, "daily": 24 * 3600}
-    providers = [("CX", cx, "codex"), ("CL", cl, "claude"), ("AGY", agy, "agy")]
+    providers = [("CX", cx, "codex"), ("CL", cl, "claude"), ("AGY", agy, "agy"), ("GROK", gr, "grok")]
     for label, provider, pkey in providers:
         if "error" in provider:
             print(f"{label} ⚠ {provider['error']}")
@@ -1019,11 +1316,19 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                 # 两个独立池分开报，别把 Gemini 池的余量当成整个 agy 的余量
                 spec = [("gemini_5h", "G-5h"), ("gemini_weekly", "G-7d"),
                         ("3p_5h", "3P-5h"), ("3p_weekly", "3P-7d")]
+            elif pkey == "grok":
+                bot_wk = provider.get("bot_weekly")
+                if bot_wk and bot_wk.get("pct") is not None:
+                    spec = [("main_weekly", "主池-7d"), ("bot_weekly", "Bot-7d")]
+                else:
+                    spec = [("weekly", "7d")]
             else:
                 spec = [("five_hour", "5h"), ("daily", "day"), ("weekly", "7d")]
             for key, lbl in spec:
                 w = provider.get(key)
                 if w:
+                    if w.get("pct") is None:
+                        continue
                     has_window = True
                     mins = max(0, int((w["reset_at"] - time.time()) / 60)) if w.get("reset_at") else 0
                     if pkey == "agy":
@@ -1033,14 +1338,16 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}"
                                      + rate_suffix(hist, pkey, key, w.get("pct")))
                         continue
-                    p    = pace_line(w, totals[key])
+                    total_window_sec = 7 * 24 * 3600 if (key in ("weekly", "main_weekly", "bot_weekly")) else totals.get(key, 7 * 24 * 3600)
+                    p    = pace_line(w, total_window_sec)
                     pace = (" " + p.strip()) if p else ""
-                    if key == "weekly":
-                        d = today_target_line(w, today_bl.get(f"{pkey}_weekly"), today_bl.get(f"{pkey}_weekly_daily_target"), total_sec=totals[key])
-                        pace += (" " + d.strip()) if d else ""
+                    if key in ("weekly", "main_weekly", "bot_weekly"):
+                        hist_key = HIST_KEY_BY_WINDOW.get((pkey, key), f"{pkey}_{key}")
+                        d = today_target_line(w, today_bl.get(hist_key), today_bl.get(f"{hist_key}_daily_target"), total_sec=total_window_sec)
+                        pace += (" " + " ".join(d.split())) if d else ""
                     elif key == "daily":
-                        d = today_target_line(w, today_bl.get(f"{pkey}_daily"), total_sec=totals[key], daily_rate=100.0)
-                        pace += (" " + d.strip()) if d else ""
+                        d = today_target_line(w, today_bl.get(f"{pkey}_daily"), total_sec=total_window_sec, daily_rate=100.0)
+                        pace += (" " + " ".join(d.split())) if d else ""
                     req_str = f" ({w['used']}/{w['limit']} reqs)" if "used" in w and "limit" in w else ""
                     parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}"
                                  + rate_suffix(hist, pkey, key, w.get("pct")))
@@ -1060,6 +1367,7 @@ def collect():
         "codex":    fetch_codex(),
         "claude":   fetch_claude(),
         "agy":      fetch_agy(),
+        "grok":     fetch_grok(),
     }
 
 def main():
@@ -1080,7 +1388,7 @@ def main():
 
     def do_query():
         full      = state["full"]
-        prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy") if k in full}
+        prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok") if k in full}
         data      = collect()
 
         # ── History（实测消耗速率的数据源）──────────────────────────────────
@@ -1094,20 +1402,20 @@ def main():
         baselines = full.get("daily_baselines", {})
         if today not in baselines:
             entry = {}
-            for prov in ("codex", "claude", "agy"):
-                for win in ("five_hour", "weekly", "daily"):
+            for prov in ("codex", "claude", "agy", "grok"):
+                for win in ("five_hour", "weekly", "daily", "main_weekly", "bot_weekly"):
                     w   = data.get(prov, {}).get(win) or {}
                     pct = w.get("pct")
                     if pct is None:
                         continue
                     entry[f"{prov}_{win}"] = float(pct)
-                    if win == "weekly":
+                    if win in ("weekly", "main_weekly", "bot_weekly"):
                         reset_at = w.get("reset_at")
                         if reset_at:
                             rd = max(0.0, (reset_at - time.time()) / 86400)
                             if rd > 0.05:
                                 dt = max(0.0, 100.0 - float(pct)) / rd
-                                entry[f"{prov}_weekly_daily_target"] = round(dt, 2)
+                                entry[f"{prov}_{win}_daily_target"] = round(dt, 2)
                     elif win == "daily":
                         entry[f"{prov}_daily_used"] = w.get("used", 0)
             baselines[today] = entry
@@ -1127,7 +1435,7 @@ def main():
         elif compact:
             render_compact(data, prev_data, today_bl, hist)
         else:
-            print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"],
+            print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
                              prev_data, today_bl, hist))
 
     do_query()

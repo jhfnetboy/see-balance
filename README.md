@@ -1,6 +1,6 @@
 # see-balance
 
-查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) 四个 AI provider 的余额和用量。
+查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) 五个 AI provider 的余额和用量。
 
 ## 安装
 
@@ -19,6 +19,8 @@ bash install.sh
 
 ```bash
 DEEPSEEK_API_KEY=sk-your-key-here
+# 可选：手动指定 XAI_API_KEY
+# XAI_API_KEY=xai-your-key-here
 
 # 如需代理（VPN 场景）：
 # HTTPS_PROXY=http://127.0.0.1:7890
@@ -27,6 +29,9 @@ DEEPSEEK_API_KEY=sk-your-key-here
 - **DeepSeek key**：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
 - **Codex**：自动读取 `~/.codex/auth.json`（运行 `codex login` 生成）
 - **Claude Code**：自动读取 macOS Keychain（`claude /login` 登录后自动写入）
+- **Grok (xAI)**：自动读取 `~/.grok/auth.json`（运行 `grok` / `grok login` 生成）或 `XAI_API_KEY`，直连 `cli-chat-proxy.grok.com` 查询：
+  - **主周池**（Chat · Imagine · Voice · Build）：7d 使用百分比、进度与重置倒计时；
+  - **Grok Bot 池**（Bot / Cursor 独立周额度）：独立周额度不占用主池；支持在 `~/.see-balance.env` 配置 `CURSOR_SESSION_TOKEN` 同步实测用量。
 - **Antigravity (AGY)**：自动读取 macOS Keychain / Google OAuth 凭据，识别 `paidTier` 套餐；直连服务端 `retrieveUserQuotaSummary` 读真实配额。
 
 两个互不相通的池，各自带 **5h + weekly** 两个窗口：
