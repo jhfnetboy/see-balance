@@ -165,6 +165,7 @@ def save_state(snapshot):
 HISTORY_MAX_SEC  = 14 * 86400   # 历史保留 14 天
 HISTORY_MAX_ROWS = 4000         # 并限制条数
 RATE_LOOKBACK_MAX_SEC = 12 * 3600   # 速率最多回看 12h（更早的窗口已重置）
+WINDOW_AVG_MIN_SEC    = 24 * 3600   # 不短于 1 天的窗口（7d），建议改用窗口平均速率：跨昼夜，不被一时高峰带偏
 
 
 def history_sample(data: dict) -> dict:
@@ -226,6 +227,34 @@ def burn_rate(hist, key, window_sec, increasing=True):
             "from": v0, "to": v1, "samples": len(seg), "since_ts": int(t0)}
 
 
+def window_avg_rate(w, window_sec):
+    """窗口开始以来的平均速率（%/h）= 已用 ÷ 已过小时。窗口起点用量是 0，不需要历史样本。"""
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return None
+    elapsed = window_sec - max(0.0, w["reset_at"] - time.time())
+    if elapsed < window_sec * 0.05:   # 与 pace_line 同一门槛：刚开窗时分母太小，平均值不稳
+        return None
+    hours = elapsed / 3600.0
+    return {"per_hour": float(w["pct"]) / hours, "hours": hours, "kind": "window"}
+
+
+def advice_rate(w, hist, key, window_sec):
+    """建议用哪个速率：5h 窗口看近期实测；7d 窗口看窗口平均，近期实测只作参考。
+
+    7d 窗口刚开不久（平均值还不稳）时，返回近期速率并标记 provisional —— 只展示，不下结论。
+    """
+    recent = burn_rate(hist, key, window_sec)
+    if window_sec < WINDOW_AVG_MIN_SEC:
+        return recent
+    if not (w or {}).get("reset_at"):   # 不知道窗口位置，只能看近期
+        return recent
+    avg = window_avg_rate(w, window_sec)
+    if avg:
+        avg["recent"] = recent
+        return avg
+    return dict(recent, provisional=True) if recent else None
+
+
 def burn_advice(w, rate, alt_hint=None):
     """返回 (实测消耗行, 进展建议行) 二元组（已是完整行，含缩进）；没有则 None。
 
@@ -238,6 +267,9 @@ def burn_advice(w, rate, alt_hint=None):
     reset_in_h = (max(0.0, w["reset_at"] - time.time()) / 3600.0) if w.get("reset_at") else None
 
     if not rate or rate["per_hour"] <= 0.005:
+        if rate and rate.get("kind") == "window":
+            return (f"     实测消耗     窗口平均几乎为 0（已过 {rate['hours']:.0f}h，用了 {pct:.1f}%）",
+                    "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
         if rate:
             return (f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）",
                     "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
@@ -245,8 +277,16 @@ def burn_advice(w, rate, alt_hint=None):
 
     ph        = rate["per_hour"]
     exhaust_h = left / ph
-    line      = (f"     实测消耗     +{ph:.1f}%/h（剩余 {left:.1f}%，近 {rate['hours']:.1f}h，"
-                 f"{rate['samples']} 样本）")
+    if rate.get("kind") == "window":
+        line = f"     实测消耗     窗口平均 +{ph:.1f}%/h（已过 {rate['hours']:.0f}h，剩余 {left:.1f}%）"
+        recent = rate.get("recent")
+        if recent:
+            line += f"；近 {recent['hours']:.1f}h +{max(0.0, recent['per_hour']):.1f}%/h"
+    else:
+        line = (f"     实测消耗     +{ph:.1f}%/h（剩余 {left:.1f}%，近 {rate['hours']:.1f}h，"
+                f"{rate['samples']} 样本）")
+    if rate.get("provisional"):   # 7d 窗口刚开：近期速率会被一时高峰带偏，不据此下结论
+        return line, "     建议         窗口刚开始，先不下结论"
 
     if reset_in_h is None:
         return line, f"     建议         按此速率还能撑 {exhaust_h:.1f}h"
@@ -299,16 +339,17 @@ def history_summary(hist):
     return out
 
 
-def rate_suffix(hist, pkey, key, pct=None):
+def rate_suffix(hist, pkey, key, w=None):
     """紧凑模式的一行后缀：` ⇣+1.2%/h≈12h`（按实测速率还有 12h 见底）。"""
     hk = HIST_KEY_BY_WINDOW.get((pkey, key))
     if not hk:
         return ""
     window_sec = 5 * 3600 if (key.endswith("5h") or key == "five_hour") else 7 * 24 * 3600
-    r = burn_rate(hist, hk, window_sec)
-    if not r or r["per_hour"] <= 0.005:
+    r = advice_rate(w, hist, hk, window_sec)
+    if not r or r.get("provisional") or r["per_hour"] <= 0.005:
         return ""
     text = f" ⇣+{r['per_hour']:.1f}%/h"
+    pct = (w or {}).get("pct")
     if pct is not None:
         text += f"≈{(100.0 - float(pct)) / r['per_hour']:.0f}h"
     return text
@@ -1187,7 +1228,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         if d: lines.append(d)
         p = pace_line(cx.get("weekly") or {}, 7 * 24 * 3600)
         if p: lines.append(p)
-        b, a = burn_advice(cx.get("weekly"), burn_rate(hist, "codex_weekly", 7 * 24 * 3600))
+        b, a = burn_advice(cx.get("weekly"), advice_rate(cx.get("weekly"), hist, "codex_weekly", 7 * 24 * 3600))
         if b: lines.append(b)
         if a: lines.append(a)
     lines.append("")
@@ -1203,7 +1244,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         if d: lines.append(d)
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
-        b, a = burn_advice(cl.get("weekly"), burn_rate(hist, "claude_weekly", 7 * 24 * 3600))
+        b, a = burn_advice(cl.get("weekly"), advice_rate(cl.get("weekly"), hist, "claude_weekly", 7 * 24 * 3600))
         if b: lines.append(b)
         if a: lines.append(a)
         b, a = burn_advice(cl.get("five_hour"), burn_rate(hist, "claude_5h", 5 * 3600))
@@ -1241,7 +1282,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
                 if d: lines.append(d)
                 p = pace_line(wk, 7 * 24 * 3600)
                 if p: lines.append(p)
-                b, a = burn_advice(wk, burn_rate(hist, keywk, 7 * 24 * 3600), alt_hint=alt_hint)
+                b, a = burn_advice(wk, advice_rate(wk, hist, keywk, 7 * 24 * 3600), alt_hint=alt_hint)
                 if b: lines.append(b)
                 if a: lines.append(a)
 
@@ -1290,7 +1331,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             if d: lines.append(d)
             p = pace_line(main_wk, 7 * 24 * 3600)
             if p: lines.append(p)
-            b, a = burn_advice(main_wk, burn_rate(hist, "grok_weekly", 7 * 24 * 3600))
+            b, a = burn_advice(main_wk, advice_rate(main_wk, hist, "grok_weekly", 7 * 24 * 3600))
             if b: lines.append(b)
             if a: lines.append(a)
 
@@ -1302,7 +1343,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             if d: lines.append(d)
             p = pace_line(bot_wk, 7 * 24 * 3600)
             if p: lines.append(p)
-            b, a = burn_advice(bot_wk, burn_rate(hist, "grok_bot_weekly", 7 * 24 * 3600))
+            b, a = burn_advice(bot_wk, advice_rate(bot_wk, hist, "grok_bot_weekly", 7 * 24 * 3600))
             if b: lines.append(b)
             if a: lines.append(a)
         else:
@@ -1368,7 +1409,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         p    = pace_line(w, window_sec)
                         pace = (" " + p.strip()) if p else ""
                         parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}"
-                                     + rate_suffix(hist, pkey, key, w.get("pct")))
+                                     + rate_suffix(hist, pkey, key, w))
                         continue
                     total_window_sec = 7 * 24 * 3600 if (key in ("weekly", "main_weekly", "bot_weekly")) else totals.get(key, 7 * 24 * 3600)
                     p    = pace_line(w, total_window_sec)
@@ -1382,7 +1423,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         pace += (" " + " ".join(d.split())) if d else ""
                     req_str = f" ({w['used']}/{w['limit']} reqs)" if "used" in w and "limit" in w else ""
                     parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}"
-                                 + rate_suffix(hist, pkey, key, w.get("pct")))
+                                 + rate_suffix(hist, pkey, key, w))
             if not has_window:
                 if provider.get("credits") is not None:
                     parts.append(f"credits: {provider['credits']}")
