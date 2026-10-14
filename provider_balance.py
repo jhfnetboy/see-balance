@@ -381,9 +381,8 @@ def today_target_line(w: dict, baseline_pct=None, fixed_daily_target=None, total
     if daily_rate is None:
         daily_rate = 100.0 / (total_sec / 86400.0)
 
-    # Bar: current_pct vs target_now (full bar = on or ahead of schedule)
-    fill_pct = min(100.0, (pct / target_now * 100) if target_now > 0 else 100.0)
-    bar_n = int(round(fill_pct / 5))
+    # Bar: target_now on the same 0–100% scale as the "used" bars above, so the two line up
+    bar_n = int(round(min(100.0, target_now) / 5))
     bar   = "█" * bar_n + "░" * (20 - bar_n)
 
     diff = pct - target_now
@@ -1462,6 +1461,11 @@ def main():
 
         today_bl = baselines.get(today, {})
 
+        # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
+        redraw = watch_mode and not json_mode and sys.stdout.isatty()
+        if redraw:
+            sys.stdout.write("\033[H\033[2J")
+
         if json_mode:
             print(json.dumps({**data, "history_summary": history_summary(hist)}, indent=2, ensure_ascii=False))
         elif compact:
@@ -1469,11 +1473,12 @@ def main():
         else:
             print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
                              prev_data, today_bl, hist))
+        if watch_mode:
+            print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n", flush=True)
 
     do_query()
 
     if watch_mode:
-        print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n")
         try:
             while True:
                 time.sleep(interval_min * 60)
