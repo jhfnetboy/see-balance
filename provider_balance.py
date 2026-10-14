@@ -547,7 +547,7 @@ def _security(args):
     try:
         return subprocess.run(["/usr/bin/security", *args],
                               capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):   # ValueError：输出不是合法 UTF-8
         return None
 
 def _claude_keychain_account():
@@ -589,7 +589,7 @@ def _read_claude_creds():
     try:
         with open(path) as f:
             oauth = _parse_claude_oauth(f.read())
-    except OSError:
+    except (OSError, ValueError):   # ValueError：文件被写到一半、截断在多字节字符中间
         return None
     if not oauth: return None
     return {"file": path, "oauth": oauth}
