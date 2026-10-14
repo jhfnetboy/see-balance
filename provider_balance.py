@@ -635,7 +635,7 @@ def _write_claude_creds(creds, oauth):
             try:
                 with open(path) as f: outer = json.load(f)
                 break
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError):   # ValueError 涵盖 JSONDecodeError 和读到半截多字节字符的 UnicodeDecodeError
                 if attempt < 2: time.sleep(0.2)
         if not isinstance(outer, dict):
             return False
@@ -684,12 +684,15 @@ def fetch_claude():
         new_oauth["refreshToken"] = refreshed["refresh_token"]
         new_oauth["expiresAt"]    = refreshed["expires_at"]
         saved = _write_claude_creds(creds, new_oauth)
+        unsaved = "token 已刷新但未能写回凭据，如遇登录失效请 claude /login"
         usage, err = _probe_claude(refreshed["access_token"])
         if usage:
             if not saved:   # 新 token 只在本进程内存里；旧 refresh token 若已作废，下次就得重新登录
-                usage["warning"] = "token 已刷新但未能写回凭据，如遇登录失效请 claude /login"
+                usage["warning"] = unsaved
             return usage
         if err:   last_err = err
+        if not saved:   # 查询也失败时同样要提示，否则看起来只是一次网络错误
+            last_err = f"{last_err}；{unsaved}"
 
     return {"error": last_err}
 
