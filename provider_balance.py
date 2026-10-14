@@ -385,13 +385,14 @@ def today_target_line(w: dict, baseline_pct=None, fixed_daily_target=None, total
     bar_n = int(round(min(100.0, target_now) / 5))
     bar   = "█" * bar_n + "░" * (20 - bar_n)
 
+    # 只陈述差值，快慢判断统一交给 pace_line（按到期推算），避免两行结论打架
     diff = pct - target_now
-    if diff > 1.0:
-        status = f"超前{diff:.1f}% ✓"
-    elif diff < -1.0:
-        status = f"还差{abs(diff):.1f}%"
+    if diff >= 0.05:
+        status = f"多用{diff:.1f}%"
+    elif diff <= -0.05:
+        status = f"少用{abs(diff):.1f}%"
     else:
-        status = "进度正常"
+        status = "持平"
 
     rate_str = f"日均+{daily_rate:.1f}%" if total_sec > 86400 else "今日进度"
     return (f"     进度应达    {target_now:5.1f}%  {bar}"
