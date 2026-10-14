@@ -518,20 +518,36 @@ def _claude_keychain_account():
                 return val[1:-1] or None
     return None
 
-def _read_claude_creds():
-    account = _claude_keychain_account()
-    if not account: return None
-    out = _security(["find-generic-password", "-s", "Claude Code-credentials",
-                     "-a", account, "-w"])
-    if not out or out.returncode != 0: return None
+def _claude_creds_file():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, ".credentials.json")
+
+def _parse_claude_oauth(raw):
     try:
-        outer = json.loads(out.stdout.strip())
-        oauth = outer.get("claudeAiOauth") or {}
-    except json.JSONDecodeError:
+        oauth = (json.loads(raw) or {}).get("claudeAiOauth") or {}
+    except (json.JSONDecodeError, AttributeError):
         return None
     if not oauth.get("accessToken") or not oauth.get("refreshToken"):
         return None
-    return {"account": account, "oauth": oauth}
+    return oauth
+
+def _read_claude_creds():
+    # Keychain 优先；条目缺失或为空（如 SSH 登录 / 迁移后的机器）时回退到 ~/.claude/.credentials.json
+    account = _claude_keychain_account()
+    if account:
+        out = _security(["find-generic-password", "-s", "Claude Code-credentials",
+                         "-a", account, "-w"])
+        if out and out.returncode == 0:
+            oauth = _parse_claude_oauth(out.stdout.strip())
+            if oauth: return {"account": account, "oauth": oauth}
+    path = _claude_creds_file()
+    try:
+        with open(path) as f:
+            oauth = _parse_claude_oauth(f.read())
+    except OSError:
+        return None
+    if not oauth: return None
+    return {"file": path, "oauth": oauth}
 
 def _probe_claude(token):
     status, obj = http_get(
@@ -564,10 +580,26 @@ def _refresh_claude_oauth(refresh_token):
             "refresh_token": obj.get("refresh_token", refresh_token),
             "expires_at":    int((time.time() + expires_in) * 1000)}
 
-def _write_claude_creds(account, oauth):
+def _write_claude_creds(creds, oauth):
+    if creds.get("file"):
+        # 保留文件里 claudeAiOauth 以外的字段，原子替换并保持 0600
+        path = creds["file"]
+        try:
+            with open(path) as f: outer = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            outer = {}
+        outer["claudeAiOauth"] = oauth
+        tmp = path + ".tmp"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f: json.dump(outer, f)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            return False
     payload = json.dumps({"claudeAiOauth": oauth})
     out = _security(["add-generic-password", "-U",
-                     "-s", "Claude Code-credentials", "-a", account, "-w", payload])
+                     "-s", "Claude Code-credentials", "-a", creds["account"], "-w", payload])
     return bool(out and out.returncode == 0)
 
 def fetch_claude():
@@ -596,7 +628,7 @@ def fetch_claude():
         new_oauth["accessToken"]  = refreshed["access_token"]
         new_oauth["refreshToken"] = refreshed["refresh_token"]
         new_oauth["expiresAt"]    = refreshed["expires_at"]
-        _write_claude_creds(creds["account"], new_oauth)
+        _write_claude_creds(creds, new_oauth)
         usage, err = _probe_claude(refreshed["access_token"])
         if usage: return usage
         if err:   last_err = err
