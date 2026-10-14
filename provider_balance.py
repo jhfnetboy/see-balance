@@ -22,7 +22,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, json, os, socket, ssl, subprocess, sys, time
+import base64, json, os, socket, ssl, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -271,8 +271,10 @@ def burn_advice(w, rate, alt_hint=None):
             return (f"     实测消耗     窗口平均几乎为 0（已过 {rate['hours']:.0f}h，用了 {pct:.1f}%）",
                     "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
         if rate:
-            return (f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）",
-                    "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
+            line = f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）"
+            if rate.get("provisional"):   # 窗口刚开：近期没动也不代表整窗安全
+                return line, "     建议         窗口刚开始，先不下结论"
+            return line, ("     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
         return None, None
 
     ph        = rate["per_hour"]
@@ -568,6 +570,8 @@ def _parse_claude_oauth(raw):
         oauth = (json.loads(raw) or {}).get("claudeAiOauth") or {}
     except (json.JSONDecodeError, AttributeError):
         return None
+    if not isinstance(oauth, dict):
+        return None
     if not oauth.get("accessToken") or not oauth.get("refreshToken"):
         return None
     return oauth
@@ -623,20 +627,27 @@ def _refresh_claude_oauth(refresh_token):
 
 def _write_claude_creds(creds, oauth):
     if creds.get("file"):
-        # 保留文件里 claudeAiOauth 以外的字段，原子替换并保持 0600
+        # 保留文件里 claudeAiOauth 以外的字段，原子替换并保持 0600。
+        # 读不到或解析失败（可能正被 Claude Code 改写）就放弃写回，绝不拿空对象覆盖。
         path = creds["file"]
         try:
             with open(path) as f: outer = json.load(f)
         except (OSError, json.JSONDecodeError):
-            outer = {}
+            return False
+        if not isinstance(outer, dict):
+            return False
         outer["claudeAiOauth"] = oauth
-        tmp = path + ".tmp"
+        tmp = None
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # mkstemp：每个进程一个唯一临时文件，权限固定 0600，并发刷新互不踩
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".credentials.", suffix=".tmp")
             with os.fdopen(fd, "w") as f: json.dump(outer, f)
             os.replace(tmp, path)
             return True
         except OSError:
+            if tmp:
+                try: os.unlink(tmp)
+                except OSError: pass
             return False
     payload = json.dumps({"claudeAiOauth": oauth})
     out = _security(["add-generic-password", "-U",
@@ -1515,8 +1526,9 @@ def main():
         else:
             print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
                              prev_data, today_bl, hist))
-        if watch_mode:
+        if watch_mode and (redraw or not state.get("footer_shown")):
             print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n", flush=True)
+            state["footer_shown"] = True
 
     do_query()
 
