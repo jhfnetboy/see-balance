@@ -629,11 +629,14 @@ def _write_claude_creds(creds, oauth):
     if creds.get("file"):
         # 保留文件里 claudeAiOauth 以外的字段，原子替换并保持 0600。
         # 读不到或解析失败（可能正被 Claude Code 改写）就放弃写回，绝不拿空对象覆盖。
-        path = creds["file"]
-        try:
-            with open(path) as f: outer = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return False
+        path  = creds["file"]
+        outer = None
+        for attempt in range(3):   # 读到半截多半是 Claude Code 正在改写，稍等重试
+            try:
+                with open(path) as f: outer = json.load(f)
+                break
+            except (OSError, json.JSONDecodeError):
+                if attempt < 2: time.sleep(0.2)
         if not isinstance(outer, dict):
             return False
         outer["claudeAiOauth"] = oauth
@@ -680,9 +683,12 @@ def fetch_claude():
         new_oauth["accessToken"]  = refreshed["access_token"]
         new_oauth["refreshToken"] = refreshed["refresh_token"]
         new_oauth["expiresAt"]    = refreshed["expires_at"]
-        _write_claude_creds(creds, new_oauth)
+        saved = _write_claude_creds(creds, new_oauth)
         usage, err = _probe_claude(refreshed["access_token"])
-        if usage: return usage
+        if usage:
+            if not saved:   # 新 token 只在本进程内存里；旧 refresh token 若已作废，下次就得重新登录
+                usage["warning"] = "token 已刷新但未能写回凭据，如遇登录失效请 claude /login"
+            return usage
         if err:   last_err = err
 
     return {"error": last_err}
@@ -1249,6 +1255,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         lines.append(f"     ⚠ {cl['error']}")
     else:
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
+        if cl.get("warning"): lines.append(f"     ⚠ {cl['warning']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
         d = today_target_line(cl.get("weekly", {}), today_bl.get("claude_weekly"), today_bl.get("claude_weekly_daily_target"))
@@ -1440,6 +1447,8 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                     parts.append(f"credits: {provider['credits']}")
                 else:
                     parts.append("✓ online")
+            if provider.get("warning"):
+                parts.append(f"⚠ {provider['warning']}")
             print("  ".join(parts))
 
 # ── Main ──────────────────────────────────────────────────────────────────────
