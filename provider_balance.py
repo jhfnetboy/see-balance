@@ -22,7 +22,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, json, os, socket, ssl, subprocess, sys, time
+import base64, json, os, socket, ssl, subprocess, sys, tempfile, time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -165,6 +165,7 @@ def save_state(snapshot):
 HISTORY_MAX_SEC  = 14 * 86400   # 历史保留 14 天
 HISTORY_MAX_ROWS = 4000         # 并限制条数
 RATE_LOOKBACK_MAX_SEC = 12 * 3600   # 速率最多回看 12h（更早的窗口已重置）
+WINDOW_AVG_MIN_SEC    = 24 * 3600   # 不短于 1 天的窗口（7d），建议改用窗口平均速率：跨昼夜，不被一时高峰带偏
 
 
 def history_sample(data: dict) -> dict:
@@ -226,6 +227,34 @@ def burn_rate(hist, key, window_sec, increasing=True):
             "from": v0, "to": v1, "samples": len(seg), "since_ts": int(t0)}
 
 
+def window_avg_rate(w, window_sec):
+    """窗口开始以来的平均速率（%/h）= 已用 ÷ 已过小时。窗口起点用量是 0，不需要历史样本。"""
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return None
+    elapsed = window_sec - max(0.0, w["reset_at"] - time.time())
+    if elapsed < window_sec * 0.05:   # 与 pace_line 同一门槛：刚开窗时分母太小，平均值不稳
+        return None
+    hours = elapsed / 3600.0
+    return {"per_hour": float(w["pct"]) / hours, "hours": hours, "kind": "window"}
+
+
+def advice_rate(w, hist, key, window_sec):
+    """建议用哪个速率：5h 窗口看近期实测；7d 窗口看窗口平均，近期实测只作参考。
+
+    7d 窗口刚开不久（平均值还不稳）时，返回近期速率并标记 provisional —— 只展示，不下结论。
+    """
+    recent = burn_rate(hist, key, window_sec)
+    if window_sec < WINDOW_AVG_MIN_SEC:
+        return recent
+    if not (w or {}).get("reset_at"):   # 不知道窗口位置，只能看近期
+        return recent
+    avg = window_avg_rate(w, window_sec)
+    if avg:
+        avg["recent"] = recent
+        return avg
+    return dict(recent, provisional=True) if recent else None
+
+
 def burn_advice(w, rate, alt_hint=None):
     """返回 (实测消耗行, 进展建议行) 二元组（已是完整行，含缩进）；没有则 None。
 
@@ -238,15 +267,28 @@ def burn_advice(w, rate, alt_hint=None):
     reset_in_h = (max(0.0, w["reset_at"] - time.time()) / 3600.0) if w.get("reset_at") else None
 
     if not rate or rate["per_hour"] <= 0.005:
-        if rate:
-            return (f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）",
+        if rate and rate.get("kind") == "window":
+            return (f"     实测消耗     窗口平均几乎为 0（已过 {rate['hours']:.0f}h，用了 {pct:.1f}%）",
                     "     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
+        if rate:
+            line = f"     实测消耗     近 {rate['hours']:.1f}h 几乎没动（{rate['samples']} 样本，{rate['from']:.1f}%→{rate['to']:.1f}%）"
+            if rate.get("provisional"):   # 窗口刚开：近期没动也不代表整窗安全
+                return line, "     建议         窗口刚开始，先不下结论"
+            return line, ("     建议         可以放心用" if reset_in_h and reset_in_h > 1 else None)
         return None, None
 
     ph        = rate["per_hour"]
     exhaust_h = left / ph
-    line      = (f"     实测消耗     +{ph:.1f}%/h（剩余 {left:.1f}%，近 {rate['hours']:.1f}h，"
-                 f"{rate['samples']} 样本）")
+    if rate.get("kind") == "window":
+        line = f"     实测消耗     窗口平均 +{ph:.1f}%/h（已过 {rate['hours']:.0f}h，剩余 {left:.1f}%）"
+        recent = rate.get("recent")
+        if recent:
+            line += f"；近 {recent['hours']:.1f}h +{max(0.0, recent['per_hour']):.1f}%/h"
+    else:
+        line = (f"     实测消耗     +{ph:.1f}%/h（剩余 {left:.1f}%，近 {rate['hours']:.1f}h，"
+                f"{rate['samples']} 样本）")
+    if rate.get("provisional"):   # 7d 窗口刚开：近期速率会被一时高峰带偏，不据此下结论
+        return line, "     建议         窗口刚开始，先不下结论"
 
     if reset_in_h is None:
         return line, f"     建议         按此速率还能撑 {exhaust_h:.1f}h"
@@ -299,16 +341,17 @@ def history_summary(hist):
     return out
 
 
-def rate_suffix(hist, pkey, key, pct=None):
+def rate_suffix(hist, pkey, key, w=None):
     """紧凑模式的一行后缀：` ⇣+1.2%/h≈12h`（按实测速率还有 12h 见底）。"""
     hk = HIST_KEY_BY_WINDOW.get((pkey, key))
     if not hk:
         return ""
     window_sec = 5 * 3600 if (key.endswith("5h") or key == "five_hour") else 7 * 24 * 3600
-    r = burn_rate(hist, hk, window_sec)
-    if not r or r["per_hour"] <= 0.005:
+    r = advice_rate(w, hist, hk, window_sec)
+    if not r or r.get("provisional") or r["per_hour"] <= 0.005:
         return ""
     text = f" ⇣+{r['per_hour']:.1f}%/h"
+    pct = (w or {}).get("pct")
     if pct is not None:
         text += f"≈{(100.0 - float(pct)) / r['per_hour']:.0f}h"
     return text
@@ -381,18 +424,18 @@ def today_target_line(w: dict, baseline_pct=None, fixed_daily_target=None, total
     if daily_rate is None:
         daily_rate = 100.0 / (total_sec / 86400.0)
 
-    # Bar: current_pct vs target_now (full bar = on or ahead of schedule)
-    fill_pct = min(100.0, (pct / target_now * 100) if target_now > 0 else 100.0)
-    bar_n = int(round(fill_pct / 5))
+    # Bar: target_now on the same 0–100% scale as the "used" bars above, so the two line up
+    bar_n = int(round(min(100.0, target_now) / 5))
     bar   = "█" * bar_n + "░" * (20 - bar_n)
 
+    # 只陈述差值，快慢判断统一交给 pace_line（按到期推算），避免两行结论打架
     diff = pct - target_now
-    if diff > 1.0:
-        status = f"超前{diff:.1f}% ✓"
-    elif diff < -1.0:
-        status = f"还差{abs(diff):.1f}%"
+    if diff >= 0.05:
+        status = f"多用{diff:.1f}%"
+    elif diff <= -0.05:
+        status = f"少用{abs(diff):.1f}%"
     else:
-        status = "进度正常"
+        status = "持平"
 
     rate_str = f"日均+{daily_rate:.1f}%" if total_sec > 86400 else "今日进度"
     return (f"     进度应达    {target_now:5.1f}%  {bar}"
@@ -504,7 +547,7 @@ def _security(args):
     try:
         return subprocess.run(["/usr/bin/security", *args],
                               capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):   # ValueError：输出不是合法 UTF-8
         return None
 
 def _claude_keychain_account():
@@ -518,20 +561,38 @@ def _claude_keychain_account():
                 return val[1:-1] or None
     return None
 
-def _read_claude_creds():
-    account = _claude_keychain_account()
-    if not account: return None
-    out = _security(["find-generic-password", "-s", "Claude Code-credentials",
-                     "-a", account, "-w"])
-    if not out or out.returncode != 0: return None
+def _claude_creds_file():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, ".credentials.json")
+
+def _parse_claude_oauth(raw):
     try:
-        outer = json.loads(out.stdout.strip())
-        oauth = outer.get("claudeAiOauth") or {}
-    except json.JSONDecodeError:
+        oauth = (json.loads(raw) or {}).get("claudeAiOauth") or {}
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(oauth, dict):
         return None
     if not oauth.get("accessToken") or not oauth.get("refreshToken"):
         return None
-    return {"account": account, "oauth": oauth}
+    return oauth
+
+def _read_claude_creds():
+    # Keychain 优先；条目缺失或为空（如 SSH 登录 / 迁移后的机器）时回退到 ~/.claude/.credentials.json
+    account = _claude_keychain_account()
+    if account:
+        out = _security(["find-generic-password", "-s", "Claude Code-credentials",
+                         "-a", account, "-w"])
+        if out and out.returncode == 0:
+            oauth = _parse_claude_oauth(out.stdout.strip())
+            if oauth: return {"account": account, "oauth": oauth}
+    path = _claude_creds_file()
+    try:
+        with open(path) as f:
+            oauth = _parse_claude_oauth(f.read())
+    except (OSError, ValueError):   # ValueError：文件被写到一半、截断在多字节字符中间
+        return None
+    if not oauth: return None
+    return {"file": path, "oauth": oauth}
 
 def _probe_claude(token):
     status, obj = http_get(
@@ -564,10 +625,36 @@ def _refresh_claude_oauth(refresh_token):
             "refresh_token": obj.get("refresh_token", refresh_token),
             "expires_at":    int((time.time() + expires_in) * 1000)}
 
-def _write_claude_creds(account, oauth):
+def _write_claude_creds(creds, oauth):
+    if creds.get("file"):
+        # 保留文件里 claudeAiOauth 以外的字段，原子替换并保持 0600。
+        # 读不到或解析失败（可能正被 Claude Code 改写）就放弃写回，绝不拿空对象覆盖。
+        path  = creds["file"]
+        outer = None
+        for attempt in range(3):   # 读到半截多半是 Claude Code 正在改写，稍等重试
+            try:
+                with open(path) as f: outer = json.load(f)
+                break
+            except (OSError, ValueError):   # ValueError 涵盖 JSONDecodeError 和读到半截多字节字符的 UnicodeDecodeError
+                if attempt < 2: time.sleep(0.2)
+        if not isinstance(outer, dict):
+            return False
+        outer["claudeAiOauth"] = oauth
+        tmp = None
+        try:
+            # mkstemp：每个进程一个唯一临时文件，权限固定 0600，并发刷新互不踩
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".credentials.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f: json.dump(outer, f)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            if tmp:
+                try: os.unlink(tmp)
+                except OSError: pass
+            return False
     payload = json.dumps({"claudeAiOauth": oauth})
     out = _security(["add-generic-password", "-U",
-                     "-s", "Claude Code-credentials", "-a", account, "-w", payload])
+                     "-s", "Claude Code-credentials", "-a", creds["account"], "-w", payload])
     return bool(out and out.returncode == 0)
 
 def fetch_claude():
@@ -596,10 +683,16 @@ def fetch_claude():
         new_oauth["accessToken"]  = refreshed["access_token"]
         new_oauth["refreshToken"] = refreshed["refresh_token"]
         new_oauth["expiresAt"]    = refreshed["expires_at"]
-        _write_claude_creds(creds["account"], new_oauth)
+        saved = _write_claude_creds(creds, new_oauth)
+        unsaved = "token 已刷新但未能写回凭据，如遇登录失效请 claude /login"
         usage, err = _probe_claude(refreshed["access_token"])
-        if usage: return usage
+        if usage:
+            if not saved:   # 新 token 只在本进程内存里；旧 refresh token 若已作废，下次就得重新登录
+                usage["warning"] = unsaved
+            return usage
         if err:   last_err = err
+        if not saved:   # 查询也失败时同样要提示，否则看起来只是一次网络错误
+            last_err = f"{last_err}；{unsaved}"
 
     return {"error": last_err}
 
@@ -1155,7 +1248,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         if d: lines.append(d)
         p = pace_line(cx.get("weekly") or {}, 7 * 24 * 3600)
         if p: lines.append(p)
-        b, a = burn_advice(cx.get("weekly"), burn_rate(hist, "codex_weekly", 7 * 24 * 3600))
+        b, a = burn_advice(cx.get("weekly"), advice_rate(cx.get("weekly"), hist, "codex_weekly", 7 * 24 * 3600))
         if b: lines.append(b)
         if a: lines.append(a)
     lines.append("")
@@ -1165,13 +1258,14 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         lines.append(f"     ⚠ {cl['error']}")
     else:
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
+        if cl.get("warning"): lines.append(f"     ⚠ {cl['warning']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
         lines.append(f"     7d used     {window_pct_bar(cl.get('weekly'))}")
         d = today_target_line(cl.get("weekly", {}), today_bl.get("claude_weekly"), today_bl.get("claude_weekly_daily_target"))
         if d: lines.append(d)
         p = pace_line(cl.get("weekly", {}), 7 * 24 * 3600)
         if p: lines.append(p)
-        b, a = burn_advice(cl.get("weekly"), burn_rate(hist, "claude_weekly", 7 * 24 * 3600))
+        b, a = burn_advice(cl.get("weekly"), advice_rate(cl.get("weekly"), hist, "claude_weekly", 7 * 24 * 3600))
         if b: lines.append(b)
         if a: lines.append(a)
         b, a = burn_advice(cl.get("five_hour"), burn_rate(hist, "claude_5h", 5 * 3600))
@@ -1209,7 +1303,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
                 if d: lines.append(d)
                 p = pace_line(wk, 7 * 24 * 3600)
                 if p: lines.append(p)
-                b, a = burn_advice(wk, burn_rate(hist, keywk, 7 * 24 * 3600), alt_hint=alt_hint)
+                b, a = burn_advice(wk, advice_rate(wk, hist, keywk, 7 * 24 * 3600), alt_hint=alt_hint)
                 if b: lines.append(b)
                 if a: lines.append(a)
 
@@ -1258,7 +1352,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             if d: lines.append(d)
             p = pace_line(main_wk, 7 * 24 * 3600)
             if p: lines.append(p)
-            b, a = burn_advice(main_wk, burn_rate(hist, "grok_weekly", 7 * 24 * 3600))
+            b, a = burn_advice(main_wk, advice_rate(main_wk, hist, "grok_weekly", 7 * 24 * 3600))
             if b: lines.append(b)
             if a: lines.append(a)
 
@@ -1270,7 +1364,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             if d: lines.append(d)
             p = pace_line(bot_wk, 7 * 24 * 3600)
             if p: lines.append(p)
-            b, a = burn_advice(bot_wk, burn_rate(hist, "grok_bot_weekly", 7 * 24 * 3600))
+            b, a = burn_advice(bot_wk, advice_rate(bot_wk, hist, "grok_bot_weekly", 7 * 24 * 3600))
             if b: lines.append(b)
             if a: lines.append(a)
         else:
@@ -1336,7 +1430,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         p    = pace_line(w, window_sec)
                         pace = (" " + p.strip()) if p else ""
                         parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}"
-                                     + rate_suffix(hist, pkey, key, w.get("pct")))
+                                     + rate_suffix(hist, pkey, key, w))
                         continue
                     total_window_sec = 7 * 24 * 3600 if (key in ("weekly", "main_weekly", "bot_weekly")) else totals.get(key, 7 * 24 * 3600)
                     p    = pace_line(w, total_window_sec)
@@ -1350,12 +1444,14 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         pace += (" " + " ".join(d.split())) if d else ""
                     req_str = f" ({w['used']}/{w['limit']} reqs)" if "used" in w and "limit" in w else ""
                     parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}"
-                                 + rate_suffix(hist, pkey, key, w.get("pct")))
+                                 + rate_suffix(hist, pkey, key, w))
             if not has_window:
                 if provider.get("credits") is not None:
                     parts.append(f"credits: {provider['credits']}")
                 else:
                     parts.append("✓ online")
+            if provider.get("warning"):
+                parts.append(f"⚠ {provider['warning']}")
             print("  ".join(parts))
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1430,6 +1526,11 @@ def main():
 
         today_bl = baselines.get(today, {})
 
+        # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
+        redraw = watch_mode and not json_mode and sys.stdout.isatty()
+        if redraw:
+            sys.stdout.write("\033[H\033[2J")
+
         if json_mode:
             print(json.dumps({**data, "history_summary": history_summary(hist)}, indent=2, ensure_ascii=False))
         elif compact:
@@ -1437,11 +1538,13 @@ def main():
         else:
             print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
                              prev_data, today_bl, hist))
+        if watch_mode and (redraw or not state.get("footer_shown")):
+            print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n", flush=True)
+            state["footer_shown"] = True
 
     do_query()
 
     if watch_mode:
-        print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n")
         try:
             while True:
                 time.sleep(interval_min * 60)

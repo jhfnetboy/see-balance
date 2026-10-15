@@ -28,7 +28,7 @@ DEEPSEEK_API_KEY=sk-your-key-here
 
 - **DeepSeek key**：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
 - **Codex**：自动读取 `~/.codex/auth.json`（运行 `codex login` 生成）
-- **Claude Code**：自动读取 macOS Keychain（`claude /login` 登录后自动写入）
+- **Claude Code**：自动读取 macOS Keychain（`claude /login` 登录后自动写入）；Keychain 条目缺失或为空时回退到 `~/.claude/.credentials.json`（遵循 `CLAUDE_CONFIG_DIR`）
 - **Grok (xAI)**：自动读取 `~/.grok/auth.json`（运行 `grok` / `grok login` 生成）或 `XAI_API_KEY`，直连 `cli-chat-proxy.grok.com` 查询：
   - **主周池**（Chat · Imagine · Voice · Build）：7d 使用百分比、进度与重置倒计时；
   - **Grok Bot 池**（Bot / Cursor 独立周额度）：独立周额度不占用主池；支持在 `~/.see-balance.env` 配置 `CURSOR_SESSION_TOKEN` 同步实测用量。
