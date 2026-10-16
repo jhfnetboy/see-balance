@@ -17,7 +17,7 @@ Usage:
   python3 provider_balance.py --no-pet         # hide the Claude pet (or SEE_BALANCE_PET=0)
   python3 provider_balance.py --pet-demo       # preview every pet mood, no API calls
 
-  In --watch on a terminal: p toggles the pet, r refreshes now, q quits.
+  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now, q quits.
 
 Config:
   ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, and proxy settings here
@@ -1509,8 +1509,8 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
 
 # ── Pet（Claude 用量宠物）─────────────────────────────────────────────────────
 #
-# 一只 ASCII 颜文字猫，按 Claude 的用量节奏换情绪，画在终端右侧中间。
-# 画风参考 ts-animal（MIT, https://github.com/ts-animal/ts-animal）的 `∧ _ ∧` 颜文字猫，帧为本项目自绘。
+# 一只 ASCII 宠物（猫 / 兔子 / 小熊，按 s 切换），按 Claude 的用量节奏换情绪，画在终端右下角。
+# 画风参考 ts-animal（MIT, https://github.com/ts-animal/ts-animal）的颜文字动物，帧为本项目自绘。
 # 精灵图里不用 emoji：各终端里 emoji 的宽度不一致，会把右侧对齐弄乱。
 
 PET_HAPPY_PCT     = 99.5        # 7d 用量 ≥ 此值：订阅用完了，开心
@@ -1518,33 +1518,67 @@ PET_ANGRY_MAX_PCT = 90.0        # 上一窗口最后用量 < 此值：一周没�
 PET_ANGRY_SEC     = 12 * 3600   # 生气从窗口重置起持续多久
 PET_TICK_SEC      = 0.5         # 动画帧间隔
 PET_MSG_MAX       = 30          # 气泡文字最多占几列
-PET_W, PET_H      = 36, 8       # 整块（气泡 4 行 + 猫 4 行）固定大小，重画时能完整盖住上一帧
+PET_SPRITE_H      = 8           # 精灵图 7 行 + 1 行留给上下跳
+PET_W, PET_H      = 36, 4 + PET_SPRITE_H   # 整块（气泡 + 精灵图）固定大小，重画时能完整盖住上一帧
 
-_SIT = ["   ∧ _ ∧", "  ( •ω• )", "  /  つつ", " (___)_)~"]
-def _cat(face="( •ω• )", ears="   ∧ _ ∧", paws="  /  つつ", tail=" (___)_)~"):
-    return [ears, "  " + face, paws, tail]
+# 精灵图模板：{el}{er} 眼睛、{m} 嘴巴各 1 列；{hl}{h}{hr} 双手和手里的东西各 2 列；{x1}{x2} 头旁装饰；{t} 尾巴
+PET_SPECIES = {
+    "cat":   ("猫", [
+        r"   /\_______/\   {x1}",
+        r"  /  {el}     {er}  \  {x2}",
+        r" (  =   {m}   =  )",
+        r"  \  {hl}{h}{hr}   /",
+        r"  /           \ ",
+        r" (  |       |  ){t}",
+        r"  \_|_)___(_|_/"]),
+    "bunny": ("兔子", [
+        r"    (\     /)   {x1}",
+        r"    ( \   / )  {x2}",
+        r"   (  {el}   {er}  )",
+        r"   (    {m}    )",
+        r"  o( {hl}{h}{hr}  )o",
+        r"   (         ){t}",
+        r"    (_)   (_)"]),
+    "bear":  ("小熊", [
+        r"  .-.     .-.  {x1}",
+        r" ( (_.---._) ) {x2}",
+        r"  /  {el}   {er}  \ ",
+        r" |    ({m})    |",
+        r"  \ {hl}{h}{hr}  /",
+        r"  /`-------'\ {t}",
+        r" (_/       \_)"]),
+}
+PET_SPECIES_ORDER = list(PET_SPECIES)
+_PET_SLOT_W  = {"el": 1, "er": 1, "m": 1, "hl": 2, "h": 2, "hr": 2}
+_PET_DEFAULT = dict(el="•", er="•", m="ω", hl="  ", h="  ", hr="  ", x1="", x2="", t="~", dx=0, dy=0)
+
+def _pf(**kw):
+    """一帧的部件：没写的用默认值。dx 左右挪一列（东张西望/发抖），dy=-1 往上跳一行。"""
+    return {**_PET_DEFAULT, **kw}
+
+_BLINK = _pf(el="-", er="-")
 
 # 每个情绪一组帧，按 PET_TICK_SEC 循环；重复的帧 = 停留更久
 PET_FRAMES = {
-    "caring":    [_cat(paws="  ( つ♡と)", tail="   し─J")] * 2
-                 + [_cat("( ˘ω˘ )", ears="   ∧ _ ∧  ♥", paws="  ( つ♥と)", tail="   し─J")] * 2,
-    "happy":     [[" ✧ ∧ _ ∧ ✧", "  \\(^ω^)/", "    |  |", "    し J"],
-                  ["   ∧ _ ∧", " ✧\\(^ω^)/✧", "    |  |", "   ~ しJ ~"]],
-    "angry":     [_cat("( `ω´ )", ears="   ∧ _ ∧  #", paws="  (つ  つ", tail="   し─J  ぷん"),
-                  _cat("(`ω´  )", ears="   ∧ _ ∧ # #", paws="  (つ  つ", tail="   し─J ぷんぷん")],
-    "encourage": [_cat("( •ω• )ノ☆", paws="  (  つ )", tail="   し─J"),
-                  _cat("( >ω< )ノ", ears="   ∧ _ ∧   ☆", paws="  (  つ )", tail="   し─J")],
+    "caring":    [_pf(hl="つ", h="♡ ", hr="と")] * 2
+                 + [_pf(el="˘", er="˘", hl="つ", h="♥ ", hr="と", x1="♥")] * 2,
+    "happy":     [_pf(el="^", er="^", m="▽", hl="\\ ", hr=" /", x1="✧", dy=-1),
+                  _pf(el="^", er="^", m="▽", hl="\\ ", hr=" /", x2=" ✧")],
+    "angry":     [_pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="#", t="!"),
+                  _pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="# #", x2=" ぷんぷん", t="!", dx=1)],
+    "encourage": [_pf(el=">", er="<", m="o", hl="ノ", h="☆ ", x1="☆"),
+                  _pf(el="^", er="^", m="▽", hl="ノ", h="☆ ", x2="  ☆", dy=-1)],
 }
 
 # 日常小动作：(气泡文字, 帧序列)；没别的情绪时每隔几秒随机换一个
 PET_IDLE = [
-    ("发呆中…",         [_SIT] * 5 + [_cat("( -ω- )")]),
-    ("摇尾巴～",        [_SIT, _cat(tail=" (___)_)∽"), _SIT, _cat(tail=" (___)_) ~")]),
-    ("左看看，右看看",  [_cat("(•ω•  )")] * 3 + [_cat("(  •ω•)")] * 3),
-    ("哈～欠",          [_SIT, _cat("( -o- )"), _cat("( >O< ) ふぁ"), _cat("( >O< ) ふぁ"), _cat("( -ω- )")]),
-    ("舔舔爪子",        [_cat("( -ω-)ノ", paws="  /  つ"), _cat("( -ω-)っ ペロ", paws="  /  つ")]),
-    ("伸个懒腰",        [_SIT, _SIT, ["", "   ∧ _ ∧", " ⊂( -ω- )⊃", "  (___)_)~"]] + [["", "   ∧ _ ∧", " ⊂( >ω< )⊃", "  (___)_)~"]] * 2),
-    ("Zzz…",            [_cat("( -ω- )  z"), _cat("( -ω- ) zZ"), _cat("( -ω- )zZz")]),
+    ("发呆中…",         [_pf()] * 5 + [_BLINK]),
+    ("摇尾巴～",        [_pf(), _pf(t="∽"), _pf(), _pf(t=" ~")]),
+    ("东张西望",        [_pf(dx=-1)] * 3 + [_pf(dx=1)] * 3),
+    ("哈～欠",          [_pf(), _pf(el="-", er="-", m="o"), _pf(el=">", er="<", m="O", x2=" ふぁ～")] + [_pf(el=">", er="<", m="O", x2=" ふぁ～")] + [_BLINK]),
+    ("舔舔爪子",        [_pf(el="-", er="-", hr="ノ"), _pf(el="-", er="-", hr="っ", x2=" ペロ")]),
+    ("伸个懒腰",        [_pf(), _pf()] + [_pf(el=">", er="<", hl="\\ ", hr=" /", dy=-1)] * 2),
+    ("Zzz…",            [_pf(el="-", er="-", x1="z"), _pf(el="-", er="-", x1="zZ"), _pf(el="-", er="-", x1="zZz", x2="z")]),
 ]
 
 
@@ -1565,6 +1599,20 @@ def _clip(s: str, width: int) -> str:
             break
         out += c
     return out + "…"
+
+
+def pet_sprite(species: str, parts: dict):
+    """按物种模板和一帧的部件拼出精灵图（PET_SPRITE_H 行）。槽位按固定列宽居中，宽字符不会把身体挤歪。"""
+    _, tpl = PET_SPECIES.get(species) or PET_SPECIES[PET_SPECIES_ORDER[0]]
+    vals = {}
+    for k, v in parts.items():
+        if k in _PET_SLOT_W:
+            v = _pad(v, _PET_SLOT_W[k])
+        vals[k] = v
+    indent = " " * (1 + int(parts.get("dx", 0)))
+    lines  = [indent + line.format(**vals).rstrip() for line in tpl]
+    lines  = (lines + [""]) if parts.get("dy", 0) < 0 else ([""] + lines)
+    return (lines + [""] * PET_SPRITE_H)[:PET_SPRITE_H]
 
 
 def pet_track_reset(cl, pet_state, now=None):
@@ -1634,9 +1682,15 @@ def pet_bubble(text: str):
 class PetView:
     """宠物动画状态：当前情绪 + 帧序号；日常状态下每隔几秒随机换一个小动作。"""
 
-    def __init__(self, rng=None):
+    def __init__(self, rng=None, species="cat"):
         self.rng, self.mood, self.msg = rng or random.Random(), "idle", None
         self.tick, self.idle_i, self.idle_until = 0, 0, 0.0
+        self.species = species if species in PET_SPECIES else PET_SPECIES_ORDER[0]
+
+    def next_species(self):
+        i = PET_SPECIES_ORDER.index(self.species)
+        self.species = PET_SPECIES_ORDER[(i + 1) % len(PET_SPECIES_ORDER)]
+        return self.species
 
     def set_mood(self, mood, msg=None):
         if (mood, msg) != (self.mood, self.msg):
@@ -1657,9 +1711,9 @@ class PetView:
             caption, seq = PET_IDLE[self.idle_i]
         else:
             caption, seq = self.msg or "", PET_FRAMES[self.mood]
-        cat = seq[self.tick % len(seq)]
+        sprite = pet_sprite(self.species, seq[self.tick % len(seq)])
         self.tick += 1
-        return [_pad(line, PET_W) for line in pet_bubble(caption) + cat][:PET_H]
+        return [_pad(line, PET_W) for line in pet_bubble(caption) + sprite][:PET_H]
 
 
 def screen_rows(text: str, cols: int):
@@ -1674,15 +1728,15 @@ def screen_rows(text: str, cols: int):
     return rows
 
 
-def pet_place(widths, cols, center_row):
-    """在每行已占列数 widths 里，找离 center_row 最近、右侧放得下宠物的位置。
+def pet_place(widths, cols, pref_top):
+    """在每行已占列数 widths 里，找离 pref_top（期望的起始行）最近、右侧放得下宠物的位置。
 
     返回 0 起算的 (起始行, 起始列)；哪儿都放不下返回 None。宠物贴右边、右侧留 1 列，左侧和正文至少隔 2 列。
     """
     col, n = cols - PET_W - 1, len(widths)
     if col < 0 or n < PET_H:
         return None
-    top0 = max(0, min(center_row - PET_H // 2, n - PET_H))
+    top0 = max(0, min(pref_top, n - PET_H))
     for d in range(n):
         for top in (top0 - d, top0 + d):
             if 0 <= top <= n - PET_H and all(w + 2 <= col for w in widths[top:top + PET_H]):
@@ -1691,10 +1745,10 @@ def pet_place(widths, cols, center_row):
 
 
 def pet_merge_static(text: str, pet_lines, cols: int) -> str:
-    """一次性查询：把一帧宠物拼在正文右侧（垂直居中于正文）；右侧放不下就接在正文下面。"""
+    """一次性查询：把一帧宠物拼在正文右下角；右侧放不下就接在正文下面。"""
     lines = text.split("\n")
     lines += [""] * max(0, PET_H - len(lines))
-    place = pet_place([display_width(l) for l in lines], cols, len(lines) // 2)
+    place = pet_place([display_width(l) for l in lines], cols, len(lines) - PET_H)
     if not place:
         return text + "\n" + "\n".join(l.rstrip() for l in pet_lines)
     top, col = place
@@ -1714,20 +1768,22 @@ def pet_draw(pet_lines, top, col):
 
 
 def pet_demo():
-    """--pet-demo：不查接口，依次演示每种情绪和日常小动作。"""
+    """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
     view  = PetView()
     shows = [("caring", "照这样到期要用 135%，歇一歇 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
-        for mood, arg in shows:
+        for i, (mood, arg) in enumerate(shows):
+            view.species = PET_SPECIES_ORDER[i % len(PET_SPECIES_ORDER)]
             view.set_idle(arg) if mood == "idle" else view.set_mood(mood, arg)
-            print(f"── {mood}\n" + "\n".join(l.rstrip() for l in view.frame()) + "\n")
+            print(f"── {PET_SPECIES[view.species][0]} · {mood}\n" + "\n".join(l.rstrip() for l in view.frame()) + "\n")
         return
     sys.stdout.write("\033[?25l")
     try:
         print("\n" * (PET_H - 1))
-        for mood, arg in shows:
+        for i, (mood, arg) in enumerate(shows):
+            view.species = PET_SPECIES_ORDER[i % len(PET_SPECIES_ORDER)]
             view.set_idle(arg) if mood == "idle" else view.set_mood(mood, arg)
             for _ in range(8):
                 sys.stdout.write(f"\033[{PET_H}F" + "\n".join(view.frame()) + "\n")
@@ -1778,18 +1834,20 @@ def main():
                    and sys.stdout.isatty() and sys.stdin.isatty()
                    and os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp())
 
-    state = {"full": load_state(), "pet": PetView(), "pet_visible": True, "size": None, "place": None}
+    full0 = load_state()
+    state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
+             "pet_visible": True, "size": None, "place": None}
 
     def paint():
-        """整屏重画：正文 + footer，再把宠物画在右侧中间（放不下就在 footer 下提示）。"""
+        """整屏重画：正文 + footer，再把宠物画在右下角（放不下就在 footer 下提示）。"""
         size  = shutil.get_terminal_size()
-        keys  = " · p 宠物" if pet_mode else ""
+        keys  = " · p 宠物 · s 换宠物" if pet_mode else ""
         text  = state["body"] + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n"
         place = None
         if pet_mode and state["pet_visible"]:
             rows    = screen_rows(text, size.columns)   # 末尾空行就是光标所在行
             visible = rows[-size.lines:] + [0] * max(0, size.lines - len(rows))
-            place   = pet_place(visible, size.columns, size.lines // 2)
+            place   = pet_place(visible, size.columns, size.lines - PET_H - 1)   # 底下留 1 行给光标
             if not place:
                 need  = max(visible) + 2 + PET_W + 1
                 text += f"   （终端太窄，宠物先躲起来了：加宽到约 {need} 列可显示；p 隐藏宠物）\n"
@@ -1826,6 +1884,13 @@ def main():
                 if ch == "p" and pet_mode:
                     state["pet_visible"] = not state["pet_visible"]
                     paint()
+                if ch == "s" and pet_mode and state["pet_visible"]:
+                    # 换下一种宠物，并记进 state.json，下次启动沿用
+                    full = state["full"]
+                    full["pet"] = dict(full.get("pet") or {}, species=state["pet"].next_species())
+                    save_state(full)
+                    if state["place"]:
+                        pet_draw(state["pet"].frame(), *state["place"])
 
     def do_query():
         full      = state["full"]
