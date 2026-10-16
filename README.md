@@ -55,7 +55,28 @@ python3 ~/bin/provider_balance.py          # 一次性查询
 python3 ~/bin/provider_balance.py --watch 30   # 每 30 分钟
 python3 ~/bin/provider_balance.py --compact    # 每 provider 一行
 python3 ~/bin/provider_balance.py --json       # 原始 JSON
+python3 ~/bin/provider_balance.py --no-pet     # 不显示 Claude 宠物（或设 SEE_BALANCE_PET=0）
+python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的每种情绪
 ```
+
+`--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`r`** 立即刷新，**`q`** 退出。
+
+## Claude 宠物
+
+完整视图右侧中间有一只 ASCII 颜文字猫，只看 **Claude** 的用量，按优先级从高到低换情绪：
+
+| 情绪 | 什么时候 |
+|---|---|
+| 开心 | 7d 周额度用完（≥ 99.5%） |
+| 献爱心（提醒休息） | 7d 按当前进度预计到期用量 > 120%；或 5h 已用满；或按实测速率 5h 会在重置前见底 |
+| 生气 | 7d 窗口重置时，上一周最后用量 < 90%（重置后 12h 内） |
+| 鼓励 | 7d 预计到期用量 ≤ 75% |
+| 日常 | 其它情况：每隔几秒随机发呆、摇尾巴、左右看、打哈欠、舔爪、伸懒腰、睡觉 |
+
+- 宠物优先贴着终端右侧居中；中间那几行的正文太宽时，就近找一块空位；哪儿都放不下时会隐藏，并在 footer 下提示需要多宽的终端。
+- 一次性查询时显示静态的一帧；`--compact`、`--json` 和管道输出不显示宠物。
+- “生气”要知道上周最后的用量，所以会在 `state.json` 的 `pet` 段记下 Claude 7d 窗口的位置。
+- 画风参考 [ts-animal](https://github.com/ts-animal/ts-animal)（MIT）的颜文字猫，帧为本项目自绘。
 
 ## 输出示例
 
