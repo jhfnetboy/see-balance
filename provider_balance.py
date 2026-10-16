@@ -1728,6 +1728,11 @@ class PetView:
         self.tick += 1
         return [_pad(line, PET_W) for line in pet_bubble(caption) + sprite][:PET_H]
 
+    def busy_frame(self, text="稍等片刻，正在刷新…"):
+        """刷新取数期间的静态帧（取数会阻塞几秒，动画停在这一帧）。"""
+        sprite = pet_sprite(self.species, _pf(m="o", x1="…"))
+        return [_pad(line, PET_W) for line in pet_bubble(text) + sprite][:PET_H]
+
 
 def screen_rows(text: str, cols: int):
     """把文本按终端宽度折行，返回每个屏幕行已占的列数。"""
@@ -1988,9 +1993,21 @@ def main():
             signal.signal(sig, lambda *_: sys.exit(0))
         tty.setcbreak(fd)                    # 按键不用回车、不回显；Ctrl+C 照常生效
         sys.stdout.write("\033[?25l")        # 动画期间隐藏光标
+
+        def show_busy():
+            """取数要好几秒：先让宠物说“稍等片刻”；宠物不在屏幕上就在 footer 下给一行提示。"""
+            if pet_mode and state["pet_visible"] and state["place"]:
+                pet_draw(state["pet"].busy_frame(), *state["place"])
+            else:
+                sys.stdout.write("\r⏳ 正在刷新，稍等片刻…")
+                sys.stdout.flush()
+
         try:
+            sys.stdout.write("⏳ 正在获取数据，稍等片刻…")
+            sys.stdout.flush()
             do_query()
             while wait_interactive(interval_min * 60):
+                show_busy()
                 state["full"] = load_state()
                 do_query()
         except KeyboardInterrupt:
