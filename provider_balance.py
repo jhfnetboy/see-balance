@@ -26,7 +26,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, io, json, os, random, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, time, unicodedata
+import base64, io, json, os, random, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1581,6 +1581,8 @@ PET_FRAMES = {
                   _pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="# #", x2=" ぷんぷん", t="!", dx=1)],
     "encourage": [_pf(el=">", er="<", m="o", hl="ノ", h="☆ ", x1="☆"),
                   _pf(el="^", er="^", m="▽", hl="ノ", h="☆ ", x2="  ☆", dy=-1)],
+    # 刷新取数中（后台线程在拉数据，动画照常跑）
+    "busy":      [_pf(m="o", x1="."), _pf(x1=".."), _pf(m="o", x1="..."), _pf(x1="...")],
 }
 
 # 日常小动作：(气泡文字, 帧序列)；没别的情绪时每隔几秒随机换一个
@@ -1728,10 +1730,6 @@ class PetView:
         self.tick += 1
         return [_pad(line, PET_W) for line in pet_bubble(caption) + sprite][:PET_H]
 
-    def busy_frame(self, text="稍等片刻，正在刷新…"):
-        """刷新取数期间的静态帧（取数会阻塞几秒，动画停在这一帧）。"""
-        sprite = pet_sprite(self.species, _pf(m="o", x1="…"))
-        return [_pad(line, PET_W) for line in pet_bubble(text) + sprite][:PET_H]
 
 
 def screen_rows(text: str, cols: int):
@@ -1869,51 +1867,85 @@ def main():
             if not place:
                 need  = max(visible) + 2 + PET_W + 1
                 text += f"   （终端太窄，宠物先躲起来了：加宽到约 {need} 列可显示；p 隐藏宠物）\n"
+        if state.get("busy") and not place:   # 宠物不在屏幕上，就用一行字提示正在刷新
+            text += "⏳ 正在刷新，稍等片刻…\n"
         sys.stdout.write("\033[H\033[2J" + text)
         sys.stdout.flush()
         state["size"], state["place"] = size, place
         if place:
             pet_draw(state["pet"].frame(), *place)
 
+    def pump(timeout):
+        """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
+        if pet_mode and state["pet_visible"]:
+            if shutil.get_terminal_size() != state["size"]:
+                paint()      # 终端尺寸变了：整屏重排
+            elif state["place"]:
+                pet_draw(state["pet"].frame(), *state["place"])
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], max(0.0, timeout))
+        if not ready:
+            return None
+        keys = os.read(fd, 64).decode(errors="ignore")
+        if "\033" in keys:   # 方向键 / F 键等转义序列（F1 = ESC O P）整段忽略，免得误触 p
+            return None
+        for ch in keys.lower():
+            if ch == "q":
+                return "quit"
+            if ch == "r" and not state.get("busy"):
+                return "refresh"
+            if ch == "p" and pet_mode:
+                state["pet_visible"] = not state["pet_visible"]
+                paint()
+            if ch == "s" and pet_mode and state["pet_visible"]:
+                # 换下一种宠物，并记进 state.json，下次启动沿用
+                full = state["full"]
+                full["pet"] = dict(full.get("pet") or {}, species=state["pet"].next_species())
+                save_state(full)
+                if state["place"]:
+                    pet_draw(state["pet"].frame(), *state["place"])
+        return None
+
     def wait_interactive(seconds):
         """等到下次刷新，期间推进宠物动画、处理按键。返回 False 表示要退出。"""
         deadline = time.time() + seconds
-        fd       = sys.stdin.fileno()
         while True:
-            if pet_mode and state["pet_visible"]:
-                if shutil.get_terminal_size() != state["size"]:
-                    paint()      # 终端尺寸变了：整屏重排
-                elif state["place"]:
-                    pet_draw(state["pet"].frame(), *state["place"])
             left = deadline - time.time()
             if left <= 0:
                 return True
-            ready, _, _ = select.select([fd], [], [], min(PET_TICK_SEC, left))
-            if not ready:
-                continue
-            keys = os.read(fd, 64).decode(errors="ignore")
-            if "\033" in keys:   # 方向键 / F 键等转义序列（F1 = ESC O P）整段忽略，免得误触 p
-                continue
-            for ch in keys.lower():
-                if ch == "q":
-                    return False
-                if ch == "r":
-                    return True
-                if ch == "p" and pet_mode:
-                    state["pet_visible"] = not state["pet_visible"]
-                    paint()
-                if ch == "s" and pet_mode and state["pet_visible"]:
-                    # 换下一种宠物，并记进 state.json，下次启动沿用
-                    full = state["full"]
-                    full["pet"] = dict(full.get("pet") or {}, species=state["pet"].next_species())
-                    save_state(full)
-                    if state["place"]:
-                        pet_draw(state["pet"].frame(), *state["place"])
+            act = pump(min(PET_TICK_SEC, left))
+            if act:
+                return act == "refresh"
 
-    def do_query():
+    def refresh_interactive():
+        """后台线程拉数据，主线程照常跑动画、响应按键；拉完再渲染。返回 False 表示要退出。"""
+        box = {}
+        def work():
+            try:
+                box["data"] = collect()
+            except BaseException as e:   # 交给主线程抛出，和原来同步取数时一样
+                box["err"] = e
+        worker = threading.Thread(target=work, daemon=True)   # 中途按 q 直接退出，不等它
+        worker.start()
+        state["busy"] = True
+        state["pet"].set_mood("busy", "稍等片刻，正在刷新…")
+        paint()
+        try:
+            while worker.is_alive():
+                if pump(PET_TICK_SEC) == "quit":
+                    return False
+        finally:
+            state["busy"] = False
+        if "err" in box:
+            raise box["err"]
+        state["full"] = load_state()
+        do_query(box["data"])
+        return True
+
+    def do_query(data=None):
         full      = state["full"]
         prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok") if k in full}
-        data      = collect()
+        data      = data if data is not None else collect()
 
         # ── History（实测消耗速率的数据源）──────────────────────────────────
         hist = full.get("history") or []
@@ -1994,26 +2026,17 @@ def main():
         tty.setcbreak(fd)                    # 按键不用回车、不回显；Ctrl+C 照常生效
         sys.stdout.write("\033[?25l")        # 动画期间隐藏光标
 
-        def show_busy():
-            """取数要好几秒：先让宠物说“稍等片刻”；宠物不在屏幕上就在 footer 下给一行提示。"""
-            if pet_mode and state["pet_visible"] and state["place"]:
-                pet_draw(state["pet"].busy_frame(), *state["place"])
-            else:
-                sys.stdout.write("\r⏳ 正在刷新，稍等片刻…")
-                sys.stdout.flush()
-
+        state["body"] = "⏳ 正在获取数据，稍等片刻…"   # 第一次取数前先占个位，宠物照常在右下角动
         try:
-            sys.stdout.write("⏳ 正在获取数据，稍等片刻…")
-            sys.stdout.flush()
-            do_query()
-            while wait_interactive(interval_min * 60):
-                show_busy()
-                state["full"] = load_state()
-                do_query()
+            ok = refresh_interactive()
+            while ok and wait_interactive(interval_min * 60):
+                ok = refresh_interactive()
         except KeyboardInterrupt:
             pass
         finally:
             try:
+                if state["place"] and state["pet_visible"]:   # 擦掉宠物，别留在 shell 里
+                    pet_draw([" " * PET_W] * PET_H, *state["place"])
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 sys.stdout.write("\033[?25h")
                 sys.stdout.flush()
