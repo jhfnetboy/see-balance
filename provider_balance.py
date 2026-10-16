@@ -291,16 +291,16 @@ def burn_advice(w, rate, alt_hint=None):
         return line, "     建议         窗口刚开始，先不下结论"
 
     if reset_in_h is None:
-        return line, f"     建议         按此速率还能撑 {exhaust_h:.1f}h"
+        return line, f"     建议         按此速率还能撑 {fmt_countdown(exhaust_h * 3600)}"
     if reset_in_h < 0.25:   # 还剩 <15 分钟，建议已无意义（马上就是新窗口）
         return line, None
     if exhaust_h < reset_in_h:
         tail = alt_hint if alt_hint else "建议降速或换池"
-        return line, (f"     建议         ⚠ 按此速率 {exhaust_h:.1f}h 后见底，"
-                      f"比重置早 {reset_in_h - exhaust_h:.1f}h —— {tail}")
+        return line, (f"     建议         ⚠ 按此速率 {fmt_countdown(exhaust_h * 3600)} 后见底，"
+                      f"比重置早 {fmt_countdown((reset_in_h - exhaust_h) * 3600)} —— {tail}")
     projected = min(100.0, pct + ph * reset_in_h)
     verdict   = "✓ 撑得到重置" if projected < 97 else "⚠ 刚好卡在重置前"
-    return line, (f"     建议         {verdict}（还剩 {reset_in_h:.1f}h，届时约用 {projected:.0f}%）")
+    return line, (f"     建议         {verdict}（还剩 {fmt_countdown(reset_in_h * 3600)}，届时约用 {projected:.0f}%）")
 
 
 HIST_KEY_BY_WINDOW = {
@@ -342,7 +342,7 @@ def history_summary(hist):
 
 
 def rate_suffix(hist, pkey, key, w=None):
-    """紧凑模式的一行后缀：` ⇣+1.2%/h≈12h`（按实测速率还有 12h 见底）。"""
+    """紧凑模式的一行后缀：` ⇣+1.2%/h≈12h`（按实测速率还有 12h 见底；满 1 天显示为 `1d02h`）。"""
     hk = HIST_KEY_BY_WINDOW.get((pkey, key))
     if not hk:
         return ""
@@ -353,7 +353,7 @@ def rate_suffix(hist, pkey, key, w=None):
     text = f" ⇣+{r['per_hour']:.1f}%/h"
     pct = (w or {}).get("pct")
     if pct is not None:
-        text += f"≈{(100.0 - float(pct)) / r['per_hour']:.0f}h"
+        text += f"≈{fmt_countdown((100.0 - float(pct)) / r['per_hour'] * 3600)}"
     return text
 
 
@@ -393,12 +393,18 @@ def deepseek_lines(ds, hist):
 
 # ── Render helpers ────────────────────────────────────────────────────────────
 
+def fmt_countdown(seconds):
+    """倒计时：满 1 天显示 `5d03h`，不足 1 天显示 `3h26m`（向下取整）。"""
+    mins = max(0, int(seconds / 60))
+    if mins >= 24 * 60:
+        return f"{mins // 1440}d{mins % 1440 // 60:02d}h"
+    return f"{mins // 60}h{mins % 60:02d}m"
+
 def window_pct_bar(w):
     if not w: return "—"
     pct = max(0.0, min(100.0, float(w.get("pct", 0))))
     if w.get("reset_at"):
-        mins  = max(0, int((w["reset_at"] - time.time()) / 60))
-        reset = f"resets in {mins//60}h{mins%60:02d}m"
+        reset = f"resets in {fmt_countdown(w['reset_at'] - time.time())}"
     else:
         reset = "reset ?"
     bar_n = int(round(pct / 5))
@@ -510,8 +516,8 @@ def fetch_codex():
         with open(path) as f:
             tokens = json.load(f).get("tokens") or {}
         token = tokens.get("access_token")
-    except (OSError, json.JSONDecodeError):
-        token = None
+    except (OSError, ValueError, AttributeError):
+        tokens, token = {}, None
     if not token: return {"error": "no codex auth (run: codex login)"}
 
     status, obj = http_get("https://chatgpt.com/backend-api/wham/usage",
@@ -538,8 +544,17 @@ def fetch_codex():
         pct = d.get("used_percent", 0) or 0
         windows[slot] = {"pct": round(max(0.0, min(100.0, float(pct))), 1),
                          "reset_at": parse_reset(d.get("reset_at"))}
-    return {"plan": obj.get("plan_type"),
+    return {"plan": obj.get("plan_type"), "account": obj.get("email") or _jwt_email(tokens.get("id_token")),
             "five_hour": windows.get("five_hour"), "weekly": windows.get("weekly")}
+
+def _jwt_email(token):
+    """只解码 JWT payload 取 email 用于显示，不校验签名。"""
+    try:
+        payload = token.split(".")[1]
+        claims  = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return claims.get("email") if isinstance(claims, dict) else None
+    except (AttributeError, IndexError, ValueError):
+        return None
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
@@ -564,6 +579,17 @@ def _claude_keychain_account():
 def _claude_creds_file():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     return os.path.join(base, ".credentials.json")
+
+def _claude_account_email():
+    # Claude Code 把登录账号缓存在 ~/.claude.json（设了 CLAUDE_CONFIG_DIR 时在该目录下）
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = os.path.join(base, ".claude.json") if base else os.path.expanduser("~/.claude.json")
+    try:
+        with open(path) as f:
+            acct = (json.load(f) or {}).get("oauthAccount") or {}
+        return acct.get("emailAddress") if isinstance(acct, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 def _parse_claude_oauth(raw):
     try:
@@ -658,6 +684,12 @@ def _write_claude_creds(creds, oauth):
     return bool(out and out.returncode == 0)
 
 def fetch_claude():
+    usage = _fetch_claude_usage()
+    if "error" not in usage:
+        usage["account"] = _claude_account_email()
+    return usage
+
+def _fetch_claude_usage():
     last_err = "auth required"
     creds    = _read_claude_creds()
 
@@ -1241,6 +1273,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
     if "error" in cx:
         lines.append(f"     ⚠ {cx['error']}")
     else:
+        if cx.get("account"): lines.append(f"     account     {cx['account']}")
         if cx.get("plan"): lines.append(f"     plan        {cx['plan']}")
         lines.append(f"     5h used     {window_pct_bar(cx.get('five_hour')) if cx.get('five_hour') else '— (当前套餐无 5h 窗口)'}")
         lines.append(f"     7d used     {window_pct_bar(cx.get('weekly')) if cx.get('weekly') else '— (当前套餐无 7d 窗口)'}")
@@ -1257,6 +1290,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
     if "error" in cl:
         lines.append(f"     ⚠ {cl['error']}")
     else:
+        if cl.get("account"): lines.append(f"     account     {cl['account']}")
         if cl.get("plan"): lines.append(f"     plan        {cl['plan']}")
         if cl.get("warning"): lines.append(f"     ⚠ {cl['warning']}")
         lines.append(f"     5h used     {window_pct_bar(cl.get('five_hour'))}")
@@ -1424,12 +1458,12 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                     if w.get("pct") is None:
                         continue
                     has_window = True
-                    mins = max(0, int((w["reset_at"] - time.time()) / 60)) if w.get("reset_at") else 0
+                    left = fmt_countdown(w["reset_at"] - time.time() if w.get("reset_at") else 0)
                     if pkey == "agy":
                         window_sec = 5 * 3600 if key.endswith("5h") else 7 * 24 * 3600
                         p    = pace_line(w, window_sec)
                         pace = (" " + p.strip()) if p else ""
-                        parts.append(f"{lbl}: {w['pct']}% ({mins//60}h{mins%60:02d}m){pace}"
+                        parts.append(f"{lbl}: {w['pct']}% ({left}){pace}"
                                      + rate_suffix(hist, pkey, key, w))
                         continue
                     total_window_sec = 7 * 24 * 3600 if (key in ("weekly", "main_weekly", "bot_weekly")) else totals.get(key, 7 * 24 * 3600)
@@ -1443,7 +1477,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                         d = today_target_line(w, today_bl.get(f"{pkey}_daily"), total_sec=total_window_sec, daily_rate=100.0)
                         pace += (" " + " ".join(d.split())) if d else ""
                     req_str = f" ({w['used']}/{w['limit']} reqs)" if "used" in w and "limit" in w else ""
-                    parts.append(f"{lbl}: {w['pct']}%{req_str} ({mins//60}h{mins%60:02d}m){pace}"
+                    parts.append(f"{lbl}: {w['pct']}%{req_str} ({left}){pace}"
                                  + rate_suffix(hist, pkey, key, w))
             if not has_window:
                 if provider.get("credits") is not None:
