@@ -264,6 +264,9 @@ def advice_rate(w, hist, key, window_sec):
     return dict(recent, provisional=True) if recent else None
 
 
+EXHAUSTED_PCT = 99.5   # 用量 ≥ 此值视为额度已用完：不再谈速率/节奏，只说什么时候重置
+
+
 def burn_advice(w, rate, alt_hint=None):
     """返回 (实测消耗行, 进展建议行) 二元组（已是完整行，含缩进）；没有则 None。
 
@@ -274,6 +277,11 @@ def burn_advice(w, rate, alt_hint=None):
     pct  = float(w["pct"])
     left = max(0.0, 100.0 - pct)
     reset_in_h = (max(0.0, w["reset_at"] - time.time()) / 3600.0) if w.get("reset_at") else None
+
+    if pct >= EXHAUSTED_PCT:   # 已经用完：“按此速率 0h00m 后见底 / 建议降速”都没意义了
+        when = f"{fmt_countdown(reset_in_h * 3600)} 后重置" if reset_in_h is not None else "等待重置"
+        tail = f" —— {alt_hint}" if alt_hint else ""
+        return None, f"     建议         ⛔ 已用完，{when}{tail}"
 
     if not rate or rate["per_hour"] <= 0.005:
         if rate and rate.get("kind") == "window":
@@ -356,6 +364,8 @@ def rate_suffix(hist, pkey, key, w=None):
     if not hk:
         return ""
     window_sec = 5 * 3600 if (key.endswith("5h") or key == "five_hour") else 7 * 24 * 3600
+    if float((w or {}).get("pct") or 0) >= EXHAUSTED_PCT:   # 已用完，没有“还剩多久见底”
+        return ""
     r = advice_rate(w, hist, hk, window_sec)
     if not r or r.get("provisional") or r["per_hour"] <= 0.005:
         return ""
@@ -478,6 +488,9 @@ def pace_line(w: dict, total_sec: int) -> str:
     Compares actual usage against how much should have been used given elapsed
     time, then projects what the final usage will be at the current rate.
     """
+    if w and w.get("pct") is not None and w.get("reset_at") and float(w["pct"]) >= EXHAUSTED_PCT:
+        elapsed = max(0.0, total_sec - max(0.0, w["reset_at"] - time.time()))
+        return f"       ⛔ 已用完  已过{elapsed / total_sec * 100:.0f}%时间，等待重置"
     proj = pace_projection(w, total_sec)
     if not proj:
         return ""
@@ -1513,7 +1526,7 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
 # 画风参考 ts-animal（MIT, https://github.com/ts-animal/ts-animal）的颜文字动物，帧为本项目自绘。
 # 精灵图里不用 emoji：各终端里 emoji 的宽度不一致，会把右侧对齐弄乱。
 
-PET_HAPPY_PCT     = 99.5        # 7d 用量 ≥ 此值：订阅用完了，开心
+PET_HAPPY_PCT     = EXHAUSTED_PCT  # 7d 用量 ≥ 此值：订阅用完了，开心
 PET_ANGRY_MAX_PCT = 90.0        # 上一窗口最后用量 < 此值：一周没用完，生气
 PET_ANGRY_SEC     = 12 * 3600   # 生气从窗口重置起持续多久
 PET_TICK_SEC      = 0.5         # 动画帧间隔
