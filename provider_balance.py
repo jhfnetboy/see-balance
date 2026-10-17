@@ -1967,7 +1967,19 @@ def check_update(upd=None, force=False, now=None):
     却还没暂存时，不等到点，马上补下载。
     """
     now, upd = now or time.time(), dict(upd or {})
-    behind = (not _from_git_checkout() and _newer(upd.get("latest")) and not staged_update()[0])
+    staged = staged_update()[0]
+    latest = upd.get("latest")
+    if staged and latest and _version_key(staged) > _version_key(latest):
+        # 暂存之后又有一次检查（可能是别的副本做的）说上游比它低：上游回滚了，这份别再装
+        try:
+            if os.lstat(UPDATE_STAGED).st_mtime < float(upd.get("checked_at") or 0):
+                UPDATE_STAGED.unlink()
+                staged = None
+        except OSError:
+            pass
+    # 上游有比本机和暂存都新的版本，这份装好的副本却还没拿到：不等到点，马上补下载
+    behind = (not _from_git_checkout() and _newer(latest)
+              and (not staged or _version_key(staged) < _version_key(latest)))
     if upd.get("error"):
         wait = UPDATE_RETRY_SEC       # 上次没成：过 1 小时再试（补下载也一样，别每次刷新都下）
     else:
@@ -1995,7 +2007,8 @@ def check_update(upd=None, force=False, now=None):
                 UPDATE_STAGED.unlink()
         except OSError:
             pass
-    if _newer(latest):
+    staged = staged_update()[0]
+    if _newer(latest) and not (staged and _version_key(staged) >= _version_key(latest)):   # 别人刚暂存的更新版本不覆盖
         try:
             UPDATE_STAGED.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if not _private_dir(UPDATE_STAGED.parent):
@@ -2053,7 +2066,8 @@ def apply_update():
     if not _newer(v):   # 刚才这段时间里别的终端已经装了同样新或更新的版本
         return False, f"已经装好 v{_current_version()}，重启一下就能用上"
     try:
-        shutil.copy2(target, target.with_name(target.name + ".bak"))
+        old = target.read_text(encoding="utf-8")   # .bak 用原子写：已有同名符号链接时换掉链接本身，不顺着写到别处
+        _write_atomic(target.with_name(target.name + ".bak"), old, mode=target.stat().st_mode & 0o7777)
         _write_atomic(target, text, mode=target.stat().st_mode & 0o7777)
     except (OSError, UnicodeError) as e:
         return False, f"更新失败：{e}"
@@ -2111,6 +2125,8 @@ def main():
             print(update_hint(upd) or f"当前 v{__version__}，没发现更新的版本")
             sys.exit(1 if upd.get("error") else 0)
         ok, msg = apply_update()   # 这次没查成，之前暂存好的新版本照样能装
+        if not ok and upd.get("error") and msg.startswith("已经是最新版"):
+            msg = f"这次没查成，暂时没有可装的新版本（当前 v{_current_version()}）"
         print(("✓ " if ok else "") + msg)
         failed = msg.startswith("更新失败") or (not ok and upd.get("error"))
         sys.exit(1 if failed else 0)
