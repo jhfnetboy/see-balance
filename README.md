@@ -60,9 +60,28 @@ python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的�
 python3 ~/bin/provider_balance.py --update     # 马上检查并安装上游最新版
 python3 ~/bin/provider_balance.py --version    # 看当前版本
 python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 SEE_BALANCE_UPDATE=0）
+python3 ~/bin/provider_balance.py --install-hooks    # 开启会话提醒（见下）
+python3 ~/bin/provider_balance.py --uninstall-hooks  # 关掉会话提醒
 ```
 
 `--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`s`** 切换宠物（猫 / 兔子 / 小熊），**`r`** 立即刷新，**`q`** 退出；有新版本时还有 **`u`** / **`k`** / **`n`**（见下）。
+
+## 会话提醒
+
+Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你，底部列出是哪个项目的哪个会话、等了多久、问的是什么：
+
+```
+🔔 see-balance 的 Claude 在等你确认（0h03m 前）：Claude needs your permission to use Bash
+🔔 Agent24 的 Grok 在等你回复（0h12m 前）：要不要我推送到 fork？
+```
+
+- **算“等你”的**：弹出权限确认 / MCP 表单；或者最后一句话在问你（以 `?` / `？` 结尾），之后一直没动静。干完活单纯空闲的不算。
+- **自动消失**：你回了话、这一轮结束、会话关了，或者会话在提醒之后又有了新进展（你已经在终端里处理了）。超过 12 小时的提醒也不再显示。
+- **只提醒，不代你批准**：回原来的终端作答。
+- **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `UserPromptSubmit` / `Stop` / `SessionEnd` 上（改之前备份为 `settings.json.see-balance.bak`，已有的 hook 不动）。Grok CLI 默认也读这个文件，所以两边都能覆盖；新开的会话开始生效。`--uninstall-hooks` 原样摘掉。
+- hook 只往 `~/.see-balance/attention.jsonl` 追加一行：会话 id、目录、事件类型和一小段说明（权限提示文字或最后那句问话），不记工具输入输出。
+- 宠物上的优先级：会话提醒 > 升级选项 > 用量情绪。
+- Codex、Antigravity 暂时没有可靠的“在等你”信号，还不支持。
 
 ## 自动更新
 
@@ -98,7 +117,8 @@ python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 
 
 | 情绪 | 什么时候 |
 |---|---|
-| 升级 | 有下载好的新版本：举牌弹出升级选项，排在所有情绪前面，选完就让开 |
+| 叫你 | 有 Claude Code / Grok 会话在等你确认或回复（见「会话提醒」），排在最前面 |
+| 升级 | 有下载好的新版本：举牌弹出升级选项，排在用量情绪前面，选完就让开 |
 | 开心 | 7d 周额度用完（≥ 99.5%） |
 | 献爱心（提醒休息） | 7d 按当前进度预计到期用量 > 120%；或 5h 已用满；或按实测速率 5h 会在重置前见底 |
 | 生气 | 7d 窗口重置时，上一周最后用量 < 90%（重置后 12h 内） |
@@ -137,6 +157,7 @@ python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 
 | `SEE_BALANCE_STATE` | 换一个 state 文件（测试 / 多账号） |
 | `SEE_BALANCE_UPDATE` | 设成 `0` 关掉每日更新检查 |
 | `SEE_BALANCE_UPDATE_URL` | 换一个更新源（测试用） |
+| `SEE_BALANCE_CLAUDE_SETTINGS` | `--install-hooks` 改哪个 settings 文件（默认 `~/.claude/settings.json`，测试用） |
 | `SEE_BALANCE_CNY_DAILY_CAP` | DeepSeek 当日人民币闸门（例 `9`），设了就会给「安全 / 会超」判定 |
 | `HTTPS_PROXY` | 访问 api.deepseek.com / chatgpt.com 的代理 |
 

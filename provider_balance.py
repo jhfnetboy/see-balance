@@ -19,6 +19,8 @@ Usage:
   python3 provider_balance.py --update         # install the latest version from upstream main now
   python3 provider_balance.py --version        # print the version
   python3 provider_balance.py --no-update      # skip the daily update check (or SEE_BALANCE_UPDATE=0)
+  python3 provider_balance.py --install-hooks  # pet reminds you when a Claude Code / Grok session waits for you
+  python3 provider_balance.py --uninstall-hooks
 
   In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now,
   u installs a downloaded update and restarts, q quits.
@@ -1589,6 +1591,9 @@ PET_FRAMES = {
                   _pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="# #", x2=" ぷんぷん", t="!", dx=1)],
     "encourage": [_pf(el=">", er="<", m="o", hl="ノ", h="☆ ", x1="☆"),
                   _pf(el="^", er="^", m="▽", hl="ノ", h="☆ ", x2="  ☆", dy=-1)],
+    # 有会话在等你确认 / 回复：挥手叫你
+    "call":      [_pf(el="°", er="°", m="o", hl="ノ", h="! ", x1="!"),
+                  _pf(el="°", er="°", m="o", hr="ノ", x2="  !", dx=1)],
     # 有新版本，举着牌子等你选
     "update":    [_pf(m="▽", hl="ノ", h="! ", x1="NEW"),
                   _pf(el="^", er="^", m="▽", hl="ノ", h="! ", x2="  NEW", dy=-1)],
@@ -1801,7 +1806,8 @@ def pet_demo():
     view  = PetView()
     shows = [("caring", "照这样到期要用 135%，歇一歇 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！"),
-             ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒")]
+             ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒"),
+             ("call", "see-balance 的 Claude\n在等你确认，快去看看 ♥")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
         for i, (mood, arg) in enumerate(shows):
@@ -2078,6 +2084,216 @@ def apply_update():
     return True, f"已更新到 v{v}（旧版备份在 {_short_path(str(target))}.bak）"
 
 
+# ── 会话提醒 ──────────────────────────────────────────────────────────────────
+#
+# Claude Code / Grok 的会话在等你确认权限、或问了你问题在等回复时，宠物弹出来提醒你回去处理。
+# 信号来自一个只记录的 hook（--install-hooks 装进 ~/.claude/settings.json；Grok 默认也读这个文件）：
+# 它把事件追加到 ~/.see-balance/attention.jsonl，只记会话 id、目录、事件和一小段说明，不记工具输入输出。
+# 宠物只提醒，不替你批准任何东西：回原来的终端作答。
+
+ATTENTION_LOG     = STATE_FILE.parent / "attention.jsonl"
+ATTENTION_HOOK    = STATE_FILE.parent / "hook.py"
+ATTENTION_MAX_AGE = 12 * 3600          # 超过这么久还没动静的提醒（终端关了等）不再显示
+ATTENTION_ROTATE  = 1024 * 1024        # 日志超过这么大就换新文件（旧的留一份 .old）
+CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
+                         or (Path.home() / ".claude" / "settings.json"))
+HOOK_EVENTS       = ("Notification", "UserPromptSubmit", "Stop", "SessionEnd")
+SOURCE_NAMES      = {"claude": "Claude", "grok": "Grok"}
+# Notification 的类型 → 等你做什么；没列出的（auth_success、agent_completed 等）不算等你
+WAIT_KINDS        = {"permission_prompt": "确认", "elicitation_dialog": "填写",
+                     "elicitation_url_dialog": "填写", "agent_needs_input": "回复"}
+
+HOOK_SCRIPT = r'''#!/usr/bin/env python3
+# see-balance 会话提醒 hook（由 provider_balance.py --install-hooks 生成，--uninstall-hooks 删除）。
+# 只往日志追加一行：哪个会话、在哪个目录、发生了什么；不输出任何东西，不影响会话本身。
+import json, os, re, sys, time
+raw = sys.stdin.readline()
+try:
+    e = json.loads(raw)
+except ValueError:              # 不是单行 JSON：读完剩下的再试一次
+    try:
+        e = json.loads(raw + sys.stdin.read())
+    except ValueError:
+        sys.exit(0)
+if not isinstance(e, dict) or e.get("agent_id"):    # 子 agent 的事件不管，只看主会话
+    sys.exit(0)
+ev  = e.get("hook_event_name") or ""
+rec = {"ts": time.time(), "src": "grok" if "hookEventName" in e else "claude", "ev": ev,
+       "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or ""}
+if ev == "Notification":
+    rec["type"] = e.get("notification_type") or e.get("notificationType") or ""
+    rec["msg"]  = str(e.get("message") or "")[:120]
+    rec["transcript"] = e.get("transcript_path") or ""
+elif ev == "Stop":               # 最后一句是不是在问你：之后的“空闲等待”才算在等你回复
+    tail = str(e.get("last_assistant_message") or "").rstrip()[-300:]
+    q    = re.findall(r"[^\n。！!?？]*[?？]", tail)
+    rec["ask"] = q[-1].strip()[-120:] if q else ""
+try:
+    fd = os.open(__LOG__, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode())
+    os.close(fd)
+except OSError:
+    pass
+'''
+
+
+def _hook_command():
+    return f'python3 -S "{ATTENTION_HOOK}"'
+
+
+def install_hooks():
+    """写 hook 脚本，并把它挂到 ~/.claude/settings.json 的几个事件上（已挂过的不重复挂）。返回说明行。"""
+    ATTENTION_HOOK.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(ATTENTION_HOOK, HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG))), mode=0o700)
+    try:
+        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8")) if CLAUDE_SETTINGS.exists() else {}
+    except (OSError, ValueError) as e:
+        return [f"⚠ 读不了 {CLAUDE_SETTINGS}：{e}，没有改动"]
+    hooks, cmd, added = settings.setdefault("hooks", {}), _hook_command(), []
+    for ev in HOOK_EVENTS:
+        groups = hooks.setdefault(ev, [])
+        if any(h.get("command") == cmd for g in groups for h in g.get("hooks", [])):
+            continue
+        groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
+        added.append(ev)
+    if added:
+        CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        if CLAUDE_SETTINGS.exists():
+            shutil.copy2(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_name(CLAUDE_SETTINGS.name + ".see-balance.bak"))
+        _write_atomic(CLAUDE_SETTINGS, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+    return [f"✓ hook 脚本：{_short_path(str(ATTENTION_HOOK))}",
+            (f"✓ 已挂到 {_short_path(str(CLAUDE_SETTINGS))}：{'、'.join(added)}" if added
+             else f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里已经挂好了，没有改动"),
+            "  Grok CLI 默认也读这个文件；新开的 Claude Code / Grok 会话开始生效。"]
+
+
+def uninstall_hooks():
+    """把 install_hooks 挂上的条目摘掉（别的 hook 不动），删掉 hook 脚本。返回说明行。"""
+    out, cmd = [], _hook_command()
+    try:
+        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8")) if CLAUDE_SETTINGS.exists() else {}
+    except (OSError, ValueError) as e:
+        return [f"⚠ 读不了 {CLAUDE_SETTINGS}：{e}，没有改动"]
+    hooks, removed = settings.get("hooks") or {}, []
+    for ev in list(hooks):
+        groups = []
+        for g in hooks[ev]:
+            kept = [h for h in g.get("hooks", []) if h.get("command") != cmd]
+            if len(kept) != len(g.get("hooks", [])):
+                removed.append(ev)
+            if kept:
+                groups.append(dict(g, hooks=kept))
+        if groups:
+            hooks[ev] = groups
+        else:
+            del hooks[ev]
+    if removed:
+        _write_atomic(CLAUDE_SETTINGS, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        out.append(f"✓ 已从 {_short_path(str(CLAUDE_SETTINGS))} 摘掉：{'、'.join(dict.fromkeys(removed))}")
+    else:
+        out.append(f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里没有 see-balance 的 hook")
+    try:
+        ATTENTION_HOOK.unlink()
+        out.append(f"✓ 已删除 {_short_path(str(ATTENTION_HOOK))}")
+    except OSError:
+        pass
+    return out
+
+
+def hooks_installed():
+    try:
+        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    cmd = _hook_command()
+    return ATTENTION_HOOK.exists() and any(
+        h.get("command") == cmd for g in (settings.get("hooks") or {}).get("Notification", []) for h in g.get("hooks", []))
+
+
+def _attention_lines():
+    """读日志（连同轮换下来的 .old）；太大就轮换。hook 只追加，这里只读，互不打架。"""
+    lines = []
+    for path in (ATTENTION_LOG.with_name(ATTENTION_LOG.name + ".old"), ATTENTION_LOG):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines += fh.readlines()
+        except OSError:
+            pass
+    try:
+        if ATTENTION_LOG.stat().st_size > ATTENTION_ROTATE:
+            os.replace(ATTENTION_LOG, ATTENTION_LOG.with_name(ATTENTION_LOG.name + ".old"))
+    except OSError:
+        pass
+    return lines
+
+
+def attention_items(now=None):
+    """现在还在等你的会话，按等待时间从早到晚：[{src, sid, cwd, kind, ts, msg}]。
+
+    等你：权限确认 / 表单（Notification 的对应类型），或者最后一句在问你、之后一直空闲（idle_prompt）。
+    不再等：你回了话（UserPromptSubmit）、这一轮结束（Stop）、会话关了（SessionEnd），
+    或者会话记录在提醒之后又有了新内容（你在终端里已经处理了）。
+    """
+    now, sessions = now or time.time(), {}
+    for line in _attention_lines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or not r.get("sid"):
+            continue
+        s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": ""}), r.get("ev")
+        if ev == "Notification":
+            typ  = r.get("type") or ""
+            kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
+            if kind:
+                msg = s["ask"] if typ == "idle_prompt" else (r.get("msg") or "")
+                s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
+                             "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or ""}
+        elif ev == "Stop":
+            s["wait"], s["ask"] = None, r.get("ask") or ""
+        elif ev in ("UserPromptSubmit", "SessionEnd"):
+            s["wait"], s["ask"] = None, ""
+    items = []
+    for s in sessions.values():
+        w = s["wait"]
+        if not w or now - w["ts"] > ATTENTION_MAX_AGE:
+            continue
+        try:   # 会话记录在提醒之后又写了东西：你已经在终端里处理过了
+            if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 5:
+                continue
+        except OSError:
+            pass
+        items.append(w)
+    return sorted(items, key=lambda w: w["ts"])
+
+
+def _attention_name(w):
+    return f"{os.path.basename(w['cwd'].rstrip('/')) or '~'} 的 {SOURCE_NAMES.get(w['src'], w['src'])}"
+
+
+def attention_bubble(items):
+    """宠物气泡（两行）。"""
+    if len(items) == 1:
+        w = items[0]
+        return f"{_attention_name(w)}\n在等你{w['kind']}，快去看看 ♥"
+    names = "、".join(os.path.basename(w["cwd"].rstrip("/")) or "~" for w in items)
+    return f"{len(items)} 个会话在等你 ♥\n{names}"
+
+
+def attention_lines(items, now=None):
+    """底部提醒行：每个等你的会话一行，带上等了多久和那句话。"""
+    now = now or time.time()
+    out = []
+    for w in items[:5]:
+        ago  = fmt_countdown(now - w["ts"])
+        what = f"：{w['msg']}" if w["msg"] else ""
+        out.append(f"🔔 {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
+    if len(items) > 5:
+        out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
+    return out
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def collect(update=True):
@@ -2109,6 +2325,9 @@ def main():
 
     if "--pet-demo" in args:
         pet_demo()
+        return
+    if "--install-hooks" in args or "--uninstall-hooks" in args:
+        print("\n".join(install_hooks() if "--install-hooks" in args else uninstall_hooks()))
         return
     if "--version" in args:
         print(f"see-balance v{__version__}")
@@ -2145,15 +2364,28 @@ def main():
 
     full0 = load_state()
     state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
-             "pet_visible": True, "size": None, "place": None}
+             "pet_visible": True, "size": None, "place": None,
+             "attention_on": not json_mode and not compact and hooks_installed()}
 
     def update_prompt():
         """要不要弹升级选项：有下载好的新版本，这次没跳过，这个版本也没说过“不要提醒”。"""
         v = state.get("update_ver")
         return bool(v) and not state.get("update_skip") and v != state.get("update_muted")
 
+    def refresh_attention():
+        """重读“哪些会话在等你”；有变化返回 True。没装 hook 就什么都不做。"""
+        items = attention_items() if state["attention_on"] else []
+        key   = [(w["src"], w["sid"], w["kind"], w["ts"]) for w in items]
+        if key == state.get("attention_key"):
+            return False
+        state["attention"], state["attention_key"] = items, key
+        return True
+
     def set_pet_mood():
-        """升级选项最优先（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
+        """会话在等你最优先，其次升级选项（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
+        if state.get("attention"):
+            state["pet"].set_mood("call", attention_bubble(state["attention"]))
+            return
         if update_prompt():
             state["pet"].set_mood("update", f"新版本 v{state['update_ver']}！u 立即升级\nk 跳过本次 · n 不要提醒")
             return
@@ -2173,7 +2405,8 @@ def main():
                     "u 立即升级 · k 跳过本次 · n 不要提醒") if update_prompt() else None
         else:
             note = state.get("update_hint")
-        text  = (state["body"] + (f"\n\n{note}" if note else "")
+        calls = "\n".join(attention_lines(state.get("attention") or []))
+        text  = (state["body"] + (f"\n\n{calls}" if calls else "") + (f"\n\n{note}" if note else "")
                  + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n")
         place = None
         if pet_mode and state["pet_visible"]:
@@ -2193,6 +2426,12 @@ def main():
 
     def pump(timeout):
         """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
+        now = time.time()
+        if state["attention_on"] and now - state.get("attention_at", 0) >= 1 and not state.get("busy"):
+            state["attention_at"] = now   # 会话提醒要及时：每秒看一眼日志，不等下一次刷新
+            if refresh_attention():
+                set_pet_mood()
+                paint()
         if pet_mode and state["pet_visible"]:
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排
@@ -2334,6 +2573,7 @@ def main():
         state["update_msg"]  = None
         state["refresh_no"]  = state.get("refresh_no", 0) + 1
         state["update_skip"] = state["refresh_no"] < state.get("update_skip_until", 0)   # “跳过本次”只管到下次刷新
+        refresh_attention()
         set_pet_mood()
 
         # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
@@ -2359,6 +2599,9 @@ def main():
             if pet_mode and sys.stdout.isatty():
                 body = pet_merge_static(body, state["pet"].frame(), shutil.get_terminal_size().columns)
             print(body)
+            calls = attention_lines(state.get("attention") or [])
+            if calls:
+                print("\n" + "\n".join(calls))
             if hint and not compact:
                 print("\n" + hint)
         if watch_mode and (redraw or not state.get("footer_shown")):
