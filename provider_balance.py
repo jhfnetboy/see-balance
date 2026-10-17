@@ -2099,7 +2099,7 @@ CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
                          or (Path.home() / ".claude" / "settings.json"))
 GROK_HOOK_FILE    = Path(os.environ.get("SEE_BALANCE_GROK_HOOKS")
                          or (Path.home() / ".grok" / "hooks" / "see-balance.json"))
-HOOK_EVENTS       = ("Notification", "UserPromptSubmit", "Stop", "SessionEnd")
+HOOK_EVENTS       = ("Notification", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd")
 # Grok 里拒绝 / 取消权限框时发的是 StopCancelled（代替 Stop）。Claude Code 不认识这个事件，
 # 所以不放进共享的 ~/.claude/settings.json，单独写一份只有 Grok 读的 ~/.grok/hooks/see-balance.json
 GROK_ONLY_EVENTS  = ("StopCancelled",)
@@ -2123,11 +2123,15 @@ except ValueError:              # 不是单行 JSON：读完剩下的再试一�
 if not isinstance(e, dict):
     sys.exit(0)
 ev  = e.get("hook_event_name") or ""
-# 子 agent 的回合结束 / 输入不代表主会话的状态；但子 agent 弹的权限框照样要你去处理，Notification 保留
-if ev != "Notification" and (e.get("agent_id") or e.get("subagentType")):
+sub = bool(e.get("agent_id") or e.get("subagentType"))
+# 子 agent 的输入 / 会话结束不代表主会话；它弹的权限框、它这一轮的结束（只清它自己的提醒）还是要记
+if sub and ev not in ("Notification", "Stop", "StopCancelled", "StopFailure"):
     sys.exit(0)
 rec = {"ts": time.time(), "src": "grok" if "hookEventName" in e else "claude", "ev": ev,
-       "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or ""}
+       "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or "",
+       "pid": e.get("prompt_id") or e.get("promptId") or ""}
+if sub:
+    rec["sub"] = True
 if ev == "Notification":
     rec["type"] = e.get("notification_type") or e.get("notificationType") or ""
     rec["msg"]  = str(e.get("message") or "")[:120]
@@ -2208,17 +2212,25 @@ def _remove_hooks(path, is_ours):
         return [], err
     hooks, removed = data.get("hooks") or {}, []
     for ev in list(hooks):
-        groups = []
+        groups, touched = [], False
         for g in hooks[ev]:
-            hs   = (g.get("hooks") or []) if isinstance(g, dict) else []
+            hs = g.get("hooks") if isinstance(g, dict) else None
+            if not isinstance(hs, list):       # 结构看不懂的组原样留着
+                groups.append(g)
+                continue
             kept = [h for h in hs if not (isinstance(h, dict) and is_ours(str(h.get("command") or "")))]
-            if len(kept) != len(hs):
-                removed.append(ev)
-            if kept or not isinstance(g, dict) or not hs:
-                groups.append(dict(g, hooks=kept) if isinstance(g, dict) and hs else g)
+            if len(kept) == len(hs):
+                groups.append(g)
+                continue
+            touched = True
+            if kept:
+                groups.append(dict(g, hooks=kept))
+        if not touched:
+            continue
+        removed.append(ev)
         if groups:
             hooks[ev] = groups
-        else:
+        else:                                  # 只删被我们摘空的事件；原本就空的不动
             del hooks[ev]
     if removed:
         _save_settings(path, data)
@@ -2248,8 +2260,9 @@ def install_hooks():
 def uninstall_hooks():
     """把 install_hooks 挂上的条目摘掉（别的 hook 不动），删掉 hook 脚本。返回说明行。"""
     out = []
-    def is_ours(command):   # 认 hook.py 的文件名，换过 SEE_BALANCE_STATE 装的也能摘掉
-        return "hook.py" in command and "see-balance" in command or command == _hook_command()
+    ours = re.compile(r"python3 -S (\S+/hook\.py|'[^']*/hook\.py') >/dev/null 2>&1 \|\| true")
+    def is_ours(command):   # 只认 install_hooks 生成的那种命令（换过 SEE_BALANCE_STATE 装的也认），别的不碰
+        return command == _hook_command() or bool(ours.fullmatch(command))
     for path in (CLAUDE_SETTINGS, GROK_HOOK_FILE):
         removed, err = _remove_hooks(path, is_ours)
         if err:
@@ -2298,22 +2311,27 @@ def _attention_lines(now=None):
         big = ATTENTION_LOG.stat().st_size > ATTENTION_ROTATE
     except OSError:
         big = False
-    if big:
+    leftovers = sorted(ATTENTION_LOG.parent.glob(ATTENTION_LOG.name + ".*.rotating"))   # 上次轮换半路失败留下的
+    if big or leftovers:
         moving = ATTENTION_LOG.with_name(f"{ATTENTION_LOG.name}.{os.getpid()}.rotating")
         try:
-            os.replace(ATTENTION_LOG, moving)
+            if big:
+                os.replace(ATTENTION_LOG, moving)
+            parts = sorted(set(leftovers) | ({moving} if big else set()))
             keep = []
-            for line in _read_lines(old) + _read_lines(moving):
+            for line in _read_lines(old) + [l for p in parts for l in _read_lines(p)]:
                 try:
                     if now - float(json.loads(line).get("ts") or 0) <= ATTENTION_MAX_AGE:
                         keep.append(line if line.endswith("\n") else line + "\n")
                 except (ValueError, AttributeError):
                     pass
             _write_atomic(old, "".join(keep))
-            os.unlink(moving)
+            for p in parts:
+                os.unlink(p)
         except OSError:
             pass
-    return _read_lines(old) + _read_lines(ATTENTION_LOG)
+    leftovers = sorted(ATTENTION_LOG.parent.glob(ATTENTION_LOG.name + ".*.rotating"))   # 没并成功的照样读，提醒不丢
+    return _read_lines(old) + [l for p in leftovers for l in _read_lines(p)] + _read_lines(ATTENTION_LOG)
 
 
 def attention_items(now=None):
@@ -2332,16 +2350,25 @@ def attention_items(now=None):
         if not isinstance(r, dict) or not r.get("sid"):
             continue
         s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": ""}), r.get("ev")
+        w = s["wait"]
+        if ev in ("Stop", "StopCancelled", "StopFailure"):
+            if r.get("sub"):          # 子 agent 这一轮结束：只清它自己弹的提醒
+                if w and w.get("sub"):
+                    s["wait"] = None
+                continue
+            if w and w.get("pid") and r.get("pid") and r["pid"] != w["pid"]:
+                continue              # 上一轮迟到的回合结束（Grok 会排队晚到），别清掉这一轮的提醒
         if ev == "Notification":
             typ  = r.get("type") or ""
             kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
             if kind:
                 msg = s["ask"] if typ == "idle_prompt" else (r.get("msg") or "")
                 s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
-                             "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or ""}
+                             "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or "",
+                             "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Stop":
             s["wait"], s["ask"] = None, r.get("ask") or ""
-        elif ev == "StopCancelled":   # Grok：拒绝 / 取消了权限框，这一轮就此结束
+        elif ev in ("StopCancelled", "StopFailure"):   # 拒绝 / 取消了权限框，或出错，这一轮就此结束
             s["wait"], s["ask"] = None, ""
         elif ev in ("UserPromptSubmit", "SessionEnd"):
             s["wait"], s["ask"] = None, ""
@@ -2351,7 +2378,7 @@ def attention_items(now=None):
         if not w or now - w["ts"] > ATTENTION_MAX_AGE:
             continue
         try:   # 会话记录在提醒之后又写了东西：你已经在终端里处理过了
-            if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 5:
+            if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 1:
                 continue
         except OSError:
             pass
@@ -2359,8 +2386,20 @@ def attention_items(now=None):
     return sorted(items, key=lambda w: w["ts"])
 
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def _clean(text):
+    """日志里的文字来自会话（模型输出、MCP 表单、目录名），显示前去掉控制字符，别让它改终端。"""
+    return _CONTROL_CHARS.sub(" ", str(text or "")).strip()
+
+
+def _project(w):
+    return _clean(os.path.basename(w["cwd"].rstrip("/"))) or "~"
+
+
 def _attention_name(w):
-    return f"{os.path.basename(w['cwd'].rstrip('/')) or '~'} 的 {SOURCE_NAMES.get(w['src'], w['src'])}"
+    return f"{_project(w)} 的 {SOURCE_NAMES.get(w['src'], _clean(w['src']))}"
 
 
 def attention_bubble(items):
@@ -2368,7 +2407,7 @@ def attention_bubble(items):
     if len(items) == 1:
         w = items[0]
         return f"{_attention_name(w)}\n在等你{w['kind']}，快去看看 ♥"
-    names = "、".join(os.path.basename(w["cwd"].rstrip("/")) or "~" for w in items)
+    names = "、".join(_project(w) for w in items)
     return f"{len(items)} 个会话在等你 ♥\n{names}"
 
 
@@ -2378,7 +2417,7 @@ def attention_lines(items, now=None):
     out = []
     for w in items[:5]:
         ago  = fmt_countdown(now - w["ts"])
-        what = f"：{w['msg']}" if w["msg"] else ""
+        what = f"：{_clean(w['msg'])}" if w["msg"] else ""
         out.append(f"🔔 {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
     if len(items) > 5:
         out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
