@@ -1522,7 +1522,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         # 两个池互不相通：Gemini 池见底时，3P 池还是完整的
         # 3P 池算不算有余量，和调度建议用同一套标准，免得两处说法打架
         g_left   = 100.0 - float((agy.get("gemini_weekly") or {}).get("pct") or 0.0)
-        p3_spare = any(s["name"] == "AGY Claude·GPT 池" for s in spare_candidates(sub_status({"agy": agy}), "AGY Gemini 池"))
+        p3_spare = any(s["name"] == "AGY Claude·GPT 池" for s in spare_candidates(sub_status({"agy": agy}, None, hist), "AGY Gemini 池"))
         alt_hint = None
         if g_left < 30.0 and p3_spare:
             alt_hint = "agy 的 Claude·GPT 池仍有余量 → `--agent antigravity --model <claude/gpt 模型 id>`"
@@ -1845,7 +1845,7 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
     mine = next((s for s in stats if s["prov"] == "claude"), None)
     if mine and mine["kind"] == "sprint" and not mine["fh_tight"]:   # 5h 紧时不劝放开用，和调度建议一致
         return "encourage", f"剩 {mine['left']:.0f}% 要过期啦，试试 Opus？"
-    if proj and proj[1] <= PACE_SLOW_PCT:
+    if proj and proj[1] <= PACE_SLOW_PCT and not (mine and mine["fh_tight"]):   # 5h 紧时不劝多用
         return "encourage", f"还剩 {100.0 - float(pct):.0f}% 呢，多用用嘛～加油！"
     return "idle", None
 
