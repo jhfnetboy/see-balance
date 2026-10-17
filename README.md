@@ -182,9 +182,21 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 
 ## 更新
 
+装好的副本会自己更新：`--watch` 运行时每 10 分钟查一次上游 `main`，有新版本时宠物弹出升级选项，按 `u` 装好并自动重启（详见「自动更新」）。也可以随时手动：
+
 ```bash
-# 修改源文件后重新安装
-cd ~/Dev/tools/see-balance
-# 编辑 provider_balance.py
-bash install.sh
+python3 ~/bin/provider_balance.py --update    # 马上检查并安装最新版
+python3 ~/bin/provider_balance.py --version   # 看当前版本
 ```
+
+从源码装：`git pull` 后运行 `bash install.sh`。
+
+### 版本记录
+
+| 版本 | 内容 |
+|---|---|
+| 1.2.2 | README：更新方式与版本记录 |
+| 1.2.1 | 每 10 分钟检查一次更新（`--watch` 期间后台检查，带 ETag，上游没变只回 304） |
+| 1.2.0 | Claude 宠物（升级选项、会话提醒）、跨订阅调度建议、自动更新 |
+| 1.1.0 | 支持 Grok (xAI) 余额与周用量 |
+| 1.0.0 | 支持 Antigravity (AGY)、用量节奏建议 |
