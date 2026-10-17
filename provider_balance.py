@@ -1280,6 +1280,133 @@ def fetch_grok():
 
 # ── Render ────────────────────────────────────────────────────────────────────
 
+# ── 跨订阅调度建议 ───────────────────────────────────────────────────────────
+#
+# 把几家订阅的 7d 窗口放在一起看：哪家要超、哪家用完了、哪家闲着、哪家快重置还剩一大截。
+# 要超 / 用完 → 指一家有余量的去分担；快重置还剩很多 → 劝它放开用（高 effort、强模型、加速、并行）。
+
+SPARE_MIN_LEFT = 30.0         # 剩余 ≥ 此值才算“有余量”，能接别家的活儿
+SPRINT_SEC     = 24 * 3600    # 距 7d 重置不足此时长 ……
+SPRINT_WASTE   = 20.0         # …… 且照现在的速度到期会剩下 ≥ 此值：放开用
+FRESH_MAX_PCT  = 5.0          # 窗口刚开、还没法推算时，用量 ≤ 此值才算闲着（刚开窗就猛烧的不算）
+FH_TIGHT_PCT   = 80.0         # 同池 5h 用量 ≥ 此值，或 5h 预计到期超速：眼下不宜再加活儿
+SOON_SEC       = 900          # 离 7d 重置不足 15 分钟：马上就是新窗口，不再谈节奏
+
+# (provider, 7d 窗口, 同池 5h 窗口, 全称, 宠物气泡里的短名, 放开用的办法)
+SUBSCRIPTIONS = [
+    ("claude", "weekly",        "five_hour", "Claude", "Claude",
+     "可以切 Opus、调高 effort、开 /fast，或多开几个并行 agent"),
+    ("codex",  "weekly",        "five_hour", "Codex",  "Codex",
+     "可以换最强模型、把 model_reasoning_effort 调到 xhigh，或多开几个并行任务"),
+    ("grok",   "main_weekly",   None,        "Grok",   "Grok",
+     "可以换最强模型，或多跑几个并行任务"),
+    ("agy",    "gemini_weekly", "gemini_5h", "AGY Gemini 池", "Gemini",
+     "可以换 Gemini Pro，或多开几个并行 agent"),
+    ("agy",    "3p_weekly",     "3p_5h",     "AGY Claude·GPT 池", "AGY",
+     "可以换 Opus，或多开几个并行 agent"),
+]
+
+
+def sub_status(data, now=None):
+    """每个订阅池一条：用量、离重置多久、预计到期用量，以及归类 out / hot / sprint / slow / ok。"""
+    now, out = now or time.time(), []
+    for prov, wkey, fkey, name, short, boost in SUBSCRIPTIONS:
+        p = data.get(prov) or {}
+        if "error" in p:
+            continue
+        wk = p.get(wkey) or (p.get("weekly") if prov == "grok" else None) or {}
+        if wk.get("pct") is None:
+            continue
+        pct   = float(wk["pct"])
+        fh    = (p.get(fkey) or {}) if fkey else {}
+        st    = {"prov": prov, "name": name, "short": short, "boost": boost, "pct": pct,
+                 "left": max(0.0, 100.0 - pct), "reset_in": None, "proj": None, "kind": "ok",
+                 "fh_out": fh.get("pct") is not None and float(fh["pct"]) >= EXHAUSTED_PCT,
+                 "fh_reset_in": max(0.0, fh["reset_at"] - now) if fh.get("reset_at") else None}
+        fh_proj = pace_projection(fh, 5 * 3600) if fh else None
+        st["fh_tight"] = st["fh_out"] or (fh.get("pct") is not None and (
+            float(fh["pct"]) >= FH_TIGHT_PCT or bool(fh_proj and fh_proj[1] > PACE_FAST_PCT)))
+        if wk.get("reset_at"):
+            st["reset_in"] = max(0.0, wk["reset_at"] - now)
+            elapsed = 7 * 24 * 3600 - st["reset_in"]
+            if elapsed >= 7 * 24 * 3600 * 0.05:    # 和 pace_projection 同一门槛，但快重置时照样推算
+                st["proj"] = pct + pct / elapsed * st["reset_in"]
+        proj = st["proj"]
+        if pct >= EXHAUSTED_PCT:
+            st["kind"] = "out"
+        elif proj is not None and proj > PACE_FAST_PCT:
+            st["kind"] = "hot"
+        elif proj is not None and st["reset_in"] < SOON_SEC:
+            pass                                   # 马上重置：既不劝放开用，也不劝多给活儿
+        elif proj is not None and st["reset_in"] <= SPRINT_SEC and 100.0 - proj >= SPRINT_WASTE:
+            st["kind"] = "sprint"
+        elif proj is not None and proj <= PACE_SLOW_PCT and st["left"] >= SPARE_MIN_LEFT:
+            st["kind"] = "slow"
+        out.append(st)
+    return out
+
+
+def spare_candidates(stats, exclude):
+    """能接活儿的别的订阅池（exclude 是要排除的池名，或整个 provider）：5h 不紧、剩得够多，且 7d 闲着 ——
+    快重置还剩一大截（sprint）、节奏偏慢（slow），或窗口刚开、几乎没用。
+
+    和 ⏰ / 💤 行用同一套标准，免得一边说“别家也不宽裕”、一边又劝多用某家。
+    """
+    return [s for s in stats if exclude not in (s["name"], s["prov"]) and not s["fh_tight"]
+            and s["left"] >= SPARE_MIN_LEFT
+            and (s["kind"] in ("sprint", "slow")
+                 or (s["kind"] == "ok" and s["proj"] is None and s["pct"] <= FRESH_MAX_PCT))]
+
+
+def best_spare(stats, exclude):
+    """挑一个来分担：sprint 优先 —— 不用就过期了；其余按到期还能空出多少排。"""
+    def headroom(s):
+        return 100.0 - (s["proj"] if s["proj"] is not None else s["pct"])
+    return max(spare_candidates(stats, exclude), key=lambda s: (s["kind"] == "sprint", headroom(s)), default=None)
+
+
+def dispatch_advice(data, now=None):
+    """调度建议行（已含缩进）；没什么可说时返回空列表。"""
+    stats, lines, helpers = sub_status(data, now), [], set()
+
+    def spare_text(s):
+        alt = best_spare(stats, s["name"])   # 按池排除：AGY 两个池互不相通
+        if not alt:
+            return None
+        helpers.add(alt["name"])
+        when = f"，{fmt_countdown(alt['reset_in'])} 后重置" if alt["reset_in"] is not None else ""
+        return f"要不试试 {alt['name']}？还剩 {alt['left']:.0f}%{when}，人家也很强哦"
+
+    for s in stats:
+        if s["kind"] == "out":
+            alt  = spare_text(s)
+            when = f"，{fmt_countdown(s['reset_in'])} 后重置" if s["reset_in"] is not None else ""
+            lines.append(f"     ⛔ {s['name']} 周额度用完了{when}"
+                         + (f" → {alt}" if alt else ""))
+            continue
+        if s["fh_out"]:
+            alt  = spare_text(s)
+            when = f"，{fmt_countdown(s['fh_reset_in'])} 后恢复" if s["fh_reset_in"] is not None else ""
+            lines.append(f"     ⛔ {s['name']} 5h 额度用光了{when}"
+                         + (f" → 等的时候{alt}" if alt else ""))
+        if s["kind"] == "hot":   # 5h 用光时照样说：5h 一恢复，周额度还是会超
+            if s["fh_out"]:      # 上一行已经推荐过别家
+                tail = " → 5h 恢复后也悠着点，可以试试调低 effort 或换个小模型"
+            else:
+                alt  = spare_text(s)
+                tail = f" → {alt}" if alt else " → 别家也不太宽裕，可以试试调低 effort 或换个小模型"
+            lines.append(f"     ⚠ {s['name']} 照这样到期要用 {s['proj']:.0f}%{tail}")
+    for s in stats:
+        if s["fh_tight"]:   # 5h 紧或已卡住，眼下不宜“放开用 / 多给活儿”
+            continue
+        if s["kind"] == "sprint":
+            lines.append(f"     ⏰ {s['name']} {fmt_countdown(s['reset_in'])} 后重置，还剩 {s['left']:.0f}%，"
+                         f"照这样会空着约 {100.0 - s['proj']:.0f}% → 不如放开用？{s['boost']}")
+        elif s["kind"] == "slow" and s["name"] not in helpers:
+            lines.append(f"     💤 {s['name']} 预计到期只用 {s['proj']:.0f}%（还剩 {s['left']:.0f}%）→ 闲着也是闲着，要不多给它点活儿？")
+    return lines
+
+
 def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
@@ -1374,10 +1501,11 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
                 if a: lines.append(a)
 
         # 两个池互不相通：Gemini 池见底时，3P 池还是完整的
-        g_left  = 100.0 - float((agy.get("gemini_weekly") or {}).get("pct") or 0.0)
-        p3_left = 100.0 - float((agy.get("3p_weekly")     or {}).get("pct") or 0.0)
+        # 3P 池算不算有余量，和调度建议用同一套标准，免得两处说法打架
+        g_left   = 100.0 - float((agy.get("gemini_weekly") or {}).get("pct") or 0.0)
+        p3_spare = any(s["name"] == "AGY Claude·GPT 池" for s in spare_candidates(sub_status({"agy": agy}), "AGY Gemini 池"))
         alt_hint = None
-        if g_left < 30.0 and p3_left >= 30.0:
+        if g_left < 30.0 and p3_spare:
             alt_hint = "agy 的 Claude·GPT 池仍有余量 → `--agent antigravity --model <claude/gpt 模型 id>`"
         _pool("Gemini 池 (Gemini Flash / Pro)", "agy_gemini_5h", "agy_gemini_weekly",
               agy.get("gemini_5h"), agy.get("gemini_weekly"))
@@ -1441,6 +1569,12 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         if gr.get("on_demand_used") is not None and gr.get("on_demand_used") > 0:
             lines.append(f"     on-demand   ${gr['on_demand_used']:.2f} / ${gr.get('on_demand_cap', 0):.2f}")
     lines.append("")
+
+    advice = dispatch_advice({"codex": cx, "claude": cl, "agy": agy, "grok": gr})
+    if advice:
+        lines.append("  🧭 调度建议")
+        lines += advice
+        lines.append("")
     lines.append("═" * 54)
     return "\n".join(lines)
 
@@ -1650,10 +1784,11 @@ def pet_track_reset(cl, pet_state, now=None):
     return st
 
 
-def claude_pet_mood(cl, hist, pet_state, now=None):
-    """返回 (情绪, 气泡文字)。只看 Claude；优先级：开心 > 献爱心 > 生气 > 鼓励 > 日常。
+def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
+    """返回 (情绪, 气泡文字)。看 Claude 的用量；优先级：开心 > 献爱心 > 生气 > 冲刺 > 鼓励 > 日常。
 
     周额度用完排最前：用完了就该庆祝，再提醒“慢点用”已没有意义。
+    传了 data（全部订阅）时，劝歇的同时指一家有余量的订阅去用。
     """
     now = now or time.time()
     if not cl or "error" in cl:
@@ -1662,12 +1797,18 @@ def claude_pet_mood(cl, hist, pet_state, now=None):
     proj   = pace_projection(wk, 7 * 24 * 3600)
     fh_pct = fh.get("pct")
     pct    = wk.get("pct")
+    stats  = sub_status(data, now) if data else []
+    alt    = best_spare(stats, "claude")
 
     if pct is not None and float(pct) >= PET_HAPPY_PCT:
         return "happy", "Claude 周额度用完啦！好棒！"
-    if fh_pct is not None and float(fh_pct) >= 100:
+    if fh_pct is not None and float(fh_pct) >= EXHAUSTED_PCT:   # 和调度建议同一口径
+        if alt:
+            return "caring", f"5h 用光啦，试试 {alt['short']} 吧？♥"
         return "caring", "5h 额度用光啦，起来走走吧 ♥"
     if proj and proj[1] > PACE_FAST_PCT:
+        if alt:
+            return "caring", f"要用到 {proj[1]:.0f}% 啦，试试 {alt['short']}？♥"
         return "caring", f"照这样到期要用 {proj[1]:.0f}%，歇一歇 ♥"
     if fh_pct is not None and fh.get("reset_at"):
         r          = burn_rate(hist, "claude_5h", 5 * 3600)
@@ -1680,6 +1821,9 @@ def claude_pet_mood(cl, hist, pet_state, now=None):
     angry = (pet_state or {}).get("angry") or {}
     if float(angry.get("until") or 0) > now:
         return "angry", f"上周白白浪费了 {float(angry.get('wasted') or 0):.0f}%！哼！"
+    mine = next((s for s in stats if s["prov"] == "claude"), None)
+    if mine and mine["kind"] == "sprint":
+        return "encourage", f"剩 {mine['left']:.0f}% 要过期啦，试试 Opus？"
     if proj and proj[1] <= PACE_SLOW_PCT:
         return "encourage", f"还剩 {100.0 - float(pct):.0f}% 呢，多用用嘛～加油！"
     return "idle", None
@@ -1786,8 +1930,9 @@ def pet_draw(pet_lines, top, col):
 def pet_demo():
     """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
     view  = PetView()
-    shows = [("caring", "照这样到期要用 135%，歇一歇 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
-             ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！")]
+    shows = [("caring", "要用到 135% 啦，试试 Grok？♥"), ("happy", "Claude 周额度用完啦！好棒！"),
+             ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "剩 45% 要过期啦，试试 Opus？"),
+             ("encourage", "还剩 62% 呢，多用用嘛～加油！")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
         for i, (mood, arg) in enumerate(shows):
@@ -1989,7 +2134,7 @@ def main():
         state["full"] = to_save
 
         today_bl = baselines.get(today, {})
-        state["pet"].set_mood(*claude_pet_mood(data.get("claude"), hist, pet_state))
+        state["pet"].set_mood(*claude_pet_mood(data.get("claude"), hist, pet_state, data=data))
 
         # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
         redraw = watch_mode and not json_mode and sys.stdout.isatty()
