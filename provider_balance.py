@@ -43,7 +43,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.2.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.2.1"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -1999,14 +1999,14 @@ def pet_demo():
 
 # ── 自动更新 ──────────────────────────────────────────────────────────────────
 #
-# 每天最多查一次上游 main 上的 provider_balance.py：__version__ 比本地新，就先下载到
+# 每 10 分钟查一次上游 main 上的 provider_balance.py：__version__ 比本地新，就先下载到
 # ~/.see-balance/update/ 暂存，再提示装上（watch 里按 u，或运行 --update）。
 # 从 git checkout 里跑时只读上游版本号、提示 git pull，不暂存、不覆盖工作区。
 
 UPDATE_URL       = (os.environ.get("SEE_BALANCE_UPDATE_URL")
                     or "https://raw.githubusercontent.com/jhfnetboy/see-balance/main/provider_balance.py")
-UPDATE_CHECK_SEC = 24 * 3600
-UPDATE_RETRY_SEC = 3600            # 没查成：过 1 小时再试，不用等一天
+UPDATE_CHECK_SEC = 10 * 60         # 多个终端共用 state 里的检查时间，不会叠加请求；没变时只是一次 304
+UPDATE_RETRY_SEC = UPDATE_CHECK_SEC
 UPDATE_MAX_BYTES = 4 * 1024 * 1024
 UPDATE_DEADLINE  = 60              # 下载总时限（秒）：urlopen 的 timeout 只管单次读写
 UPDATE_STAGED    = STATE_FILE.parent / "update" / "provider_balance.py"
@@ -2110,12 +2110,24 @@ def _write_atomic(path, text, mode=None):
         raise
 
 
-def _download(url):
-    """下载完整内容；超时、截断、过大都抛 ValueError / OSError。"""
+def _download(url, etag=None):
+    """下载完整内容，返回 (文本, ETag)；带上次的 ETag 且上游没变时返回 (None, ETag)，不重复下载。
+
+    超时、截断、过大都抛 ValueError / OSError。
+    """
     deadline = time.time() + UPDATE_DEADLINE
     chunks, total = [], 0
-    with urlopen(Request(url, headers={"User-Agent": "see-balance"}), timeout=HTTP_TIMEOUT) as resp:
-        size = resp.headers.get("Content-Length")
+    headers = {"User-Agent": "see-balance"}
+    if etag:
+        headers["If-None-Match"] = etag
+    try:
+        resp = urlopen(Request(url, headers=headers), timeout=HTTP_TIMEOUT)
+    except HTTPError as e:
+        if e.code == 304:
+            return None, etag
+        raise
+    with resp:
+        size, etag = resp.headers.get("Content-Length"), resp.headers.get("ETag")
         while True:
             if time.time() > deadline:
                 raise ValueError("下载太慢，超时了")
@@ -2129,14 +2141,14 @@ def _download(url):
     raw = b"".join(chunks)
     if size and size.isdigit() and int(size) != len(raw):   # 连接中途断了，read() 不报错只返回半截
         raise ValueError(f"只下载到 {len(raw)}/{size} 字节")
-    return raw.decode("utf-8")
+    return raw.decode("utf-8"), etag
 
 
 def check_update(upd=None, force=False, now=None):
     """到点就查一次上游，返回新的 update 状态（存进 state.json）。
 
-    每天查一次；没查成过 1 小时再试。别的副本（比如 git checkout）查到了新版本、这份装好的副本
-    却还没暂存时，不等到点，马上补下载。
+    每 10 分钟查一次（没查成也是 10 分钟后再试）；上游没变时只拿到一个 304，不重复下载。
+    别的副本（比如 git checkout）查到了新版本、这份装好的副本却还没暂存时，不等到点，马上补下载。
     """
     now, upd = now or time.time(), dict(upd or {})
     staged = staged_update()[0]
@@ -2153,23 +2165,33 @@ def check_update(upd=None, force=False, now=None):
     behind = (not _from_git_checkout() and _newer(latest)
               and (not staged or _version_key(staged) < _version_key(latest)))
     if upd.get("error"):
-        wait = UPDATE_RETRY_SEC       # 上次没成：过 1 小时再试（补下载也一样，别每次刷新都下）
+        wait = UPDATE_RETRY_SEC       # 上次没成：到点再试（补下载也一样，别每次刷新都下）
     else:
         wait = 0 if behind else UPDATE_CHECK_SEC
     if not force and now - float(upd.get("checked_at") or 0) < wait:
         return upd
     upd["checked_at"] = int(now)
+    # 需要拿到文件内容（还没查到过版本、要补下载）时不带 ETag，其余时候上游没变就只回一个 304
+    etag = upd.get("etag") if latest and not behind else None
     try:
-        text = _download(UPDATE_URL)
+        text, etag = _download(UPDATE_URL, etag)
     except (URLError, http.client.HTTPException, TimeoutError, socket.timeout, OSError, ValueError) as e:
         upd["error"] = str(e)[:200]
+        return upd
+    if text is None:   # 304：上游没变，上次的结论照旧
+        upd.pop("error", None)
         return upd
     latest = _valid_version(text)
     if not latest:   # 坏内容不覆盖上次查到的版本号，已暂存的好版本照样提示
         upd["error"] = "上游文件不完整（编译不过、没有版本号或缺入口），先不更新"
+        upd.pop("etag", None)
         return upd
     upd.pop("error", None)
     upd["latest"] = latest
+    if etag:
+        upd["etag"] = etag
+    else:
+        upd.pop("etag", None)
     if _from_git_checkout():
         return upd
     staged = staged_update()[0]
@@ -2724,9 +2746,45 @@ def main():
         if place:
             pet_draw(state["pet"].frame(), *place)
 
+    def show_update(upd):
+        """按最新的检查结果设好升级提示（底部那行、u/k/n 选项）。"""
+        hint = update_hint(upd, interactive=interactive) if update_mode else None
+        state["update_hint"] = hint
+        state["can_update"]  = bool(hint) and interactive and not _from_git_checkout()
+        state["update_ver"]  = staged_update()[0] if state["can_update"] else None
+        state["update_msg"]  = None
+
+    def poll_update(now):
+        """watch 期间每分钟在后台问一次 check_update（到没到 10 分钟由它看 state 决定），不等余额刷新。"""
+        box = state.get("update_box")
+        if box is not None and "upd" in box:      # 后台查完了：存进 state，有新版本就弹出来
+            state["update_box"] = None
+            full = load_state()
+            if full or not STATE_FILE.exists():   # 读不出来就别写回，免得把 history 等整份冲掉
+                full["update"] = box["upd"]
+                save_state(full)
+                state["full"] = full
+            before = state.get("update_ver")
+            show_update(box["upd"])
+            if state.get("update_ver") != before and not state.get("busy"):
+                set_pet_mood()
+                paint()
+            return
+        if box is None and not state.get("busy") and now >= state.get("update_poll_at", 0):
+            state["update_poll_at"] = now + 60
+            box = state["update_box"] = {}
+            def work():
+                try:
+                    box["upd"] = check_update(load_state().get("update"))
+                except Exception:          # 查更新出任何错都不能影响 watch
+                    box["upd"] = load_state().get("update") or {}
+            threading.Thread(target=work, daemon=True).start()
+
     def pump(timeout):
         """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
         now = time.time()
+        if update_mode:
+            poll_update(now)
         if state["attention_on"] and now - state.get("attention_at", 0) >= 1 and not state.get("busy"):
             state["attention_at"] = now   # 会话提醒要及时：每秒看一眼日志，不等下一次刷新
             if refresh_attention():
@@ -2868,11 +2926,9 @@ def main():
 
         # 新版本：git checkout 里只提示 git pull；装好的副本下载好了，watch 里在宠物上弹升级选项
         upd  = data.get("update") or full.get("update")
-        hint = update_hint(upd, interactive=interactive) if update_mode else None
-        state["update_hint"] = hint
-        state["can_update"]  = bool(hint) and interactive and not _from_git_checkout()
-        state["update_ver"]  = staged_update()[0] if state["can_update"] else None
-        state["update_msg"]  = None
+        show_update(upd)
+        hint = state["update_hint"]
+        state["update_poll_at"] = time.time() + 60   # 刚查过，后台定时检查从现在起算
         state["refresh_no"]  = state.get("refresh_no", 0) + 1
         state["update_skip"] = state["refresh_no"] < state.get("update_skip_until", 0)   # “跳过本次”只管到下次刷新
         refresh_attention()
