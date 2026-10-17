@@ -88,7 +88,7 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 
 ## 自动更新
 
-每天最多查一次上游 [`main` 分支](https://github.com/jhfnetboy/see-balance/blob/main/provider_balance.py)上的 `__version__`，比本地新就：
+每 10 分钟查一次上游 [`main` 分支](https://github.com/jhfnetboy/see-balance/blob/main/provider_balance.py)上的 `__version__`，比本地新就：
 
 1. 先下载到 `~/.see-balance/update/` 暂存（下载完会检查能否编译、有没有版本号，不完整就不用）；
 2. `--watch` 里宠物举牌弹出升级选项（宠物藏起来时底部也有同样一行）：
@@ -107,7 +107,8 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 
 从 see-balance 的 git checkout 里直接运行时，只读上游的版本号、提示 `git pull`，不会暂存或覆盖工作区。
 
-- 没查成（断网、上游内容不完整）时过 1 小时再试；`--update` 失败时退出码为 1。
+- `--watch` 期间在后台定时查，不等余额刷新；多个终端共用检查时间，一般不会叠加请求（几个终端恰好同时到点时可能各查一次）。上游没变时带 ETag 只拿到一个 304，不重复下载。
+- 没查成（断网、上游内容不完整）时 10 分钟后再试；`--update` 失败时退出码为 1。
 - `--json` / `--compact` 是给脚本用的：不联网查更新，输出里也没有更新相关字段。
 - 暂存目录必须是你自己的、别人写不进的目录（`SEE_BALANCE_STATE` 指到 `/tmp` 这类共享目录时不会暂存）。
 - 另一个终端已经装好更新的版本时，旧进程不会再装回暂存里的较低版本；上游回滚后，暂存里的高版本会被丢弃。
