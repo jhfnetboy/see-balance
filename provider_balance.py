@@ -2747,35 +2747,41 @@ def main():
             pet_draw(state["pet"].frame(), *place)
 
     def show_update(upd):
-        """按最新的检查结果设好升级提示（底部那行、u/k/n 选项）。"""
+        """按最新的检查结果设好升级提示（底部那行、u/k/n 选项）。提示变了返回 True。"""
+        before = (state.get("update_hint"), state.get("update_ver"))
         hint = update_hint(upd, interactive=interactive) if update_mode else None
         state["update_hint"] = hint
         state["can_update"]  = bool(hint) and interactive and not _from_git_checkout()
         state["update_ver"]  = staged_update()[0] if state["can_update"] else None
-        state["update_msg"]  = None
+        changed = (hint, state["update_ver"]) != before
+        if changed:
+            state["update_msg"] = None   # 提示换了，旧的“⚠ 更新失败”之类的话也就不用留着了
+        return changed
 
     def poll_update(now):
         """watch 期间每分钟在后台问一次 check_update（到没到 10 分钟由它看 state 决定），不等余额刷新。"""
         box = state.get("update_box")
         if box is not None and "upd" in box:      # 后台查完了：存进 state，有新版本就弹出来
             state["update_box"] = None
-            full = load_state()
-            if full or not STATE_FILE.exists():   # 读不出来就别写回，免得把 history 等整份冲掉
-                full["update"] = box["upd"]
-                save_state(full)
-                state["full"] = full
-            before = state.get("update_ver")
-            show_update(box["upd"])
-            if state.get("update_ver") != before and not state.get("busy"):
+            upd = box["upd"]
+            if upd != box["before"]:              # 没到点、没真查的话什么都不写
+                full = load_state()
+                theirs = (full.get("update") or {}).get("checked_at") or 0
+                # 读不出来就别写回（免得冲掉 history 等）；别的终端刚写了更新的检查结果也别盖掉
+                if (full or not STATE_FILE.exists()) and theirs <= (upd.get("checked_at") or 0):
+                    full["update"] = upd
+                    save_state(full)
+                    state["full"] = full
+            if show_update(upd) and not state.get("busy"):
                 set_pet_mood()
                 paint()
             return
         if box is None and not state.get("busy") and now >= state.get("update_poll_at", 0):
             state["update_poll_at"] = now + 60
-            box = state["update_box"] = {}
+            box = state["update_box"] = {"before": load_state().get("update") or {}}
             def work():
                 try:
-                    box["upd"] = check_update(load_state().get("update"))
+                    box["upd"] = check_update(box["before"])
                 except Exception:          # 查更新出任何错都不能影响 watch
                     box["upd"] = load_state().get("update") or {}
             threading.Thread(target=work, daemon=True).start()
@@ -2925,8 +2931,11 @@ def main():
         state["usage_mood"] = claude_pet_mood(data.get("claude"), hist, pet_state, data=data)
 
         # 新版本：git checkout 里只提示 git pull；装好的副本下载好了，watch 里在宠物上弹升级选项
-        upd  = data.get("update") or full.get("update")
+        # 这次刷新取到的、和后台定时检查写进 state 的，用更新的那份
+        upd  = max((u for u in (data.get("update"), full.get("update")) if u),
+                   key=lambda u: u.get("checked_at") or 0, default=None)
         show_update(upd)
+        state["update_msg"] = None
         hint = state["update_hint"]
         state["update_poll_at"] = time.time() + 60   # 刚查过，后台定时检查从现在起算
         state["refresh_no"]  = state.get("refresh_no", 0) + 1
