@@ -83,7 +83,7 @@ python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 
    - **`n` 不要提醒**：这个版本不再提醒；出了更新的版本，或重启后，才会再弹
 3. 一次性查询时在末尾提示，运行 `--update` 安装。
 
-从 see-balance 的 git checkout 里直接运行时，只提示 `git pull`，不会下载或覆盖工作区。
+从 see-balance 的 git checkout 里直接运行时，只读上游的版本号、提示 `git pull`，不会暂存或覆盖工作区。
 
 - 没查成（断网、上游内容不完整）时过 1 小时再试；`--update` 失败时退出码为 1。
 - `--json` / `--compact` 是给脚本用的：不联网查更新，输出里也没有更新相关字段。

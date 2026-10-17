@@ -30,7 +30,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, http.client, io, json, os, random, re, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time, unicodedata
+import base64, http.client, io, json, os, random, re, select, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,7 +164,7 @@ def load_env_grok_bot_token():
 
 def load_state():
     if STATE_FILE.exists():
-        try:    return json.loads(STATE_FILE.read_text())
+        try:    return json.loads(STATE_FILE.read_text(encoding="utf-8"))   # 和 save_state 同一编码，别随 locale
         except: pass
     return {}
 
@@ -1829,7 +1829,7 @@ def pet_demo():
 #
 # 每天最多查一次上游 main 上的 provider_balance.py：__version__ 比本地新，就先下载到
 # ~/.see-balance/update/ 暂存，再提示装上（watch 里按 u，或运行 --update）。
-# 从 git checkout 里跑时只提示 git pull，不下载、不覆盖工作区。
+# 从 git checkout 里跑时只读上游版本号、提示 git pull，不暂存、不覆盖工作区。
 
 UPDATE_URL       = (os.environ.get("SEE_BALANCE_UPDATE_URL")
                     or "https://raw.githubusercontent.com/jhfnetboy/see-balance/main/provider_balance.py")
@@ -1884,13 +1884,25 @@ def _from_git_checkout():
     return False
 
 
-def _private_dir(d):
-    """暂存目录得是自己的、别人写不进：SEE_BALANCE_STATE 指到 /tmp 这类共享目录时，别让人预先塞文件。"""
+def _owned_by_me(path, private=False):
+    """path 是自己的真实文件/目录（不是符号链接）；private=True 时还要求别人写不进。
+
+    SEE_BALANCE_STATE 指到 /tmp 这类共享目录时，别让人预先塞文件或放个链接指到别处。
+    没有 getuid 的平台（Windows）只查不是符号链接。
+    """
     try:
-        st = os.stat(d)
+        st = os.lstat(path)
     except OSError:
         return False
-    return st.st_uid == os.getuid() and not (st.st_mode & 0o022)
+    if stat.S_ISLNK(st.st_mode):
+        return False
+    if not hasattr(os, "getuid"):
+        return True
+    return st.st_uid == os.getuid() and not (private and st.st_mode & 0o022)
+
+
+def _private_dir(d):
+    return _owned_by_me(d, private=True)
 
 
 def _valid_version(text):
@@ -1913,6 +1925,8 @@ def _write_atomic(path, text, mode=None):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())   # 先落盘再改名：断电也不会留下空文件
         if mode is not None:
             os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -1953,9 +1967,12 @@ def check_update(upd=None, force=False, now=None):
     却还没暂存时，不等到点，马上补下载。
     """
     now, upd = now or time.time(), dict(upd or {})
-    wait = UPDATE_RETRY_SEC if upd.get("error") else UPDATE_CHECK_SEC
     behind = (not _from_git_checkout() and _newer(upd.get("latest")) and not staged_update()[0])
-    if not force and not behind and now - float(upd.get("checked_at") or 0) < wait:
+    if upd.get("error"):
+        wait = UPDATE_RETRY_SEC       # 上次没成：过 1 小时再试（补下载也一样，别每次刷新都下）
+    else:
+        wait = 0 if behind else UPDATE_CHECK_SEC
+    if not force and now - float(upd.get("checked_at") or 0) < wait:
         return upd
     upd["checked_at"] = int(now)
     try:
@@ -1973,8 +1990,9 @@ def check_update(upd=None, force=False, now=None):
         return upd
     staged = staged_update()[0]
     if staged and _version_key(staged) > _version_key(latest):   # 上游回滚了：暂存的那版别再装
-        try:
-            UPDATE_STAGED.unlink()
+        try:   # 下载期间别的终端刚暂存的更新版本不算回滚（那是它查到的更新的上游）
+            if os.lstat(UPDATE_STAGED).st_mtime < now:
+                UPDATE_STAGED.unlink()
         except OSError:
             pass
     if _newer(latest):
@@ -1993,7 +2011,7 @@ def staged_update():
     if not _private_dir(UPDATE_STAGED.parent):
         return None, None
     try:
-        if os.stat(UPDATE_STAGED).st_uid != os.getuid():
+        if not _owned_by_me(UPDATE_STAGED):
             return None, None
         text = UPDATE_STAGED.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
@@ -2032,6 +2050,8 @@ def apply_update():
             return False, f"已经装好 v{cur}，重启一下就能用上"
         return False, f"已经是最新版 v{cur}"
     target = Path(__file__).resolve()
+    if not _newer(v):   # 刚才这段时间里别的终端已经装了同样新或更新的版本
+        return False, f"已经装好 v{_current_version()}，重启一下就能用上"
     try:
         shutil.copy2(target, target.with_name(target.name + ".bak"))
         _write_atomic(target, text, mode=target.stat().st_mode & 0o7777)
@@ -2092,7 +2112,8 @@ def main():
             sys.exit(1 if upd.get("error") else 0)
         ok, msg = apply_update()   # 这次没查成，之前暂存好的新版本照样能装
         print(("✓ " if ok else "") + msg)
-        sys.exit(0 if ok or not upd.get("error") else 1)
+        failed = msg.startswith("更新失败") or (not ok and upd.get("error"))
+        sys.exit(1 if failed else 0)
     # --json / --compact 给脚本用：不联网查更新，输出也不多出 update 字段
     update_mode = ("--no-update" not in args and os.environ.get("SEE_BALANCE_UPDATE", "1").strip() != "0"
                    and not json_mode and not compact)
@@ -2179,11 +2200,13 @@ def main():
                 state["update_msg"] = f"⚠ {msg}"
                 paint()
             if ch in ("k", "n") and update_prompt():
-                if ch == "k":   # 跳过本次：下次刷新再提醒
+                if ch == "k":   # 跳过本次：这次刷新结束前不再提，下次刷新再提醒
                     state["update_skip"] = True
+                    state["update_skip_until"] = state.get("refresh_no", 0) + (2 if state.get("busy") else 1)
                 else:           # 不要提醒：这个版本不再提，出了更新的版本或重启后再提
                     state["update_muted"] = state["update_ver"]
-                set_pet_mood()
+                if not state.get("busy"):   # 刷新中宠物在显示“正在刷新”，刷完会按最新状态重设
+                    set_pet_mood()
                 paint()
             if ch == "r" and not state.get("busy"):
                 return "refresh"
@@ -2293,7 +2316,8 @@ def main():
         state["can_update"]  = bool(hint) and interactive and not _from_git_checkout()
         state["update_ver"]  = staged_update()[0] if state["can_update"] else None
         state["update_msg"]  = None
-        state["update_skip"] = False   # “跳过本次”只管到这次刷新
+        state["refresh_no"]  = state.get("refresh_no", 0) + 1
+        state["update_skip"] = state["refresh_no"] < state.get("update_skip_until", 0)   # “跳过本次”只管到下次刷新
         set_pet_mood()
 
         # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
