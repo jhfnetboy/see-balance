@@ -16,8 +16,12 @@ Usage:
   python3 provider_balance.py --json           # raw JSON
   python3 provider_balance.py --no-pet         # hide the Claude pet (or SEE_BALANCE_PET=0)
   python3 provider_balance.py --pet-demo       # preview every pet mood, no API calls
+  python3 provider_balance.py --update         # install the latest version from upstream main now
+  python3 provider_balance.py --version        # print the version
+  python3 provider_balance.py --no-update      # skip the daily update check (or SEE_BALANCE_UPDATE=0)
 
-  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now, q quits.
+  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now,
+  u installs a downloaded update and restarts, q quits.
 
 Config:
   ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, and proxy settings here
@@ -26,7 +30,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, io, json, os, random, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time, unicodedata
+import base64, http.client, io, json, os, random, re, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +40,8 @@ try:
     import termios, tty      # watch 模式读快捷键；没有（如 Windows）就退回普通 sleep
 except ImportError:
     termios = tty = None
+
+__version__ = "1.2.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -164,7 +170,8 @@ def load_state():
 
 def save_state(snapshot):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+    # 原子写：几个终端同时跑时，别人不会读到写了一半的 state（读到半截会当成空 state）
+    _write_atomic(STATE_FILE, json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
 
 # ── 实测消耗（历史采样 + 速率）───────────────────────────────────────────────
 #
@@ -1532,7 +1539,8 @@ PET_ANGRY_SEC     = 12 * 3600   # 生气从窗口重置起持续多久
 PET_TICK_SEC      = 0.5         # 动画帧间隔
 PET_MSG_MAX       = 30          # 气泡文字最多占几列
 PET_SPRITE_H      = 8           # 精灵图 7 行 + 1 行留给上下跳
-PET_W, PET_H      = 36, 4 + PET_SPRITE_H   # 整块（气泡 + 精灵图）固定大小，重画时能完整盖住上一帧
+PET_BUBBLE_LINES  = 2           # 气泡最多几行字（升级选项要两行）
+PET_W, PET_H      = 36, 3 + PET_BUBBLE_LINES + PET_SPRITE_H   # 整块（气泡 + 精灵图）固定大小，重画时能完整盖住上一帧
 
 # 精灵图模板：{el}{er} 眼睛、{m} 嘴巴各 1 列；{hl}{h}{hr} 双手和手里的东西各 2 列；{x1}{x2} 头旁装饰；{t} 尾巴
 PET_SPECIES = {
@@ -1581,6 +1589,9 @@ PET_FRAMES = {
                   _pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="# #", x2=" ぷんぷん", t="!", dx=1)],
     "encourage": [_pf(el=">", er="<", m="o", hl="ノ", h="☆ ", x1="☆"),
                   _pf(el="^", er="^", m="▽", hl="ノ", h="☆ ", x2="  ☆", dy=-1)],
+    # 有新版本，举着牌子等你选
+    "update":    [_pf(m="▽", hl="ノ", h="! ", x1="NEW"),
+                  _pf(el="^", er="^", m="▽", hl="ノ", h="! ", x2="  NEW", dy=-1)],
     # 刷新取数中（后台线程在拉数据，动画照常跑）
     "busy":      [_pf(m="o", x1="."), _pf(x1=".."), _pf(m="o", x1="..."), _pf(x1="...")],
 }
@@ -1686,12 +1697,12 @@ def claude_pet_mood(cl, hist, pet_state, now=None):
 
 
 def pet_bubble(text: str):
-    text = _clip(text, PET_MSG_MAX)
-    w    = max(2, display_width(text))
-    return [" ." + "-" * (w + 2) + ".",
-            "( " + _pad(text, w) + " )",
-            " '---." + "-" * (w - 2) + "'",
-            "     \\"]
+    """气泡：text 里的换行就是气泡里的换行，最多 PET_BUBBLE_LINES 行。"""
+    rows = [_clip(t, PET_MSG_MAX) for t in text.split("\n")[:PET_BUBBLE_LINES]]
+    w    = max(2, *(display_width(t) for t in rows))
+    return ([" ." + "-" * (w + 2) + "."]
+            + ["( " + _pad(t, w) + " )" for t in rows]
+            + [" '---." + "-" * (w - 2) + "'", "     \\"])
 
 
 class PetView:
@@ -1728,7 +1739,9 @@ class PetView:
             caption, seq = self.msg or "", PET_FRAMES[self.mood]
         sprite = pet_sprite(self.species, seq[self.tick % len(seq)])
         self.tick += 1
-        return [_pad(line, PET_W) for line in pet_bubble(caption) + sprite][:PET_H]
+        lines = pet_bubble(caption) + sprite
+        lines = [""] * max(0, PET_H - len(lines)) + lines   # 气泡字少时上面补空行，整块高度不变
+        return [_pad(line, PET_W) for line in lines][:PET_H]
 
 
 
@@ -1787,7 +1800,8 @@ def pet_demo():
     """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
     view  = PetView()
     shows = [("caring", "照这样到期要用 135%，歇一歇 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
-             ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！")]
+             ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！"),
+             ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
         for i, (mood, arg) in enumerate(shows):
@@ -1811,10 +1825,229 @@ def pet_demo():
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
 
+# ── 自动更新 ──────────────────────────────────────────────────────────────────
+#
+# 每天最多查一次上游 main 上的 provider_balance.py：__version__ 比本地新，就先下载到
+# ~/.see-balance/update/ 暂存，再提示装上（watch 里按 u，或运行 --update）。
+# 从 git checkout 里跑时只提示 git pull，不下载、不覆盖工作区。
+
+UPDATE_URL       = (os.environ.get("SEE_BALANCE_UPDATE_URL")
+                    or "https://raw.githubusercontent.com/jhfnetboy/see-balance/main/provider_balance.py")
+UPDATE_CHECK_SEC = 24 * 3600
+UPDATE_RETRY_SEC = 3600            # 没查成：过 1 小时再试，不用等一天
+UPDATE_MAX_BYTES = 4 * 1024 * 1024
+UPDATE_DEADLINE  = 60              # 下载总时限（秒）：urlopen 的 timeout 只管单次读写
+UPDATE_STAGED    = STATE_FILE.parent / "update" / "provider_balance.py"
+# 文件得以入口结尾才算完整；正则里写成 \n，源码里这一行本身不会被当成入口
+_MAIN_TAIL       = re.compile(r'\nif __name__ == "__main__":\n[ \t]+main\(\)\s*\Z')
+
+
+def _version_of(text):
+    m = re.search(r"""^__version__\s*=\s*["']([0-9]+(?:\.[0-9]+)*)["']""", text or "", re.M)
+    return m.group(1) if m else None
+
+
+def _version_key(v):
+    key = [int(x) for x in v.split(".")]
+    while key and key[-1] == 0:   # 1.2 和 1.2.0 算同一版
+        key.pop()
+    return tuple(key)
+
+
+def _installed_version():
+    """磁盘上这份脚本的版本：别的终端可能已经装了更新的，正在跑的进程还是旧的。"""
+    try:
+        return _version_of(Path(__file__).resolve().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        return None
+
+
+def _current_version():
+    disk = _installed_version()
+    return disk if disk and _version_key(disk) > _version_key(__version__) else __version__
+
+
+def _newer(v):
+    """v 比本机已有的（正在跑的、磁盘上的，取新的那个）还新。"""
+    return bool(v) and _version_key(v) > _version_key(_current_version())
+
+
+def _from_git_checkout():
+    """是不是直接从 see-balance 的 git checkout 里跑：往上找 .git，且仓库根就是本脚本所在目录。
+
+    ~/bin 被别的仓库（如 dotfiles）管着时不算：那是一份装好的副本，照常自更新。
+    """
+    here = Path(__file__).resolve().parent
+    for d in (here, *here.parents):
+        if (d / ".git").exists():
+            return d == here and (d / "install.sh").exists()
+    return False
+
+
+def _private_dir(d):
+    """暂存目录得是自己的、别人写不进：SEE_BALANCE_STATE 指到 /tmp 这类共享目录时，别让人预先塞文件。"""
+    try:
+        st = os.stat(d)
+    except OSError:
+        return False
+    return st.st_uid == os.getuid() and not (st.st_mode & 0o022)
+
+
+def _valid_version(text):
+    """内容是不是一份完整的本程序：以入口结尾、能编译、带版本号。是就返回版本号。
+
+    只靠能编译不够：半截文件常常照样能编译，装上去却什么都不做。
+    """
+    if not text or not _MAIN_TAIL.search(text):
+        return None
+    try:
+        compile(text, "provider_balance.py", "exec")
+    except (SyntaxError, ValueError):
+        return None
+    return _version_of(text)
+
+
+def _write_atomic(path, text, mode=None):
+    """先写同目录下的独一份临时文件再改名：别的进程要么读到旧文件，要么读到完整的新文件。"""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _download(url):
+    """下载完整内容；超时、截断、过大都抛 ValueError / OSError。"""
+    deadline = time.time() + UPDATE_DEADLINE
+    chunks, total = [], 0
+    with urlopen(Request(url, headers={"User-Agent": "see-balance"}), timeout=HTTP_TIMEOUT) as resp:
+        size = resp.headers.get("Content-Length")
+        while True:
+            if time.time() > deadline:
+                raise ValueError("下载太慢，超时了")
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > UPDATE_MAX_BYTES:
+                raise ValueError("文件大得不正常")
+    raw = b"".join(chunks)
+    if size and size.isdigit() and int(size) != len(raw):   # 连接中途断了，read() 不报错只返回半截
+        raise ValueError(f"只下载到 {len(raw)}/{size} 字节")
+    return raw.decode("utf-8")
+
+
+def check_update(upd=None, force=False, now=None):
+    """到点就查一次上游，返回新的 update 状态（存进 state.json）。
+
+    每天查一次；没查成过 1 小时再试。别的副本（比如 git checkout）查到了新版本、这份装好的副本
+    却还没暂存时，不等到点，马上补下载。
+    """
+    now, upd = now or time.time(), dict(upd or {})
+    wait = UPDATE_RETRY_SEC if upd.get("error") else UPDATE_CHECK_SEC
+    behind = (not _from_git_checkout() and _newer(upd.get("latest")) and not staged_update()[0])
+    if not force and not behind and now - float(upd.get("checked_at") or 0) < wait:
+        return upd
+    upd["checked_at"] = int(now)
+    try:
+        text = _download(UPDATE_URL)
+    except (URLError, http.client.HTTPException, TimeoutError, socket.timeout, OSError, ValueError) as e:
+        upd["error"] = str(e)[:200]
+        return upd
+    latest = _valid_version(text)
+    if not latest:   # 坏内容不覆盖上次查到的版本号，已暂存的好版本照样提示
+        upd["error"] = "上游文件不完整（编译不过、没有版本号或缺入口），先不更新"
+        return upd
+    upd.pop("error", None)
+    upd["latest"] = latest
+    if _from_git_checkout():
+        return upd
+    staged = staged_update()[0]
+    if staged and _version_key(staged) > _version_key(latest):   # 上游回滚了：暂存的那版别再装
+        try:
+            UPDATE_STAGED.unlink()
+        except OSError:
+            pass
+    if _newer(latest):
+        try:
+            UPDATE_STAGED.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if not _private_dir(UPDATE_STAGED.parent):
+                raise OSError(f"{UPDATE_STAGED.parent} 不是你自己的私有目录，不往里放新版本")
+            _write_atomic(UPDATE_STAGED, text)
+        except (OSError, UnicodeError) as e:
+            upd["error"] = f"下载的新版本存不下来：{e}"[:200]
+    return upd
+
+
+def staged_update():
+    """暂存好、确实比本机已有的新的 (版本号, 内容)；没有返回 (None, None)。"""
+    if not _private_dir(UPDATE_STAGED.parent):
+        return None, None
+    try:
+        if os.stat(UPDATE_STAGED).st_uid != os.getuid():
+            return None, None
+        text = UPDATE_STAGED.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None, None
+    v = _valid_version(text)
+    return (v, text) if _newer(v) else (None, None)
+
+
+def _short_path(p):
+    home = str(Path.home())
+    return "~" + p[len(home):] if p.startswith(home + os.sep) else p
+
+
+def update_hint(upd, interactive=False):
+    """有新版本时给一行提示；没有返回 None。装好的副本以暂存区为准，git checkout 以上游版本号为准。"""
+    if _from_git_checkout():
+        latest = (upd or {}).get("latest")
+        if not _newer(latest):
+            return None
+        return f"🆕 上游有新版本 v{latest}（当前 v{__version__}），git pull 一下就能用上"
+    staged = staged_update()[0]
+    if not staged:
+        return None
+    how = "按 u 更新" if interactive else f"运行 python3 {_short_path(str(Path(__file__).resolve()))} --update 更新"
+    return f"🆕 新版本 v{staged} 已下载好（当前 v{__version__}），{how}"
+
+
+def apply_update():
+    """把暂存的新版本装到当前脚本的位置，旧版留一份 .bak。返回 (成功与否, 说明)。"""
+    if _from_git_checkout():
+        return False, "这是 git checkout，用 git pull 更新"
+    v, text = staged_update()
+    if not v:
+        cur = _current_version()
+        if cur != __version__:   # 别的终端已经装好了，这个进程还是旧的
+            return False, f"已经装好 v{cur}，重启一下就能用上"
+        return False, f"已经是最新版 v{cur}"
+    target = Path(__file__).resolve()
+    try:
+        shutil.copy2(target, target.with_name(target.name + ".bak"))
+        _write_atomic(target, text, mode=target.stat().st_mode & 0o7777)
+    except (OSError, UnicodeError) as e:
+        return False, f"更新失败：{e}"
+    try:
+        UPDATE_STAGED.unlink()
+    except OSError:
+        pass
+    return True, f"已更新到 v{v}（旧版备份在 {_short_path(str(target))}.bak）"
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def collect():
-    return {
+def collect(update=True):
+    data = {
         "ts":       int(time.time()),
         "deepseek": fetch_deepseek(),
         "codex":    fetch_codex(),
@@ -1822,6 +2055,9 @@ def collect():
         "agy":      fetch_agy(),
         "grok":     fetch_grok(),
     }
+    if update:
+        data["update"] = check_update(load_state().get("update"))
+    return data
 
 def main():
     args        = sys.argv[1:]
@@ -1840,6 +2076,26 @@ def main():
     if "--pet-demo" in args:
         pet_demo()
         return
+    if "--version" in args:
+        print(f"see-balance v{__version__}")
+        return
+    if "--update" in args:
+        upd  = check_update(load_state().get("update"), force=True)
+        full = load_state()   # 查更新要几秒，期间别的终端可能写过 state：重新读，只改 update 段
+        if full or not STATE_FILE.exists():   # 读不出来就别写回，免得把 history 等整份冲掉
+            full["update"] = upd
+            save_state(full)
+        if upd.get("error"):
+            print(f"⚠ 检查更新失败：{upd['error']}")
+        if _from_git_checkout():
+            print(update_hint(upd) or f"当前 v{__version__}，没发现更新的版本")
+            sys.exit(1 if upd.get("error") else 0)
+        ok, msg = apply_update()   # 这次没查成，之前暂存好的新版本照样能装
+        print(("✓ " if ok else "") + msg)
+        sys.exit(0 if ok or not upd.get("error") else 1)
+    # --json / --compact 给脚本用：不联网查更新，输出也不多出 update 字段
+    update_mode = ("--no-update" not in args and os.environ.get("SEE_BALANCE_UPDATE", "1").strip() != "0"
+                   and not json_mode and not compact)
 
     # 宠物只跟完整视图走：--compact / --json / 管道输出保持原样，方便脚本解析
     pet_mode    = ("--no-pet" not in args and os.environ.get("SEE_BALANCE_PET", "1").strip() != "0"
@@ -1854,11 +2110,34 @@ def main():
     state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
              "pet_visible": True, "size": None, "place": None}
 
+    def update_prompt():
+        """要不要弹升级选项：有下载好的新版本，这次没跳过，这个版本也没说过“不要提醒”。"""
+        v = state.get("update_ver")
+        return bool(v) and not state.get("update_skip") and v != state.get("update_muted")
+
+    def set_pet_mood():
+        """升级选项最优先（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
+        if update_prompt():
+            state["pet"].set_mood("update", f"新版本 v{state['update_ver']}！u 立即升级\nk 跳过本次 · n 不要提醒")
+            return
+        mood = state.get("usage_mood") or ("idle", None)
+        if mood[0] == "idle" and state.get("update_hint") and not state.get("can_update"):
+            mood = ("encourage", "有新版本啦，看看底下～")
+        state["pet"].set_mood(*mood)
+
     def paint():
         """整屏重画：正文 + footer，再把宠物画在右下角（放不下就在 footer 下提示）。"""
         size  = shutil.get_terminal_size()
         keys  = " · p 宠物 · s 换宠物" if pet_mode else ""
-        text  = state["body"] + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n"
+        if state.get("update_msg"):
+            note = state["update_msg"]
+        elif state.get("can_update"):   # 宠物藏起来或放不下时，底下也能看到选项
+            note = (f"🆕 新版本 v{state['update_ver']} 已下载好（当前 v{__version__}）："
+                    "u 立即升级 · k 跳过本次 · n 不要提醒") if update_prompt() else None
+        else:
+            note = state.get("update_hint")
+        text  = (state["body"] + (f"\n\n{note}" if note else "")
+                 + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n")
         place = None
         if pet_mode and state["pet_visible"]:
             rows    = screen_rows(text, size.columns)   # 末尾空行就是光标所在行
@@ -1892,6 +2171,20 @@ def main():
         for ch in keys.lower():
             if ch == "q":
                 return "quit"
+            if ch == "u" and state.get("can_update"):
+                ok, msg = apply_update()
+                if ok:   # 退出 watch、恢复终端后用新版本重启
+                    state["restart"] = msg
+                    return "quit"
+                state["update_msg"] = f"⚠ {msg}"
+                paint()
+            if ch in ("k", "n") and update_prompt():
+                if ch == "k":   # 跳过本次：下次刷新再提醒
+                    state["update_skip"] = True
+                else:           # 不要提醒：这个版本不再提，出了更新的版本或重启后再提
+                    state["update_muted"] = state["update_ver"]
+                set_pet_mood()
+                paint()
             if ch == "r" and not state.get("busy"):
                 return "refresh"
             if ch == "p" and pet_mode:
@@ -1922,7 +2215,7 @@ def main():
         box = {}
         def work():
             try:
-                box["data"] = collect()
+                box["data"] = collect(update_mode)
             except BaseException as e:   # 交给主线程抛出，和原来同步取数时一样
                 box["err"] = e
         worker = threading.Thread(target=work, daemon=True)   # 中途按 q 直接退出，不等它
@@ -1945,7 +2238,7 @@ def main():
     def do_query(data=None):
         full      = state["full"]
         prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok") if k in full}
-        data      = data if data is not None else collect()
+        data      = data if data is not None else collect(update_mode)
 
         # ── History（实测消耗速率的数据源）──────────────────────────────────
         hist = full.get("history") or []
@@ -1985,11 +2278,23 @@ def main():
         to_save["daily_baselines"] = baselines
         to_save["history"] = hist
         to_save["pet"] = pet_state
+        if "update" not in to_save and full.get("update"):   # --no-update 这次没查，别把上次的检查记录丢了
+            to_save["update"] = full["update"]
         save_state(to_save)
         state["full"] = to_save
 
         today_bl = baselines.get(today, {})
-        state["pet"].set_mood(*claude_pet_mood(data.get("claude"), hist, pet_state))
+        state["usage_mood"] = claude_pet_mood(data.get("claude"), hist, pet_state)
+
+        # 新版本：git checkout 里只提示 git pull；装好的副本下载好了，watch 里在宠物上弹升级选项
+        upd  = data.get("update") or full.get("update")
+        hint = update_hint(upd, interactive=interactive) if update_mode else None
+        state["update_hint"] = hint
+        state["can_update"]  = bool(hint) and interactive and not _from_git_checkout()
+        state["update_ver"]  = staged_update()[0] if state["can_update"] else None
+        state["update_msg"]  = None
+        state["update_skip"] = False   # “跳过本次”只管到这次刷新
+        set_pet_mood()
 
         # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
         redraw = watch_mode and not json_mode and sys.stdout.isatty()
@@ -2014,6 +2319,8 @@ def main():
             if pet_mode and sys.stdout.isatty():
                 body = pet_merge_static(body, state["pet"].frame(), shutil.get_terminal_size().columns)
             print(body)
+            if hint and not compact:
+                print("\n" + hint)
         if watch_mode and (redraw or not state.get("footer_shown")):
             print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n", flush=True)
             state["footer_shown"] = True
@@ -2037,11 +2344,17 @@ def main():
             try:
                 if state["place"] and state["pet_visible"]:   # 擦掉宠物，别留在 shell 里
                     pet_draw([" " * PET_W] * PET_H, *state["place"])
+            except OSError:
+                pass
+            try:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 sys.stdout.write("\033[?25h")
                 sys.stdout.flush()
             except OSError:      # SIGHUP：终端已经没了
-                pass
+                state["restart"] = None   # 终端没恢复好就别重启，免得新进程把无回显当成原始状态
+        if state.get("restart"):
+            print(f"\n✓ {state['restart']}，正在重启…", flush=True)
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())] + args)
         print("\n👋 Stopped.")
         return
 

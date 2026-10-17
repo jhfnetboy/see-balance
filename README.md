@@ -57,9 +57,40 @@ python3 ~/bin/provider_balance.py --compact    # 每 provider 一行
 python3 ~/bin/provider_balance.py --json       # 原始 JSON
 python3 ~/bin/provider_balance.py --no-pet     # 不显示 Claude 宠物（或设 SEE_BALANCE_PET=0）
 python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的每种情绪
+python3 ~/bin/provider_balance.py --update     # 马上检查并安装上游最新版
+python3 ~/bin/provider_balance.py --version    # 看当前版本
+python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 SEE_BALANCE_UPDATE=0）
 ```
 
-`--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`s`** 切换宠物（猫 / 兔子 / 小熊），**`r`** 立即刷新，**`q`** 退出。
+`--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`s`** 切换宠物（猫 / 兔子 / 小熊），**`r`** 立即刷新，**`q`** 退出；有新版本时还有 **`u`** / **`k`** / **`n`**（见下）。
+
+## 自动更新
+
+每天最多查一次上游 [`main` 分支](https://github.com/jhfnetboy/see-balance/blob/main/provider_balance.py)上的 `__version__`，比本地新就：
+
+1. 先下载到 `~/.see-balance/update/` 暂存（下载完会检查能否编译、有没有版本号，不完整就不用）；
+2. `--watch` 里宠物举牌弹出升级选项（宠物藏起来时底部也有同样一行）：
+
+   ```
+    .---------------------------.
+   ( 新版本 v1.3.0！u 立即升级 )
+   ( k 跳过本次 · n 不要提醒   )
+    '---.-----------------------'
+   ```
+
+   - **`u` 立即升级**：装好后自动重启，旧版本留一份 `provider_balance.py.bak`
+   - **`k` 跳过本次**：先收起来，下次刷新再提醒
+   - **`n` 不要提醒**：这个版本不再提醒；出了更新的版本，或重启后，才会再弹
+3. 一次性查询时在末尾提示，运行 `--update` 安装。
+
+从 see-balance 的 git checkout 里直接运行时，只提示 `git pull`，不会下载或覆盖工作区。
+
+- 没查成（断网、上游内容不完整）时过 1 小时再试；`--update` 失败时退出码为 1。
+- `--json` / `--compact` 是给脚本用的：不联网查更新，输出里也没有更新相关字段。
+- 暂存目录必须是你自己的、别人写不进的目录（`SEE_BALANCE_STATE` 指到 `/tmp` 这类共享目录时不会暂存）。
+- 另一个终端已经装好更新的版本时，旧进程不会再装回暂存里的较低版本；上游回滚后，暂存里的高版本会被丢弃。
+
+> 维护者注意：要推给用户的改动，合入前把 `provider_balance.py` 顶部的 `__version__` 调大，否则已安装的副本不会提示更新。
 
 ## Claude 宠物
 
@@ -67,6 +98,7 @@ python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的�
 
 | 情绪 | 什么时候 |
 |---|---|
+| 升级 | 有下载好的新版本：举牌弹出升级选项，排在所有情绪前面，选完就让开 |
 | 开心 | 7d 周额度用完（≥ 99.5%） |
 | 献爱心（提醒休息） | 7d 按当前进度预计到期用量 > 120%；或 5h 已用满；或按实测速率 5h 会在重置前见底 |
 | 生气 | 7d 窗口重置时，上一周最后用量 < 90%（重置后 12h 内） |
@@ -103,6 +135,8 @@ python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的�
 | 变量 | 作用 |
 |---|---|
 | `SEE_BALANCE_STATE` | 换一个 state 文件（测试 / 多账号） |
+| `SEE_BALANCE_UPDATE` | 设成 `0` 关掉每日更新检查 |
+| `SEE_BALANCE_UPDATE_URL` | 换一个更新源（测试用） |
 | `SEE_BALANCE_CNY_DAILY_CAP` | DeepSeek 当日人民币闸门（例 `9`），设了就会给「安全 / 会超」判定 |
 | `HTTPS_PROXY` | 访问 api.deepseek.com / chatgpt.com 的代理 |
 
