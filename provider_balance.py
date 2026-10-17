@@ -32,7 +32,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, http.client, io, json, os, random, re, select, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
+import base64, http.client, io, json, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2097,7 +2097,12 @@ ATTENTION_MAX_AGE = 12 * 3600          # 超过这么久还没动静的提醒（
 ATTENTION_ROTATE  = 1024 * 1024        # 日志超过这么大就换新文件（旧的留一份 .old）
 CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
                          or (Path.home() / ".claude" / "settings.json"))
+GROK_HOOK_FILE    = Path(os.environ.get("SEE_BALANCE_GROK_HOOKS")
+                         or (Path.home() / ".grok" / "hooks" / "see-balance.json"))
 HOOK_EVENTS       = ("Notification", "UserPromptSubmit", "Stop", "SessionEnd")
+# Grok 里拒绝 / 取消权限框时发的是 StopCancelled（代替 Stop）。Claude Code 不认识这个事件，
+# 所以不放进共享的 ~/.claude/settings.json，单独写一份只有 Grok 读的 ~/.grok/hooks/see-balance.json
+GROK_ONLY_EVENTS  = ("StopCancelled",)
 SOURCE_NAMES      = {"claude": "Claude", "grok": "Grok"}
 # Notification 的类型 → 等你做什么；没列出的（auth_success、agent_completed 等）不算等你
 WAIT_KINDS        = {"permission_prompt": "确认", "elicitation_dialog": "填写",
@@ -2115,9 +2120,12 @@ except ValueError:              # 不是单行 JSON：读完剩下的再试一�
         e = json.loads(raw + sys.stdin.read())
     except ValueError:
         sys.exit(0)
-if not isinstance(e, dict) or e.get("agent_id"):    # 子 agent 的事件不管，只看主会话
+if not isinstance(e, dict):
     sys.exit(0)
 ev  = e.get("hook_event_name") or ""
+# 子 agent 的回合结束 / 输入不代表主会话的状态；但子 agent 弹的权限框照样要你去处理，Notification 保留
+if ev != "Notification" and (e.get("agent_id") or e.get("subagentType")):
+    sys.exit(0)
 rec = {"ts": time.time(), "src": "grok" if "hookEventName" in e else "claude", "ev": ev,
        "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or ""}
 if ev == "Notification":
@@ -2125,9 +2133,9 @@ if ev == "Notification":
     rec["msg"]  = str(e.get("message") or "")[:120]
     rec["transcript"] = e.get("transcript_path") or ""
 elif ev == "Stop":               # 最后一句是不是在问你：之后的“空闲等待”才算在等你回复
-    tail = str(e.get("last_assistant_message") or "").rstrip()[-300:]
-    q    = re.findall(r"[^\n。！!?？]*[?？]", tail)
-    rec["ask"] = q[-1].strip()[-120:] if q else ""
+    tail = str(e.get("last_assistant_message") or "").rstrip().rstrip("\"'”’)）】*_` ")
+    m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
+    rec["ask"] = m.group(0).strip()[-120:] if m else ""
 try:
     fd = os.open(__LOG__, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode())
@@ -2138,60 +2146,125 @@ except OSError:
 
 
 def _hook_command():
-    return f'python3 -S "{ATTENTION_HOOK}"'
+    """永远退出 0、不输出：hook 脚本被删了也不能拦下你的输入（Claude Code / Grok 把退出码 2 当成阻断）。"""
+    return f"python3 -S {shlex.quote(str(ATTENTION_HOOK))} >/dev/null 2>&1 || true"
+
+
+def _handlers(groups):
+    """一个事件下所有 matcher 组里的 handler；结构不对的组跳过。"""
+    for g in groups:
+        hs = g.get("hooks") if isinstance(g, dict) else None
+        if isinstance(hs, list):
+            yield from hs
+
+
+def _load_settings(path):
+    """读 hook 配置文件；格式不对返回 (None, 原因)，不往里改。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError) as e:
+        return None, str(e)
+    if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+        return None, "格式不是预期的 JSON 对象"
+    if any(not isinstance(v, list) for v in data.get("hooks", {}).values()):
+        return None, "hooks 里有不是列表的条目"
+    return data, None
+
+
+def _save_settings(path, data):
+    """改之前留一份 .see-balance.bak；符号链接（dotfiles）写到链接目标，保留原来的权限。"""
+    real = path.resolve()
+    real.parent.mkdir(parents=True, exist_ok=True)
+    mode = None
+    if real.exists():
+        mode = real.stat().st_mode & 0o7777
+        shutil.copy2(real, real.with_name(real.name + ".see-balance.bak"))
+    _write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode)
+
+
+def _add_hooks(path, events, cmd):
+    """把 cmd 挂到 path 的这些事件上（已挂过的跳过）。返回 (新挂的事件, 错误)。"""
+    data, err = _load_settings(path)
+    if data is None:
+        return [], err
+    hooks, added = data.setdefault("hooks", {}), []
+    for ev in events:
+        groups = hooks.setdefault(ev, [])
+        if any(isinstance(h, dict) and h.get("command") == cmd for h in _handlers(groups)):
+            continue
+        groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
+        added.append(ev)
+    if added:
+        _save_settings(path, data)
+    return added, None
+
+
+def _remove_hooks(path, is_ours):
+    """摘掉 is_ours(command) 为真的条目，别的不动。返回 (摘掉的事件, 错误)。"""
+    if not path.exists():
+        return [], None
+    data, err = _load_settings(path)
+    if data is None:
+        return [], err
+    hooks, removed = data.get("hooks") or {}, []
+    for ev in list(hooks):
+        groups = []
+        for g in hooks[ev]:
+            hs   = (g.get("hooks") or []) if isinstance(g, dict) else []
+            kept = [h for h in hs if not (isinstance(h, dict) and is_ours(str(h.get("command") or "")))]
+            if len(kept) != len(hs):
+                removed.append(ev)
+            if kept or not isinstance(g, dict) or not hs:
+                groups.append(dict(g, hooks=kept) if isinstance(g, dict) and hs else g)
+        if groups:
+            hooks[ev] = groups
+        else:
+            del hooks[ev]
+    if removed:
+        _save_settings(path, data)
+    return list(dict.fromkeys(removed)), None
 
 
 def install_hooks():
     """写 hook 脚本，并把它挂到 ~/.claude/settings.json 的几个事件上（已挂过的不重复挂）。返回说明行。"""
     ATTENTION_HOOK.parent.mkdir(parents=True, exist_ok=True)
     _write_atomic(ATTENTION_HOOK, HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG))), mode=0o700)
-    try:
-        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8")) if CLAUDE_SETTINGS.exists() else {}
-    except (OSError, ValueError) as e:
-        return [f"⚠ 读不了 {CLAUDE_SETTINGS}：{e}，没有改动"]
-    hooks, cmd, added = settings.setdefault("hooks", {}), _hook_command(), []
-    for ev in HOOK_EVENTS:
-        groups = hooks.setdefault(ev, [])
-        if any(h.get("command") == cmd for g in groups for h in g.get("hooks", [])):
-            continue
-        groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
-        added.append(ev)
-    if added:
-        CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        if CLAUDE_SETTINGS.exists():
-            shutil.copy2(CLAUDE_SETTINGS, CLAUDE_SETTINGS.with_name(CLAUDE_SETTINGS.name + ".see-balance.bak"))
-        _write_atomic(CLAUDE_SETTINGS, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-    return [f"✓ hook 脚本：{_short_path(str(ATTENTION_HOOK))}",
-            (f"✓ 已挂到 {_short_path(str(CLAUDE_SETTINGS))}：{'、'.join(added)}" if added
-             else f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里已经挂好了，没有改动"),
-            "  Grok CLI 默认也读这个文件；新开的 Claude Code / Grok 会话开始生效。"]
+    cmd, out = _hook_command(), [f"✓ hook 脚本：{_short_path(str(ATTENTION_HOOK))}"]
+    added, err = _add_hooks(CLAUDE_SETTINGS, HOOK_EVENTS, cmd)
+    if err:
+        return out + [f"⚠ 读不了 {_short_path(str(CLAUDE_SETTINGS))}：{err}，没有改动"]
+    out.append(f"✓ 已挂到 {_short_path(str(CLAUDE_SETTINGS))}：{'、'.join(added)}（原文件备份为 .see-balance.bak）"
+               if added else f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里已经挂好了，没有改动")
+    if GROK_HOOK_FILE.parent.parent.exists():   # 装了 Grok CLI
+        added, err = _add_hooks(GROK_HOOK_FILE, GROK_ONLY_EVENTS, cmd)
+        if err:
+            out.append(f"⚠ 读不了 {_short_path(str(GROK_HOOK_FILE))}：{err}，Grok 拒绝权限后的提醒可能要等下一句话才消失")
+        elif added:
+            out.append(f"✓ 已挂到 {_short_path(str(GROK_HOOK_FILE))}：{'、'.join(added)}（只有 Grok 读）")
+    out.append("  Grok CLI 默认也读 ~/.claude/settings.json；新开的 Claude Code / Grok 会话开始生效。")
+    return out
 
 
 def uninstall_hooks():
     """把 install_hooks 挂上的条目摘掉（别的 hook 不动），删掉 hook 脚本。返回说明行。"""
-    out, cmd = [], _hook_command()
-    try:
-        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8")) if CLAUDE_SETTINGS.exists() else {}
-    except (OSError, ValueError) as e:
-        return [f"⚠ 读不了 {CLAUDE_SETTINGS}：{e}，没有改动"]
-    hooks, removed = settings.get("hooks") or {}, []
-    for ev in list(hooks):
-        groups = []
-        for g in hooks[ev]:
-            kept = [h for h in g.get("hooks", []) if h.get("command") != cmd]
-            if len(kept) != len(g.get("hooks", [])):
-                removed.append(ev)
-            if kept:
-                groups.append(dict(g, hooks=kept))
-        if groups:
-            hooks[ev] = groups
-        else:
-            del hooks[ev]
-    if removed:
-        _write_atomic(CLAUDE_SETTINGS, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-        out.append(f"✓ 已从 {_short_path(str(CLAUDE_SETTINGS))} 摘掉：{'、'.join(dict.fromkeys(removed))}")
-    else:
-        out.append(f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里没有 see-balance 的 hook")
+    out = []
+    def is_ours(command):   # 认 hook.py 的文件名，换过 SEE_BALANCE_STATE 装的也能摘掉
+        return "hook.py" in command and "see-balance" in command or command == _hook_command()
+    for path in (CLAUDE_SETTINGS, GROK_HOOK_FILE):
+        removed, err = _remove_hooks(path, is_ours)
+        if err:
+            out.append(f"⚠ 读不了 {_short_path(str(path))}：{err}，没有改动")
+        elif removed:
+            out.append(f"✓ 已从 {_short_path(str(path))} 摘掉：{'、'.join(removed)}（原文件备份为 .see-balance.bak）")
+    data, _ = _load_settings(GROK_HOOK_FILE)
+    if GROK_HOOK_FILE.exists() and data == {"hooks": {}}:   # 这份是 install 时新建的，摘空了就删掉
+        for p in (GROK_HOOK_FILE, GROK_HOOK_FILE.with_name(GROK_HOOK_FILE.name + ".see-balance.bak")):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if not out:
+        out.append("✓ 没有找到 see-balance 的 hook")
     try:
         ATTENTION_HOOK.unlink()
         out.append(f"✓ 已删除 {_short_path(str(ATTENTION_HOOK))}")
@@ -2201,30 +2274,46 @@ def uninstall_hooks():
 
 
 def hooks_installed():
-    try:
-        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
+    data, _ = _load_settings(CLAUDE_SETTINGS)
     cmd = _hook_command()
-    return ATTENTION_HOOK.exists() and any(
-        h.get("command") == cmd for g in (settings.get("hooks") or {}).get("Notification", []) for h in g.get("hooks", []))
+    return bool(data) and ATTENTION_HOOK.exists() and any(
+        isinstance(h, dict) and h.get("command") == cmd
+        for h in _handlers((data.get("hooks") or {}).get("Notification", [])))
 
 
-def _attention_lines():
-    """读日志（连同轮换下来的 .old）；太大就轮换。hook 只追加，这里只读，互不打架。"""
-    lines = []
-    for path in (ATTENTION_LOG.with_name(ATTENTION_LOG.name + ".old"), ATTENTION_LOG):
+def _read_lines(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.readlines()
+    except OSError:
+        return []
+
+
+def _attention_lines(now=None):
+    """读日志（连同轮换下来的 .old）。太大就轮换：先把当前日志改名挪开（hook 之后的追加落到新文件），
+    再把 12 小时内的记录并进 .old —— 还在等的提醒都在这个范围里，轮换几次都不会丢。"""
+    now  = now or time.time()
+    old  = ATTENTION_LOG.with_name(ATTENTION_LOG.name + ".old")
+    try:
+        big = ATTENTION_LOG.stat().st_size > ATTENTION_ROTATE
+    except OSError:
+        big = False
+    if big:
+        moving = ATTENTION_LOG.with_name(f"{ATTENTION_LOG.name}.{os.getpid()}.rotating")
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                lines += fh.readlines()
+            os.replace(ATTENTION_LOG, moving)
+            keep = []
+            for line in _read_lines(old) + _read_lines(moving):
+                try:
+                    if now - float(json.loads(line).get("ts") or 0) <= ATTENTION_MAX_AGE:
+                        keep.append(line if line.endswith("\n") else line + "\n")
+                except (ValueError, AttributeError):
+                    pass
+            _write_atomic(old, "".join(keep))
+            os.unlink(moving)
         except OSError:
             pass
-    try:
-        if ATTENTION_LOG.stat().st_size > ATTENTION_ROTATE:
-            os.replace(ATTENTION_LOG, ATTENTION_LOG.with_name(ATTENTION_LOG.name + ".old"))
-    except OSError:
-        pass
-    return lines
+    return _read_lines(old) + _read_lines(ATTENTION_LOG)
 
 
 def attention_items(now=None):
@@ -2235,7 +2324,7 @@ def attention_items(now=None):
     或者会话记录在提醒之后又有了新内容（你在终端里已经处理了）。
     """
     now, sessions = now or time.time(), {}
-    for line in _attention_lines():
+    for line in _attention_lines(now):
         try:
             r = json.loads(line)
         except ValueError:
@@ -2252,6 +2341,8 @@ def attention_items(now=None):
                              "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or ""}
         elif ev == "Stop":
             s["wait"], s["ask"] = None, r.get("ask") or ""
+        elif ev == "StopCancelled":   # Grok：拒绝 / 取消了权限框，这一轮就此结束
+            s["wait"], s["ask"] = None, ""
         elif ev in ("UserPromptSubmit", "SessionEnd"):
             s["wait"], s["ask"] = None, ""
     items = []

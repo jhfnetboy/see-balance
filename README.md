@@ -75,12 +75,15 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 🔔 Agent24 的 Grok 在等你回复（0h12m 前）：要不要我推送到 fork？
 ```
 
-- **算“等你”的**：弹出权限确认 / MCP 表单；或者最后一句话在问你（以 `?` / `？` 结尾），之后一直没动静。干完活单纯空闲的不算。
+- **算“等你”的**：弹出权限确认 / MCP 表单（子 agent 弹的也算）；或者最后一句话在问你（以 `?` / `？` 结尾，正文中间的问号不算），之后一直没动静。干完活单纯空闲的不算。
 - **自动消失**：你回了话、这一轮结束、会话关了，或者会话在提醒之后又有了新进展（你已经在终端里处理了）。超过 12 小时的提醒也不再显示。
 - **只提醒，不代你批准**：回原来的终端作答。
-- **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `UserPromptSubmit` / `Stop` / `SessionEnd` 上（改之前备份为 `settings.json.see-balance.bak`，已有的 hook 不动）。Grok CLI 默认也读这个文件，所以两边都能覆盖；新开的会话开始生效。`--uninstall-hooks` 原样摘掉。
+- **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `UserPromptSubmit` / `Stop` / `SessionEnd` 上。Grok CLI 默认也读这个文件，所以两边都能覆盖；另外在 `~/.grok/hooks/see-balance.json` 挂一个只有 Grok 认识的 `StopCancelled`（在 Grok 里拒绝权限时用来清掉提醒）。新开的会话开始生效。`--uninstall-hooks` 原样摘掉。
+  - 改文件前备份为 `*.see-balance.bak`；已有的 hook 不动；`settings.json` 是符号链接（dotfiles）时改的是链接目标，权限不变。
+  - hook 命令永远以 0 退出、不输出任何东西：哪怕 `hook.py` 被删了，也不会拦下你的输入或打断会话。
 - hook 只往 `~/.see-balance/attention.jsonl` 追加一行：会话 id、目录、事件类型和一小段说明（权限提示文字或最后那句问话），不记工具输入输出。
 - 宠物上的优先级：会话提醒 > 升级选项 > 用量情绪。
+- 日志超过 1MB 时轮换，只保留 12 小时内的记录，还在等的提醒不会丢。
 - Codex、Antigravity 暂时没有可靠的“在等你”信号，还不支持。
 
 ## 自动更新
