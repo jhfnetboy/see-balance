@@ -14,6 +14,10 @@ Usage:
   python3 provider_balance.py --watch 15       # refresh every 15 min
   python3 provider_balance.py --compact        # one-line per provider
   python3 provider_balance.py --json           # raw JSON
+  python3 provider_balance.py --no-pet         # hide the Claude pet (or SEE_BALANCE_PET=0)
+  python3 provider_balance.py --pet-demo       # preview every pet mood, no API calls
+
+  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now, q quits.
 
 Config:
   ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, and proxy settings here
@@ -22,11 +26,16 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, json, os, socket, ssl, subprocess, sys, tempfile, time
+import base64, io, json, os, random, select, shutil, signal, socket, ssl, subprocess, sys, tempfile, threading, time, unicodedata
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+try:
+    import termios, tty      # watch 模式读快捷键；没有（如 Windows）就退回普通 sleep
+except ImportError:
+    termios = tty = None
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -255,6 +264,9 @@ def advice_rate(w, hist, key, window_sec):
     return dict(recent, provisional=True) if recent else None
 
 
+EXHAUSTED_PCT = 99.5   # 用量 ≥ 此值视为额度已用完：不再谈速率/节奏，只说什么时候重置
+
+
 def burn_advice(w, rate, alt_hint=None):
     """返回 (实测消耗行, 进展建议行) 二元组（已是完整行，含缩进）；没有则 None。
 
@@ -265,6 +277,11 @@ def burn_advice(w, rate, alt_hint=None):
     pct  = float(w["pct"])
     left = max(0.0, 100.0 - pct)
     reset_in_h = (max(0.0, w["reset_at"] - time.time()) / 3600.0) if w.get("reset_at") else None
+
+    if pct >= EXHAUSTED_PCT:   # 已经用完：“按此速率 0h00m 后见底 / 建议降速”都没意义了
+        when = f"{fmt_countdown(reset_in_h * 3600)} 后重置" if reset_in_h is not None else "等待重置"
+        tail = f" —— {alt_hint}" if alt_hint else ""
+        return None, f"     建议         ⛔ 已用完，{when}{tail}"
 
     if not rate or rate["per_hour"] <= 0.005:
         if rate and rate.get("kind") == "window":
@@ -347,6 +364,8 @@ def rate_suffix(hist, pkey, key, w=None):
     if not hk:
         return ""
     window_sec = 5 * 3600 if (key.endswith("5h") or key == "five_hour") else 7 * 24 * 3600
+    if float((w or {}).get("pct") or 0) >= EXHAUSTED_PCT:   # 已用完，没有“还剩多久见底”
+        return ""
     r = advice_rate(w, hist, hk, window_sec)
     if not r or r.get("provisional") or r["per_hour"] <= 0.005:
         return ""
@@ -447,29 +466,42 @@ def today_target_line(w: dict, baseline_pct=None, fixed_daily_target=None, total
     return (f"     进度应达    {target_now:5.1f}%  {bar}"
             f"  {rate_str}  {status}")
 
+PACE_SLOW_PCT = 75    # 预计到期用量 ≤ 此值：偏慢可加速
+PACE_FAST_PCT = 120   # 预计到期用量 > 此值：超速需节约
+
+def pace_projection(w: dict, total_sec: int):
+    """按已过时间线性推算到期用量，返回 (已过时间比例, 预计到期用量%)；太早或快重置时返回 None。"""
+    if not w or w.get("pct") is None or not w.get("reset_at"):
+        return None
+    remaining = max(0.0, w["reset_at"] - time.time())
+    elapsed   = max(0.0, total_sec - remaining)
+    if elapsed < total_sec * 0.05:   # < 5% elapsed — too early to judge
+        return None
+    if remaining < total_sec * 0.03:  # 窗口快重置了，此刻的节奏判断没意义
+        return None
+    frac = elapsed / total_sec
+    return frac, float(w["pct"]) / frac
+
 def pace_line(w: dict, total_sec: int) -> str:
     """Return a pace-assessment line for a rate-limited usage window.
 
     Compares actual usage against how much should have been used given elapsed
     time, then projects what the final usage will be at the current rate.
     """
-    if not w or w.get("pct") is None or not w.get("reset_at"):
+    if w and w.get("pct") is not None and w.get("reset_at") and float(w["pct"]) >= EXHAUSTED_PCT:
+        elapsed = max(0.0, total_sec - max(0.0, w["reset_at"] - time.time()))
+        return f"       ⛔ 已用完  已过{elapsed / total_sec * 100:.0f}%时间，等待重置"
+    proj = pace_projection(w, total_sec)
+    if not proj:
         return ""
-    pct      = float(w["pct"])
-    remaining = max(0.0, w["reset_at"] - time.time())
-    elapsed   = max(0.0, total_sec - remaining)
-    if elapsed < total_sec * 0.05:   # < 5% elapsed — too early to judge
-        return ""
-    if remaining < total_sec * 0.03:  # 窗口快重置了，此刻的节奏判断没意义
-        return ""
-    frac      = elapsed / total_sec
-    projected = pct / frac           # estimated usage at end of window
+    pct             = float(w["pct"])
+    frac, projected = proj           # estimated usage at end of window
 
-    if projected <= 75:
+    if projected <= PACE_SLOW_PCT:
         icon, verdict = "🔴", f"偏慢可加速"
     elif projected <= 100:
         icon, verdict = "🟢", f"节奏正常"
-    elif projected <= 120:
+    elif projected <= PACE_FAST_PCT:
         icon, verdict = "🟡", f"偏快需注意"
     else:
         icon, verdict = "🔴", f"超速需节约"
@@ -1488,6 +1520,297 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                 parts.append(f"⚠ {provider['warning']}")
             print("  ".join(parts))
 
+# ── Pet（Claude 用量宠物）─────────────────────────────────────────────────────
+#
+# 一只 ASCII 宠物（猫 / 兔子 / 小熊，按 s 切换），按 Claude 的用量节奏换情绪，画在终端右下角。
+# 画风参考 ts-animal（MIT, https://github.com/ts-animal/ts-animal）的颜文字动物，帧为本项目自绘。
+# 精灵图里不用 emoji：各终端里 emoji 的宽度不一致，会把右侧对齐弄乱。
+
+PET_HAPPY_PCT     = EXHAUSTED_PCT  # 7d 用量 ≥ 此值：订阅用完了，开心
+PET_ANGRY_MAX_PCT = 90.0        # 上一窗口最后用量 < 此值：一周没用完，生气
+PET_ANGRY_SEC     = 12 * 3600   # 生气从窗口重置起持续多久
+PET_TICK_SEC      = 0.5         # 动画帧间隔
+PET_MSG_MAX       = 30          # 气泡文字最多占几列
+PET_SPRITE_H      = 8           # 精灵图 7 行 + 1 行留给上下跳
+PET_W, PET_H      = 36, 4 + PET_SPRITE_H   # 整块（气泡 + 精灵图）固定大小，重画时能完整盖住上一帧
+
+# 精灵图模板：{el}{er} 眼睛、{m} 嘴巴各 1 列；{hl}{h}{hr} 双手和手里的东西各 2 列；{x1}{x2} 头旁装饰；{t} 尾巴
+PET_SPECIES = {
+    "cat":   ("猫", [
+        r"   /\_______/\   {x1}",
+        r"  /  {el}     {er}  \  {x2}",
+        r" (  =   {m}   =  )",
+        r"  \  {hl}{h}{hr}   /",
+        r"  /           \ ",
+        r" (  |       |  ){t}",
+        r"  \_|_)___(_|_/"]),
+    "bunny": ("兔子", [
+        r"    (\     /)   {x1}",
+        r"    ( \   / )  {x2}",
+        r"   (  {el}   {er}  )",
+        r"   (    {m}    )",
+        r"  o( {hl}{h}{hr}  )o",
+        r"   (         ){t}",
+        r"    (_)   (_)"]),
+    "bear":  ("小熊", [
+        r"  .-.     .-.  {x1}",
+        r" ( (_.---._) ) {x2}",
+        r"  /  {el}   {er}  \ ",
+        r" |    ({m})    |",
+        r"  \ {hl}{h}{hr}  /",
+        r"  /`-------'\ {t}",
+        r" (_/       \_)"]),
+}
+PET_SPECIES_ORDER = list(PET_SPECIES)
+_PET_SLOT_W  = {"el": 1, "er": 1, "m": 1, "hl": 2, "h": 2, "hr": 2}
+_PET_DEFAULT = dict(el="•", er="•", m="ω", hl="  ", h="  ", hr="  ", x1="", x2="", t="~", dx=0, dy=0)
+
+def _pf(**kw):
+    """一帧的部件：没写的用默认值。dx 左右挪一列（东张西望/发抖），dy=-1 往上跳一行。"""
+    return {**_PET_DEFAULT, **kw}
+
+_BLINK = _pf(el="-", er="-")
+
+# 每个情绪一组帧，按 PET_TICK_SEC 循环；重复的帧 = 停留更久
+PET_FRAMES = {
+    "caring":    [_pf(hl="つ", h="♡ ", hr="と")] * 2
+                 + [_pf(el="˘", er="˘", hl="つ", h="♥ ", hr="と", x1="♥")] * 2,
+    "happy":     [_pf(el="^", er="^", m="▽", hl="\\ ", hr=" /", x1="✧", dy=-1),
+                  _pf(el="^", er="^", m="▽", hl="\\ ", hr=" /", x2=" ✧")],
+    "angry":     [_pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="#", t="!"),
+                  _pf(el="`", er="´", m="Д", hl="つ", hr="つ", x1="# #", x2=" ぷんぷん", t="!", dx=1)],
+    "encourage": [_pf(el=">", er="<", m="o", hl="ノ", h="☆ ", x1="☆"),
+                  _pf(el="^", er="^", m="▽", hl="ノ", h="☆ ", x2="  ☆", dy=-1)],
+    # 刷新取数中（后台线程在拉数据，动画照常跑）
+    "busy":      [_pf(m="o", x1="."), _pf(x1=".."), _pf(m="o", x1="..."), _pf(x1="...")],
+}
+
+# 日常小动作：(气泡文字, 帧序列)；没别的情绪时每隔几秒随机换一个
+PET_IDLE = [
+    ("发呆中…",         [_pf()] * 5 + [_BLINK]),
+    ("摇尾巴～",        [_pf(), _pf(t="∽"), _pf(), _pf(t=" ~")]),
+    ("东张西望",        [_pf(dx=-1)] * 3 + [_pf(dx=1)] * 3),
+    ("哈～欠",          [_pf(), _pf(el="-", er="-", m="o"), _pf(el=">", er="<", m="O", x2=" ふぁ～")] + [_pf(el=">", er="<", m="O", x2=" ふぁ～")] + [_BLINK]),
+    ("舔舔爪子",        [_pf(el="-", er="-", hr="ノ"), _pf(el="-", er="-", hr="っ", x2=" ペロ")]),
+    ("伸个懒腰",        [_pf(), _pf()] + [_pf(el=">", er="<", hl="\\ ", hr=" /", dy=-1)] * 2),
+    ("Zzz…",            [_pf(el="-", er="-", x1="z"), _pf(el="-", er="-", x1="zZ"), _pf(el="-", er="-", x1="zZz", x2="z")]),
+]
+
+
+def display_width(s: str) -> int:
+    """终端显示宽度：全角/宽字符算 2 列，组合字符算 0 列。"""
+    return sum(0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in "WF" else 1)
+               for c in s)
+
+def _pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - display_width(s))
+
+def _clip(s: str, width: int) -> str:
+    if display_width(s) <= width:
+        return s
+    out = ""
+    for c in s:
+        if display_width(out + c) > width - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def pet_sprite(species: str, parts: dict):
+    """按物种模板和一帧的部件拼出精灵图（PET_SPRITE_H 行）。槽位按固定列宽居中，宽字符不会把身体挤歪。"""
+    _, tpl = PET_SPECIES.get(species) or PET_SPECIES[PET_SPECIES_ORDER[0]]
+    vals = {}
+    for k, v in parts.items():
+        if k in _PET_SLOT_W:
+            v = _pad(v, _PET_SLOT_W[k])
+        vals[k] = v
+    indent = " " * (1 + int(parts.get("dx", 0)))
+    lines  = [indent + line.format(**vals).rstrip() for line in tpl]
+    lines  = (lines + [""]) if parts.get("dy", 0) < 0 else ([""] + lines)
+    return (lines + [""] * PET_SPRITE_H)[:PET_SPRITE_H]
+
+
+def pet_track_reset(cl, pet_state, now=None):
+    """记录 Claude 7d 窗口位置；发现窗口已滚动、且上一窗口没用完，就记一笔“生气”。
+
+    用 for_reset_at 去重：多个终端各自检测到同一次重置，只算一次。
+    """
+    now = now or time.time()
+    st  = dict(pet_state or {})
+    wk  = (cl or {}).get("weekly") or {}
+    if "error" in (cl or {}) or wk.get("pct") is None or not wk.get("reset_at"):
+        return st
+    prev = st.get("claude_weekly") or {}
+    p_reset, p_pct = prev.get("reset_at"), prev.get("pct")
+    if (p_reset and p_pct is not None and wk["reset_at"] > p_reset + 86400
+            and p_pct < PET_ANGRY_MAX_PCT and (st.get("angry") or {}).get("for_reset_at") != p_reset):
+        st["angry"] = {"until": p_reset + PET_ANGRY_SEC, "wasted": round(100.0 - p_pct, 1),
+                       "for_reset_at": p_reset}
+    st["claude_weekly"] = {"reset_at": wk["reset_at"], "pct": float(wk["pct"])}
+    return st
+
+
+def claude_pet_mood(cl, hist, pet_state, now=None):
+    """返回 (情绪, 气泡文字)。只看 Claude；优先级：开心 > 献爱心 > 生气 > 鼓励 > 日常。
+
+    周额度用完排最前：用完了就该庆祝，再提醒“慢点用”已没有意义。
+    """
+    now = now or time.time()
+    if not cl or "error" in cl:
+        return "idle", None
+    wk, fh = cl.get("weekly") or {}, cl.get("five_hour") or {}
+    proj   = pace_projection(wk, 7 * 24 * 3600)
+    fh_pct = fh.get("pct")
+    pct    = wk.get("pct")
+
+    if pct is not None and float(pct) >= PET_HAPPY_PCT:
+        return "happy", "Claude 周额度用完啦！好棒！"
+    if fh_pct is not None and float(fh_pct) >= 100:
+        return "caring", "5h 额度用光啦，起来走走吧 ♥"
+    if proj and proj[1] > PACE_FAST_PCT:
+        return "caring", f"照这样到期要用 {proj[1]:.0f}%，歇一歇 ♥"
+    if fh_pct is not None and fh.get("reset_at"):
+        r          = burn_rate(hist, "claude_5h", 5 * 3600)
+        reset_in_h = max(0.0, fh["reset_at"] - now) / 3600.0
+        if r and r["per_hour"] > 0.005 and reset_in_h >= 0.25:
+            exhaust_h = max(0.0, 100.0 - float(fh_pct)) / r["per_hour"]
+            if exhaust_h < reset_in_h:
+                return "caring", f"5h 额度 {fmt_countdown(exhaust_h * 3600)} 后见底，慢点 ♥"
+
+    angry = (pet_state or {}).get("angry") or {}
+    if float(angry.get("until") or 0) > now:
+        return "angry", f"上周白白浪费了 {float(angry.get('wasted') or 0):.0f}%！哼！"
+    if proj and proj[1] <= PACE_SLOW_PCT:
+        return "encourage", f"还剩 {100.0 - float(pct):.0f}% 呢，多用用嘛～加油！"
+    return "idle", None
+
+
+def pet_bubble(text: str):
+    text = _clip(text, PET_MSG_MAX)
+    w    = max(2, display_width(text))
+    return [" ." + "-" * (w + 2) + ".",
+            "( " + _pad(text, w) + " )",
+            " '---." + "-" * (w - 2) + "'",
+            "     \\"]
+
+
+class PetView:
+    """宠物动画状态：当前情绪 + 帧序号；日常状态下每隔几秒随机换一个小动作。"""
+
+    def __init__(self, rng=None, species="cat"):
+        self.rng, self.mood, self.msg = rng or random.Random(), "idle", None
+        self.tick, self.idle_i, self.idle_until = 0, 0, 0.0
+        self.species = species if species in PET_SPECIES else PET_SPECIES_ORDER[0]
+
+    def next_species(self):
+        i = PET_SPECIES_ORDER.index(self.species)
+        self.species = PET_SPECIES_ORDER[(i + 1) % len(PET_SPECIES_ORDER)]
+        return self.species
+
+    def set_mood(self, mood, msg=None):
+        if (mood, msg) != (self.mood, self.msg):
+            self.mood, self.msg, self.tick = mood, msg, 0
+
+    def set_idle(self, i, hold_sec=1e9):
+        self.mood, self.msg, self.tick = "idle", None, 0
+        self.idle_i, self.idle_until = i, time.time() + hold_sec
+
+    def frame(self, now=None):
+        """下一帧：PET_H 行，每行补齐到 PET_W 列。"""
+        now = now or time.time()
+        if self.mood == "idle":
+            if now >= self.idle_until:
+                choices = [i for i in range(len(PET_IDLE)) if i != self.idle_i]
+                self.idle_i, self.tick = self.rng.choice(choices), 0
+                self.idle_until = now + self.rng.uniform(6, 10)
+            caption, seq = PET_IDLE[self.idle_i]
+        else:
+            caption, seq = self.msg or "", PET_FRAMES[self.mood]
+        sprite = pet_sprite(self.species, seq[self.tick % len(seq)])
+        self.tick += 1
+        return [_pad(line, PET_W) for line in pet_bubble(caption) + sprite][:PET_H]
+
+
+
+def screen_rows(text: str, cols: int):
+    """把文本按终端宽度折行，返回每个屏幕行已占的列数。"""
+    rows = []
+    for line in text.split("\n"):
+        w = display_width(line)
+        while w > cols:
+            rows.append(cols)
+            w -= cols
+        rows.append(w)
+    return rows
+
+
+def pet_place(widths, cols, pref_top):
+    """在每行已占列数 widths 里，找离 pref_top（期望的起始行）最近、右侧放得下宠物的位置。
+
+    返回 0 起算的 (起始行, 起始列)；哪儿都放不下返回 None。宠物贴右边、右侧留 1 列，左侧和正文至少隔 2 列。
+    """
+    col, n = cols - PET_W - 1, len(widths)
+    if col < 0 or n < PET_H:
+        return None
+    top0 = max(0, min(pref_top, n - PET_H))
+    for d in range(n):
+        for top in (top0 - d, top0 + d):
+            if 0 <= top <= n - PET_H and all(w + 2 <= col for w in widths[top:top + PET_H]):
+                return top, col
+    return None
+
+
+def pet_merge_static(text: str, pet_lines, cols: int) -> str:
+    """一次性查询：把一帧宠物拼在正文右下角；右侧放不下就接在正文下面。"""
+    lines = text.split("\n")
+    lines += [""] * max(0, PET_H - len(lines))
+    place = pet_place([display_width(l) for l in lines], cols, len(lines) - PET_H)
+    if not place:
+        return text + "\n" + "\n".join(l.rstrip() for l in pet_lines)
+    top, col = place
+    for i, pl in enumerate(pet_lines):
+        lines[top + i] = (_pad(lines[top + i], col) + pl).rstrip()
+    return "\n".join(lines)
+
+
+def pet_draw(pet_lines, top, col):
+    """在屏幕绝对位置 (0 起算) 画一帧，画完把光标放回原处。"""
+    out = ["\0337"]
+    for i, line in enumerate(pet_lines):
+        out.append(f"\033[{top + i + 1};{col + 1}H{line}")
+    out.append("\0338")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
+def pet_demo():
+    """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
+    view  = PetView()
+    shows = [("caring", "照这样到期要用 135%，歇一歇 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
+             ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "还剩 62% 呢，多用用嘛～加油！")]
+    shows += [("idle", i) for i in range(len(PET_IDLE))]
+    if not sys.stdout.isatty():
+        for i, (mood, arg) in enumerate(shows):
+            view.species = PET_SPECIES_ORDER[i % len(PET_SPECIES_ORDER)]
+            view.set_idle(arg) if mood == "idle" else view.set_mood(mood, arg)
+            print(f"── {PET_SPECIES[view.species][0]} · {mood}\n" + "\n".join(l.rstrip() for l in view.frame()) + "\n")
+        return
+    sys.stdout.write("\033[?25l")
+    try:
+        print("\n" * (PET_H - 1))
+        for i, (mood, arg) in enumerate(shows):
+            view.species = PET_SPECIES_ORDER[i % len(PET_SPECIES_ORDER)]
+            view.set_idle(arg) if mood == "idle" else view.set_mood(mood, arg)
+            for _ in range(8):
+                sys.stdout.write(f"\033[{PET_H}F" + "\n".join(view.frame()) + "\n")
+                sys.stdout.flush()
+                time.sleep(PET_TICK_SEC)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def collect():
@@ -1514,12 +1837,115 @@ def main():
                 interval_min = int(float(args[idx + 1]))
         except: pass
 
-    state = {"full": load_state()}
+    if "--pet-demo" in args:
+        pet_demo()
+        return
 
-    def do_query():
+    # 宠物只跟完整视图走：--compact / --json / 管道输出保持原样，方便脚本解析
+    pet_mode    = ("--no-pet" not in args and os.environ.get("SEE_BALANCE_PET", "1").strip() != "0"
+                   and not compact and not json_mode)
+    # 交互 watch：原地重绘 + 宠物动画 + 快捷键（p 宠物 / r 刷新 / q 退出）
+    # 只在前台进程启用：`--watch &` 这种后台任务改终端模式会被 SIGTTOU 挂起
+    interactive = (watch_mode and not json_mode and termios is not None
+                   and sys.stdout.isatty() and sys.stdin.isatty()
+                   and os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp())
+
+    full0 = load_state()
+    state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
+             "pet_visible": True, "size": None, "place": None}
+
+    def paint():
+        """整屏重画：正文 + footer，再把宠物画在右下角（放不下就在 footer 下提示）。"""
+        size  = shutil.get_terminal_size()
+        keys  = " · p 宠物 · s 换宠物" if pet_mode else ""
+        text  = state["body"] + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n"
+        place = None
+        if pet_mode and state["pet_visible"]:
+            rows    = screen_rows(text, size.columns)   # 末尾空行就是光标所在行
+            visible = rows[-size.lines:] + [0] * max(0, size.lines - len(rows))
+            place   = pet_place(visible, size.columns, size.lines - PET_H - 1)   # 底下留 1 行给光标
+            if not place:
+                need  = max(visible) + 2 + PET_W + 1
+                text += f"   （终端太窄，宠物先躲起来了：加宽到约 {need} 列可显示；p 隐藏宠物）\n"
+        if state.get("busy") and not place:   # 宠物不在屏幕上，就用一行字提示正在刷新
+            text += "⏳ 正在刷新，稍等片刻…\n"
+        sys.stdout.write("\033[H\033[2J" + text)
+        sys.stdout.flush()
+        state["size"], state["place"] = size, place
+        if place:
+            pet_draw(state["pet"].frame(), *place)
+
+    def pump(timeout):
+        """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
+        if pet_mode and state["pet_visible"]:
+            if shutil.get_terminal_size() != state["size"]:
+                paint()      # 终端尺寸变了：整屏重排
+            elif state["place"]:
+                pet_draw(state["pet"].frame(), *state["place"])
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], max(0.0, timeout))
+        if not ready:
+            return None
+        keys = os.read(fd, 64).decode(errors="ignore")
+        if "\033" in keys:   # 方向键 / F 键等转义序列（F1 = ESC O P）整段忽略，免得误触 p
+            return None
+        for ch in keys.lower():
+            if ch == "q":
+                return "quit"
+            if ch == "r" and not state.get("busy"):
+                return "refresh"
+            if ch == "p" and pet_mode:
+                state["pet_visible"] = not state["pet_visible"]
+                paint()
+            if ch == "s" and pet_mode and state["pet_visible"]:
+                # 换下一种宠物，并记进 state.json，下次启动沿用
+                full = state["full"]
+                full["pet"] = dict(full.get("pet") or {}, species=state["pet"].next_species())
+                save_state(full)
+                if state["place"]:
+                    pet_draw(state["pet"].frame(), *state["place"])
+        return None
+
+    def wait_interactive(seconds):
+        """等到下次刷新，期间推进宠物动画、处理按键。返回 False 表示要退出。"""
+        deadline = time.time() + seconds
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return True
+            act = pump(min(PET_TICK_SEC, left))
+            if act:
+                return act == "refresh"
+
+    def refresh_interactive():
+        """后台线程拉数据，主线程照常跑动画、响应按键；拉完再渲染。返回 False 表示要退出。"""
+        box = {}
+        def work():
+            try:
+                box["data"] = collect()
+            except BaseException as e:   # 交给主线程抛出，和原来同步取数时一样
+                box["err"] = e
+        worker = threading.Thread(target=work, daemon=True)   # 中途按 q 直接退出，不等它
+        worker.start()
+        state["busy"] = True
+        state["pet"].set_mood("busy", "稍等片刻，正在刷新…")
+        paint()
+        try:
+            while worker.is_alive():
+                if pump(PET_TICK_SEC) == "quit":
+                    return False
+        finally:
+            state["busy"] = False
+        if "err" in box:
+            raise box["err"]
+        state["full"] = load_state()
+        do_query(box["data"])
+        return True
+
+    def do_query(data=None):
         full      = state["full"]
         prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok") if k in full}
-        data      = collect()
+        data      = data if data is not None else collect()
 
         # ── History（实测消耗速率的数据源）──────────────────────────────────
         hist = full.get("history") or []
@@ -1552,29 +1978,72 @@ def main():
             for old in sorted(baselines)[:-7]:   # keep 7 days
                 del baselines[old]
 
+        # ── Pet：记住 Claude 7d 窗口位置，用来发现“一周没用完就重置了” ──────
+        pet_state = pet_track_reset(data.get("claude"), full.get("pet"))
+
         to_save = dict(data)
         to_save["daily_baselines"] = baselines
         to_save["history"] = hist
+        to_save["pet"] = pet_state
         save_state(to_save)
         state["full"] = to_save
 
         today_bl = baselines.get(today, {})
+        state["pet"].set_mood(*claude_pet_mood(data.get("claude"), hist, pet_state))
 
         # watch 模式在终端里原地重绘：数据取完再清屏，避免抓取期间白屏
         redraw = watch_mode and not json_mode and sys.stdout.isatty()
-        if redraw:
-            sys.stdout.write("\033[H\033[2J")
 
         if json_mode:
             print(json.dumps({**data, "history_summary": history_summary(hist)}, indent=2, ensure_ascii=False))
-        elif compact:
-            render_compact(data, prev_data, today_bl, hist)
         else:
-            print(render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
-                             prev_data, today_bl, hist))
+            if compact:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    render_compact(data, prev_data, today_bl, hist)
+                body = buf.getvalue().rstrip("\n")
+            else:
+                body = render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
+                                  prev_data, today_bl, hist)
+            if interactive:
+                state["body"] = body
+                paint()
+                return
+            if redraw:
+                sys.stdout.write("\033[H\033[2J")
+            if pet_mode and sys.stdout.isatty():
+                body = pet_merge_static(body, state["pet"].frame(), shutil.get_terminal_size().columns)
+            print(body)
         if watch_mode and (redraw or not state.get("footer_shown")):
             print(f"\n🔄 Refreshing every {interval_min} min. Ctrl+C to stop.\n", flush=True)
             state["footer_shown"] = True
+
+    if interactive:
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        for sig in (signal.SIGTERM, signal.SIGHUP):   # 被 kill 时也走 finally，别把终端留在无回显状态
+            signal.signal(sig, lambda *_: sys.exit(0))
+        tty.setcbreak(fd)                    # 按键不用回车、不回显；Ctrl+C 照常生效
+        sys.stdout.write("\033[?25l")        # 动画期间隐藏光标
+
+        state["body"] = "⏳ 正在获取数据，稍等片刻…"   # 第一次取数前先占个位，宠物照常在右下角动
+        try:
+            ok = refresh_interactive()
+            while ok and wait_interactive(interval_min * 60):
+                ok = refresh_interactive()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                if state["place"] and state["pet_visible"]:   # 擦掉宠物，别留在 shell 里
+                    pet_draw([" " * PET_W] * PET_H, *state["place"])
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+            except OSError:      # SIGHUP：终端已经没了
+                pass
+        print("\n👋 Stopped.")
+        return
 
     do_query()
 
