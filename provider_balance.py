@@ -1307,7 +1307,24 @@ SUBSCRIPTIONS = [
 ]
 
 
-def sub_status(data, now=None):
+def _fh_runs_out(fh, hist, hist_key, now):
+    """5h 窗口会不会在重置前用完：看近期实测速率（有历史时），以及窗口开头就猛烧的情况。
+
+    pace_projection 在窗口前 5% 不出值，开窗十分钟就用掉七成也看不出来，这里不设那个门槛。
+    """
+    if fh.get("pct") is None or not fh.get("reset_at"):
+        return False
+    pct, reset_in = float(fh["pct"]), max(0.0, fh["reset_at"] - now)
+    if reset_in < SOON_SEC:
+        return False
+    elapsed = 5 * 3600 - reset_in
+    if elapsed >= 60 and pct / elapsed * reset_in + pct > 100.0:
+        return True
+    r = burn_rate(hist, hist_key, 5 * 3600) if hist_key else None
+    return bool(r and r["per_hour"] > 0.005 and (100.0 - pct) / r["per_hour"] * 3600 < reset_in)
+
+
+def sub_status(data, now=None, hist=None):
     """每个订阅池一条：用量、离重置多久、预计到期用量，以及归类 out / hot / sprint / slow / ok。"""
     now, out = now or time.time(), []
     for prov, wkey, fkey, name, short, boost in SUBSCRIPTIONS:
@@ -1323,9 +1340,10 @@ def sub_status(data, now=None):
                  "left": max(0.0, 100.0 - pct), "reset_in": None, "proj": None, "kind": "ok",
                  "fh_out": fh.get("pct") is not None and float(fh["pct"]) >= EXHAUSTED_PCT,
                  "fh_reset_in": max(0.0, fh["reset_at"] - now) if fh.get("reset_at") else None}
-        fh_proj = pace_projection(fh, 5 * 3600) if fh else None
+        # 5h 紧：已经 ≥80%，或照近期速度 / 开窗以来的速度会在重置前用完（和 5h 的“建议”行同一口径）
         st["fh_tight"] = st["fh_out"] or (fh.get("pct") is not None and (
-            float(fh["pct"]) >= FH_TIGHT_PCT or bool(fh_proj and fh_proj[1] > PACE_FAST_PCT)))
+            float(fh["pct"]) >= FH_TIGHT_PCT
+            or _fh_runs_out(fh, hist, HIST_KEY_BY_WINDOW.get((prov, fkey)), now)))
         if wk.get("reset_at"):
             st["reset_in"] = max(0.0, wk["reset_at"] - now)
             elapsed = 7 * 24 * 3600 - st["reset_in"]
@@ -1355,7 +1373,8 @@ def spare_candidates(stats, exclude):
     return [s for s in stats if exclude not in (s["name"], s["prov"]) and not s["fh_tight"]
             and s["left"] >= SPARE_MIN_LEFT
             and (s["kind"] in ("sprint", "slow")
-                 or (s["kind"] == "ok" and s["proj"] is None and s["pct"] <= FRESH_MAX_PCT))]
+                 or (s["kind"] == "ok" and s["proj"] is None and s["reset_in"] is not None
+                     and s["pct"] <= FRESH_MAX_PCT))]   # 不知道窗口在哪（没有重置时间）的不算
 
 
 def best_spare(stats, exclude):
@@ -1365,9 +1384,9 @@ def best_spare(stats, exclude):
     return max(spare_candidates(stats, exclude), key=lambda s: (s["kind"] == "sprint", headroom(s)), default=None)
 
 
-def dispatch_advice(data, now=None):
+def dispatch_advice(data, now=None, hist=None):
     """调度建议行（已含缩进）；没什么可说时返回空列表。"""
-    stats, lines, helpers = sub_status(data, now), [], set()
+    stats, lines, helpers = sub_status(data, now, hist), [], set()
 
     def spare_text(s):
         alt = best_spare(stats, s["name"])   # 按池排除：AGY 两个池互不相通
@@ -1570,7 +1589,7 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             lines.append(f"     on-demand   ${gr['on_demand_used']:.2f} / ${gr.get('on_demand_cap', 0):.2f}")
     lines.append("")
 
-    advice = dispatch_advice({"codex": cx, "claude": cl, "agy": agy, "grok": gr})
+    advice = dispatch_advice({"codex": cx, "claude": cl, "agy": agy, "grok": gr}, hist=hist)
     if advice:
         lines.append("  🧭 调度建议")
         lines += advice
@@ -1797,7 +1816,7 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
     proj   = pace_projection(wk, 7 * 24 * 3600)
     fh_pct = fh.get("pct")
     pct    = wk.get("pct")
-    stats  = sub_status(data, now) if data else []
+    stats  = sub_status(data, now, hist) if data else []
     alt    = best_spare(stats, "claude")
 
     if pct is not None and float(pct) >= PET_HAPPY_PCT:
@@ -1816,13 +1835,15 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
         if r and r["per_hour"] > 0.005 and reset_in_h >= 0.25:
             exhaust_h = max(0.0, 100.0 - float(fh_pct)) / r["per_hour"]
             if exhaust_h < reset_in_h:
+                if alt:
+                    return "caring", f"5h {fmt_countdown(exhaust_h * 3600)} 后见底，试试 {alt['short']}？♥"
                 return "caring", f"5h 额度 {fmt_countdown(exhaust_h * 3600)} 后见底，慢点 ♥"
 
     angry = (pet_state or {}).get("angry") or {}
     if float(angry.get("until") or 0) > now:
         return "angry", f"上周白白浪费了 {float(angry.get('wasted') or 0):.0f}%！哼！"
     mine = next((s for s in stats if s["prov"] == "claude"), None)
-    if mine and mine["kind"] == "sprint":
+    if mine and mine["kind"] == "sprint" and not mine["fh_tight"]:   # 5h 紧时不劝放开用，和调度建议一致
         return "encourage", f"剩 {mine['left']:.0f}% 要过期啦，试试 Opus？"
     if proj and proj[1] <= PACE_SLOW_PCT:
         return "encourage", f"还剩 {100.0 - float(pct):.0f}% 呢，多用用嘛～加油！"
