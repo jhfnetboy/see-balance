@@ -2125,7 +2125,7 @@ if not isinstance(e, dict):
 ev  = e.get("hook_event_name") or ""
 sub = bool(e.get("agent_id") or e.get("subagentType"))
 # 子 agent 的输入 / 会话结束不代表主会话；它弹的权限框、它这一轮的结束（只清它自己的提醒）还是要记
-if sub and ev not in ("Notification", "Stop", "StopCancelled", "StopFailure"):
+if sub and ev not in ("Notification", "Stop", "StopCancelled", "StopFailure", "SessionEnd"):
     sys.exit(0)
 rec = {"ts": time.time(), "src": "grok" if "hookEventName" in e else "claude", "ev": ev,
        "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or "",
@@ -2137,7 +2137,7 @@ if ev == "Notification":
     rec["msg"]  = str(e.get("message") or "")[:120]
     rec["transcript"] = e.get("transcript_path") or ""
 elif ev == "Stop":               # 最后一句是不是在问你：之后的“空闲等待”才算在等你回复
-    tail = str(e.get("last_assistant_message") or "").rstrip().rstrip("\"'”’)）】*_` ")
+    tail = str(e.get("last_assistant_message") or "")[-400:].rstrip().rstrip("\"'”’)）】*_` ")[-300:]   # 先截短：长文本上正则会很慢
     m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
     rec["ask"] = m.group(0).strip()[-120:] if m else ""
 try:
@@ -2313,7 +2313,7 @@ def _attention_lines(now=None):
         big = False
     leftovers = sorted(ATTENTION_LOG.parent.glob(ATTENTION_LOG.name + ".*.rotating"))   # 上次轮换半路失败留下的
     if big or leftovers:
-        moving = ATTENTION_LOG.with_name(f"{ATTENTION_LOG.name}.{os.getpid()}.rotating")
+        moving = ATTENTION_LOG.with_name(f"{ATTENTION_LOG.name}.{os.getpid()}-{time.time_ns()}.rotating")
         try:
             if big:
                 os.replace(ATTENTION_LOG, moving)
@@ -2349,15 +2349,18 @@ def attention_items(now=None):
             continue
         if not isinstance(r, dict) or not r.get("sid"):
             continue
-        s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": ""}), r.get("ev")
-        w = s["wait"]
+        s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": "", "pid": ""}), r.get("ev")
+        w, pid = s["wait"], r.get("pid") or ""
+        if ev == "UserPromptSubmit" and pid:
+            s["pid"] = pid            # 记住这个会话最新的一轮
+        if ev in ("Stop", "StopCancelled", "StopFailure", "SessionEnd") and r.get("sub"):
+            if w and w.get("sub"):    # 子 agent 这一轮结束 / 子会话关了：只清它自己弹的提醒
+                s["wait"] = None
+            continue
         if ev in ("Stop", "StopCancelled", "StopFailure"):
-            if r.get("sub"):          # 子 agent 这一轮结束：只清它自己弹的提醒
-                if w and w.get("sub"):
-                    s["wait"] = None
-                continue
-            if w and w.get("pid") and r.get("pid") and r["pid"] != w["pid"]:
-                continue              # 上一轮迟到的回合结束（Grok 会排队晚到），别清掉这一轮的提醒
+            latest = s["pid"] or (w or {}).get("pid") or ""
+            if pid and latest and pid != latest:
+                continue              # 上一轮迟到的回合结束（Grok 会排队晚到），别清掉这一轮的提醒或问话
         if ev == "Notification":
             typ  = r.get("type") or ""
             kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
@@ -2536,6 +2539,7 @@ def main():
         else:
             note = state.get("update_hint")
         calls = "\n".join(attention_lines(state.get("attention") or []))
+        state["attention_min"] = int(time.time() // 60)
         text  = (state["body"] + (f"\n\n{calls}" if calls else "") + (f"\n\n{note}" if note else "")
                  + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n")
         place = None
@@ -2562,6 +2566,8 @@ def main():
             if refresh_attention():
                 set_pet_mood()
                 paint()
+            elif state.get("attention") and int(now // 60) != state.get("attention_min"):
+                paint()               # 底部“等了多久”按分钟走
         if pet_mode and state["pet_visible"]:
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排
