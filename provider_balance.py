@@ -1331,7 +1331,7 @@ def _opencode_spend(now=None):
         try:
             rows = conn.execute(
                 "SELECT time_created, json_extract(data, '$.cost'),"
-                " json_extract(data, '$.tokens.input'), json_extract(data, '$.tokens.output'),"
+                " json_extract(data, '$.tokens.input'), json_extract(data, '$.tokens.output'), json_extract(data, '$.tokens.reasoning'),"
                 " json_extract(data, '$.tokens.cache.read'), json_extract(data, '$.tokens.cache.write')"
                 " FROM message WHERE time_created >= ?"
                 " AND json_extract(data, '$.role') = 'assistant'"
