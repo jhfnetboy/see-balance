@@ -44,7 +44,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.3.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.4.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -2154,7 +2154,7 @@ def pet_demo():
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "剩 45% 要过期啦，试试 Opus？"),
              ("encourage", "还剩 62% 呢，多用用嘛～加油！"),
              ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒"),
-             ("call", "see-balance 的 Claude\n在等你确认，快去看看 ♥")]
+             ("call", "see-balance 等你确认 1/2\nBash：git push origin main")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
         for i, (mood, arg) in enumerate(shows):
@@ -2457,7 +2457,8 @@ def apply_update():
 #
 # Claude Code / Grok 的会话在等你确认权限、或问了你问题在等回复时，宠物弹出来提醒你回去处理。
 # 信号来自一个只记录的 hook（--install-hooks 装进 ~/.claude/settings.json；Grok 默认也读这个文件）：
-# 它把事件追加到 ~/.see-balance/attention.jsonl，只记会话 id、目录、事件和一小段说明，不记工具输入输出。
+# 它把事件追加到 ~/.see-balance/attention.jsonl，只记会话 id、目录、事件和一小段说明；
+# 决策框（PermissionRequest）另记要你决定的内容：问题和选项、命令、文件路径或计划标题，都截短。
 # 宠物只提醒，不替你批准任何东西：回原来的终端作答。
 
 ATTENTION_LOG     = STATE_FILE.parent / "attention.jsonl"
@@ -2468,7 +2469,7 @@ CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
                          or (Path.home() / ".claude" / "settings.json"))
 GROK_HOOK_FILE    = Path(os.environ.get("SEE_BALANCE_GROK_HOOKS")
                          or (Path.home() / ".grok" / "hooks" / "see-balance.json"))
-HOOK_EVENTS       = ("Notification", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd")
+HOOK_EVENTS       = ("Notification", "PermissionRequest", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd")
 # Grok 里拒绝 / 取消权限框时发的是 StopCancelled（代替 Stop）。Claude Code 不认识这个事件，
 # 所以不放进共享的 ~/.claude/settings.json，单独写一份只有 Grok 读的 ~/.grok/hooks/see-balance.json
 GROK_ONLY_EVENTS  = ("StopCancelled",)
@@ -2476,6 +2477,9 @@ SOURCE_NAMES      = {"claude": "Claude", "grok": "Grok"}
 # Notification 的类型 → 等你做什么；没列出的（auth_success、agent_completed 等）不算等你
 WAIT_KINDS        = {"permission_prompt": "确认", "elicitation_dialog": "填写",
                      "elicitation_url_dialog": "填写", "agent_needs_input": "回复"}
+# 决策框弹出的是哪个工具 → 等你做什么；其余工具都是权限确认
+DECIDE_KINDS      = {"AskUserQuestion": "选择", "ExitPlanMode": "批准计划"}
+ATTENTION_ROTATE_SEC = 4               # 好几个会话在等时，宠物气泡每隔几秒换下一个
 
 HOOK_SCRIPT = r'''#!/usr/bin/env python3
 # see-balance 会话提醒 hook（由 provider_balance.py --install-hooks 生成，--uninstall-hooks 删除）。
@@ -2494,7 +2498,7 @@ if not isinstance(e, dict):
 ev  = e.get("hook_event_name") or ""
 sub = bool(e.get("agent_id") or e.get("subagentType"))
 # 子 agent 的输入 / 会话结束不代表主会话；它弹的权限框、它这一轮的结束（只清它自己的提醒）还是要记
-if sub and ev not in ("Notification", "Stop", "StopCancelled", "StopFailure", "SessionEnd"):
+if sub and ev not in ("Notification", "PermissionRequest", "Stop", "StopCancelled", "StopFailure", "SessionEnd"):
     sys.exit(0)
 rec = {"ts": time.time(), "src": "grok" if "hookEventName" in e else "claude", "ev": ev,
        "sid": e.get("session_id") or e.get("sessionId") or "", "cwd": e.get("cwd") or "",
@@ -2505,6 +2509,21 @@ if ev == "Notification":
     rec["type"] = e.get("notification_type") or e.get("notificationType") or ""
     rec["msg"]  = str(e.get("message") or "")[:120]
     rec["transcript"] = e.get("transcript_path") or ""
+elif ev == "PermissionRequest":  # 决策框刚弹出来：记下要你决定的是什么（都截短，不记整段输入）
+    tool = str(e.get("tool_name") or e.get("toolName") or "")
+    ti   = e.get("tool_input") or e.get("toolInput") or {}
+    ti   = ti if isinstance(ti, dict) else {}
+    rec["tool"], rec["transcript"] = tool[:60], e.get("transcript_path") or ""
+    if tool == "AskUserQuestion":
+        rec["qs"] = [{"q": str(q.get("question") or "")[:200], "multi": bool(q.get("multiSelect")),
+                      "opts": [str(o.get("label") or "")[:40] for o in (q.get("options") or []) if isinstance(o, dict)][:6]}
+                     for q in (ti.get("questions") or []) if isinstance(q, dict)][:4]
+    elif tool == "ExitPlanMode":   # 只记计划的第一行（一般是标题）
+        rec["what"] = next((l.strip().lstrip("#").strip() for l in str(ti.get("plan") or "").splitlines() if l.strip()), "")[:200]
+    else:                          # 命令 / 文件 / 网址；认不出的工具记一小段输入
+        v = next((ti[k] for k in ("command", "file_path", "notebook_path", "url", "path", "pattern", "query")
+                  if isinstance(ti.get(k), str) and ti[k]), None)
+        rec["what"] = (v if v is not None else json.dumps(ti, ensure_ascii=False))[:200]
 elif ev == "Stop":               # 最后一句是不是在问你：之后的“空闲等待”才算在等你回复
     tail = str(e.get("last_assistant_message") or "")[-400:].rstrip().rstrip("\"'”’)）】*_` ")[-300:]   # 先截短：长文本上正则会很慢
     m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
@@ -2663,6 +2682,20 @@ def hooks_installed():
         for h in _handlers((data.get("hooks") or {}).get("Notification", [])))
 
 
+def refresh_hooks():
+    """已经开了会话提醒、但 hook 是旧版本装的（自动更新不会重跑 --install-hooks）：
+    把 hook 脚本换成新的，补挂新加的事件。别的 hook 不动；读不了配置就什么都不改。"""
+    if not hooks_installed():
+        return
+    script = HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG)))
+    try:
+        if ATTENTION_HOOK.read_text(encoding="utf-8") != script:
+            _write_atomic(ATTENTION_HOOK, script, mode=0o700)
+        _add_hooks(CLAUDE_SETTINGS, HOOK_EVENTS, _hook_command())
+    except OSError:
+        pass
+
+
 def _read_lines(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -2706,7 +2739,8 @@ def _attention_lines(now=None):
 def attention_items(now=None):
     """现在还在等你的会话，按等待时间从早到晚：[{src, sid, cwd, kind, ts, msg}]。
 
-    等你：权限确认 / 表单（Notification 的对应类型），或者最后一句在问你、之后一直空闲（idle_prompt）。
+    等你：决策框（PermissionRequest：权限确认、选择题、批准计划，带上具体内容）、表单（Notification 的对应类型），
+    或者最后一句在问你、之后一直空闲（idle_prompt）。
     不再等：你回了话（UserPromptSubmit）、这一轮结束（Stop）、会话关了（SessionEnd），
     或者会话记录在提醒之后又有了新内容（你在终端里已经处理了）。
     """
@@ -2730,10 +2764,19 @@ def attention_items(now=None):
             latest = s["pid"] or (w or {}).get("pid") or ""
             if pid and latest and pid != latest:
                 continue              # 上一轮迟到的回合结束（Grok 会排队晚到），别清掉这一轮的提醒或问话
-        if ev == "Notification":
+        if ev == "PermissionRequest":
+            tool = r.get("tool") or ""
+            s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "",
+                         "kind": DECIDE_KINDS.get(tool, "确认"), "ts": float(r.get("ts") or 0), "msg": "",
+                         "tool": tool, "what": r.get("what") or "", "qs": r.get("qs") or [],
+                         "transcript": r.get("transcript") or "", "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
+        elif ev == "Notification":
             typ  = r.get("type") or ""
             kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
-            if kind:
+            if (typ == "permission_prompt" and w and w.get("tool") and w["sub"] == bool(r.get("sub"))
+                    and float(r.get("ts") or 0) - w["ts"] < 30):
+                pass                  # 同一个决策框几秒后的提醒：前面已经记下了具体内容
+            elif kind:
                 msg = s["ask"] if typ == "idle_prompt" else (r.get("msg") or "")
                 s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
                              "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or "",
@@ -2774,23 +2817,37 @@ def _attention_name(w):
     return f"{_project(w)} 的 {SOURCE_NAMES.get(w['src'], _clean(w['src']))}"
 
 
-def attention_bubble(items):
-    """宠物气泡（两行）。"""
-    if len(items) == 1:
-        w = items[0]
-        return f"{_attention_name(w)}\n在等你{w['kind']}，快去看看 ♥"
-    names = "、".join(_project(w) for w in items)
-    return f"{len(items)} 个会话在等你 ♥\n{names}"
+def attention_detail(w):
+    """决策框的具体内容，一项一行：问题和选项 / 计划标题 / 工具和命令。不是决策框的返回 []。"""
+    if w.get("qs"):
+        return [f"❓ {_clean(q.get('q'))}（{' / '.join(_clean(o) for o in q.get('opts') or [])}"
+                f"{'，可多选' if q.get('multi') else ''}）" for q in w["qs"]]
+    if w.get("tool") == "ExitPlanMode":
+        return [f"📋 计划：{_clean(w.get('what')) or '（没有标题）'}"]
+    if w.get("tool"):
+        return [f"{_clean(w['tool'])}：{_clean(w.get('what'))}"]
+    return []
+
+
+def attention_bubble(items, now=None):
+    """宠物气泡（两行）：好几个会话在等时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个。"""
+    i = int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(items)
+    w, n = items[i], len(items)
+    head = f"{_project(w)} 等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
+    detail = [_clean(w["qs"][0].get("q"))] if w.get("qs") else attention_detail(w)
+    return f"{head}\n{detail[0] if detail else '快去看看 ♥'}"
 
 
 def attention_lines(items, now=None):
-    """底部提醒行：每个等你的会话一行，带上等了多久和那句话。"""
+    """底部提醒行：每个等你的会话一行，带上等了多久和那句话；决策框再逐行列出要你决定的内容。"""
     now = now or time.time()
     out = []
     for w in items[:5]:
-        ago  = fmt_countdown(now - w["ts"])
-        what = f"：{_clean(w['msg'])}" if w["msg"] else ""
+        ago    = fmt_countdown(now - w["ts"])
+        detail = attention_detail(w)
+        what   = f"：{_clean(w['msg'])}" if w["msg"] and not detail else ""
         out.append(f"🔔 {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
+        out += [f"     {_clip(d, 200)}" for d in detail]
     if len(items) > 5:
         out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
     return out
@@ -2865,6 +2922,8 @@ def main():
                    and sys.stdout.isatty() and sys.stdin.isatty()
                    and os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp())
 
+    if not json_mode and not compact:
+        refresh_hooks()
     full0 = load_state()
     state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
              "pet_visible": True, "size": None, "place": None,
@@ -2878,7 +2937,7 @@ def main():
     def refresh_attention():
         """重读“哪些会话在等你”；有变化返回 True。没装 hook 就什么都不做。"""
         items = attention_items() if state["attention_on"] else []
-        key   = [(w["src"], w["sid"], w["kind"], w["ts"]) for w in items]
+        key   = [(w["src"], w["sid"], w["kind"], w["ts"], w.get("what"), str(w.get("qs"))) for w in items]
         if key == state.get("attention_key"):
             return False
         state["attention"], state["attention_key"] = items, key
@@ -2980,6 +3039,8 @@ def main():
                 paint()
             elif state.get("attention") and int(now // 60) != state.get("attention_min"):
                 paint()               # 底部“等了多久”按分钟走
+            elif len(state.get("attention") or []) > 1:
+                set_pet_mood()        # 气泡轮到下一个会话（没到点就不变）
         if pet_mode and state["pet_visible"]:
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排

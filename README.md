@@ -75,20 +75,27 @@ python3 ~/bin/provider_balance.py --uninstall-hooks  # 关掉会话提醒
 
 ## 会话提醒
 
-Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你，底部列出是哪个项目的哪个会话、等了多久、问的是什么：
+Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你，底部列出是哪个项目的哪个会话、等了多久、要你决定什么：
 
 ```
-🔔 see-balance 的 Claude 在等你确认（0h03m 前）：Claude needs your permission to use Bash
-🔔 Agent24 的 Grok 在等你回复（0h12m 前）：要不要我推送到 fork？
+🔔 see-balance 的 Claude 在等你选择（0h01m 前）
+     ❓ 这次要部署到哪个环境？（Staging / Production）
+🔔 Agent24 的 Claude 在等你确认（0h03m 前）
+     Bash：git push origin feat/x
+🔔 Brood 的 Claude 在等你批准计划（0h05m 前）
+     📋 计划：重构 hook 安装流程
+🔔 WeKnora 的 Grok 在等你回复（0h12m 前）：要不要我推送到 fork？
 ```
+
+- **决策内容**：Claude Code 弹出决策框（权限确认、AskUserQuestion 选择题、批准计划）时，会列出具体的问题和选项、要跑的命令或要动的文件、计划标题。宠物气泡里依次轮播每个在等你的会话（每 4 秒换一个，标着 `2/3`）。
 
 - **算“等你”的**：弹出权限确认 / MCP 表单（子 agent 弹的也算）；或者最后一句话在问你（以 `?` / `？` 结尾，正文中间的问号不算），之后一直没动静。干完活单纯空闲的不算。
 - **自动消失**：你回了话、这一轮结束（包括出错结束、在 Grok 里拒绝权限）、会话关了，或者会话在提醒之后又有了新进展（你已经在终端里处理了）。超过 12 小时的提醒也不再显示。上一轮迟到的结束事件不会清掉这一轮的提醒；子 agent 这一轮结束只清它自己弹的提醒。
 - **只提醒，不代你批准**：回原来的终端作答。
-- **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `UserPromptSubmit` / `Stop` / `StopFailure` / `SessionEnd` 上。Grok CLI 默认也读这个文件，所以两边都能覆盖；另外在 `~/.grok/hooks/see-balance.json` 挂一个只有 Grok 认识的 `StopCancelled`（在 Grok 里拒绝权限时用来清掉提醒）。新开的会话开始生效。`--uninstall-hooks` 只摘掉它自己装的那几条（看不懂的结构、你自己的 hook、原本就空的事件都不动）。
+- **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `PermissionRequest` / `UserPromptSubmit` / `Stop` / `StopFailure` / `SessionEnd` 上。之前开过提醒的，升级后第一次运行会自动换上新的 hook 脚本、补挂新加的事件（别的 hook 不动）。Grok CLI 默认也读这个文件，所以两边都能覆盖；另外在 `~/.grok/hooks/see-balance.json` 挂一个只有 Grok 认识的 `StopCancelled`（在 Grok 里拒绝权限时用来清掉提醒）。新开的会话开始生效。`--uninstall-hooks` 只摘掉它自己装的那几条（看不懂的结构、你自己的 hook、原本就空的事件都不动）。
   - 改文件前备份为 `*.see-balance.bak`；已有的 hook 不动；`settings.json` 是符号链接（dotfiles）时改的是链接目标，权限不变。
   - hook 命令永远以 0 退出、不输出任何东西：哪怕 `hook.py` 被删了，也不会拦下你的输入或打断会话。
-- hook 只往 `~/.see-balance/attention.jsonl` 追加一行：会话 id、目录、事件类型和一小段说明（权限提示文字或最后那句问话），不记工具输入输出。显示前会去掉其中的控制字符，会话里的文字改不了你的终端。
+- hook 只往 `~/.see-balance/attention.jsonl` 追加一行：会话 id、目录、事件类型和一小段说明（权限提示文字或最后那句问话）。决策框另记要你决定的内容：问题和选项、命令 / 文件路径 / 网址，或计划的第一行，每项截到 200 字以内；不记工具输出，也不记计划全文。日志文件只有你能读（0600）。显示前会去掉其中的控制字符，会话里的文字改不了你的终端。
 - 宠物上的优先级：会话提醒 > 升级选项 > 用量情绪。
 - 日志超过 1MB 时轮换，只保留 12 小时内的记录，还在等的提醒不会丢。
 - Codex、Antigravity 暂时没有可靠的“在等你”信号，还不支持。
@@ -202,6 +209,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.4.0 | 会话提醒显示决策内容：问题和选项、要跑的命令 / 要动的文件、计划标题；宠物气泡依次轮播每个在等你的会话 |
 | 1.3.0 | 支持 OpenCode 的 Anthropic API key：验 key 是否可用，按 opencode 本地记录统计今天 / 7 天 / 30 天花费；配 `ANTHROPIC_ADMIN_KEY` 后显示 key 的过期时间 |
 | 1.2.2 | README：更新方式与版本记录 |
 | 1.2.1 | 每 10 分钟检查一次更新（`--watch` 期间后台检查，带 ETag，上游没变只回 304） |
