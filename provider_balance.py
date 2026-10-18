@@ -2161,14 +2161,17 @@ def pet_merge_static(text: str, pet_lines, cols: int) -> str:
 # 名称列按这一屏里最宽的名字定宽（上限约 50 列），剩下的全给「在做什么」。
 
 # 等你 > 运行 > 思考 > 自己空闲但还在等子 agent > 空闲 > 完成
-# 「等子」不是某一行的状态符号，只参与会话头的排序
-_KIND_RANK = {"等你": 0, "运行": 1, "思考": 2, "等子": 3, "空闲": 4, "完成": 5}
+# 「等子」不是某一行的状态符号，只参与会话头的排序。
+# 「命令 / 外部」和运行同级：下面有 ⚙ 行的会话按运行排，行本身不算子 agent、也不算会话。
+_KIND_RANK = {"等你": 0, "运行": 1, "命令": 1, "外部": 1, "思考": 2, "等子": 3, "空闲": 4, "完成": 5}
 _KIND_LABEL = {
     "等你": "◆ 等你",
     "运行": "● 运行",
     "思考": "○ 思考",
     "空闲": "○ 空闲",
     "完成": "✓ 完成",
+    "命令": "⚙ 命令",
+    "外部": "⚙ 外部",
 }
 # 标题行右侧的页签。窄到放不下就只留左边的标题，不把这一截裁出省略号
 _SESSION_HINT = "[用量] ‹会话› · t 切换 · q 退出"
@@ -2194,11 +2197,22 @@ def _cwd_ok(session, parts):
 
 
 def _node_kind(node):
-    """◆ 等你 / ● 运行（工具在跑）/ ○ 思考 / ○ 空闲 / ✓ 完成。"""
+    """◆ 等你 / ● 运行（工具在跑）/ ○ 思考 / ○ 空闲 / ✓ 完成 / ⚙ 命令 / ⚙ 外部。
+
+    注册表 status（node["reg"]）是会话自己这一行的权威：busy / shell 算运行，idle 算空闲。
+    「等你」仍盖过它。没有 reg 的旧会话，继续看 state / doing。
+    """
     state = node.get("state") or "空闲"
-    doing = node.get("doing") or ""
     if state == "等你":
         return "等你"
+    if state in ("命令", "外部"):
+        return state
+    reg = node.get("reg")
+    if reg in ("busy", "shell"):
+        return "运行"
+    if reg == "idle":
+        return "空闲"
+    doing = node.get("doing") or ""
     if state == "完成" or (isinstance(doing, str) and doing.startswith("✓")):
         return "完成"
     if doing == "思考中":
@@ -2209,10 +2223,15 @@ def _node_kind(node):
 
 
 def _living_subagents(nodes):
-    """还没做完的子 agent 有几个。嵌套的一起算；完成的节点本身不算，接着数它下面的。"""
+    """还没做完的子 agent 有几个。嵌套的一起算；完成的节点本身不算，接着数它下面的。
+    ⚙ 命令 / ⚙ 外部不是子 agent。"""
     total = 0
     for node in nodes or []:
-        if _node_kind(node) != "完成":
+        kind = _node_kind(node)
+        if kind in ("命令", "外部"):
+            total += _living_subagents(node.get("children"))
+            continue
+        if kind != "完成":
             total += 1
         total += _living_subagents(node.get("children"))
     return total
@@ -2222,6 +2241,7 @@ def _session_rank(session):
     """等你 > 运行 > 思考 > 等子 agent > 空闲。
 
     子树里更紧急的那个算在会话头上；做完的不抬优先级。
+    ⚙ 命令 / ⚙ 外部和运行同级，所以下面有命令在跑的会话按运行排。
     主会话自己是空闲、子树里也没有更紧急的，但还有活着的子 agent 时，
     排在运行 / 思考之后、普通空闲之前。
     """
@@ -2244,10 +2264,23 @@ def _session_rank(session):
 
 
 def _count_nodes(nodes):
+    """子 agent 个数。⚙ 命令 / ⚙ 外部 挂在树里，但不算子 agent。"""
     n = 0
     for node in nodes or []:
-        n += 1 + _count_nodes(node.get("children"))
+        if _node_kind(node) not in ("命令", "外部"):
+            n += 1
+        n += _count_nodes(node.get("children"))
     return n
+
+
+def _has_command(nodes):
+    """这棵子树里有没有正在跑的 ⚙ 命令 / ⚙ 外部。"""
+    for node in nodes or []:
+        if _node_kind(node) in ("命令", "外部"):
+            return True
+        if _has_command(node.get("children")):
+            return True
+    return False
 
 
 def _dur_text(ts, done=False, now=None):
@@ -2511,19 +2544,36 @@ def _clip_lines(text, width):
                      for line in str(text).split("\n"))
 
 
+def _headline_bucket(session):
+    """表头括号里这一会话算哪一类。
+
+    等你优先。自己在跑工具或在思考，算运行。自己空闲、但下面有 ⚙ 行，也算运行。
+    ⚙ 行本身不是会话，这里不单另计数。
+    """
+    kind = _node_kind(session)
+    if kind == "等你":
+        return "等你"
+    if kind in ("运行", "思考"):
+        return "运行"
+    if _has_command(session.get("children")):
+        return "运行"
+    return ""
+
+
 def _sessions_title(sessions, parts):
     """会话 · [过滤词 ·] N 个会话[（N 等你 · N 运行）][· N 个子 agent]。
 
-    括号只数会话自己的状态：等你，以及正在跑工具或思考的（都记成「运行」）。
+    括号只数会话：等你，以及正在跑工具、在思考、或下面有 ⚙ 命令的（都记成「运行」）。
+    ⚙ 行不加进会话数，也不加进子 agent 数。
     哪一项是 0 就不写；两项都是 0 就没有括号。子 agent 是 0 也不写。
     有括号时右括号后直接接「· N」（「）· 3 个子 agent」）；没有括号时仍用「 · 」。
     """
     n_wait = n_run = 0
     for session in sessions:
-        kind = _node_kind(session)
-        if kind == "等你":
+        bucket = _headline_bucket(session)
+        if bucket == "等你":
             n_wait += 1
-        elif kind in ("运行", "思考"):
+        elif bucket == "运行":
             n_run += 1
     n_sub = sum(_count_nodes(session.get("children")) for session in sessions)
     title = "会话"
@@ -2592,7 +2642,7 @@ def session_lines(sessions, cols, rows, filt=None):
 
 
 def _demo_sessions(now=None):
-    """--pet-demo 用的假会话：一个在等你的、一棵子 agent、一个空闲的、一个 Grok。"""
+    """--pet-demo 用的假会话：一个在等你的、一棵子 agent（含 ⚙ 外部）、一个 ⚙ 命令、一个空闲的、一个 Grok。"""
     now = now or time.time()
     return [
         {"src": "claude", "sid": "demo-wait", "cwd": "/work/Agent24", "title": "CI 修复",
@@ -2605,9 +2655,13 @@ def _demo_sessions(now=None):
               "doing": "Bash: codex exec review", "ts": now - 6 * 60, "children": [
                   {"aid": "a2", "name": "general-purpose「核实发现 #2」", "state": "工作中",
                    "doing": "思考中", "ts": now - 12, "children": []},
+                  {"name": "外部 Codex", "state": "外部", "doing": "codex exec review",
+                   "ts": now - 6 * 60, "children": []},
               ]},
              {"aid": "a3", "name": "grok-review「双审」", "state": "完成",
               "doing": "✓ 完成", "ts": now - 60, "children": []},
+             {"name": "gh", "state": "命令", "doing": "gh pr checks --watch",
+              "ts": now - 45, "children": []},
          ]},
         {"src": "claude", "sid": "demo-idle", "cwd": "/work/Agent24", "title": "HANDOFF 文档",
          "state": "空闲", "doing": "空闲", "ts": now - 18 * 60, "children": []},
@@ -3536,16 +3590,21 @@ def attention_lines(items, now=None, focus=None, qi=0, picks=None):
 
 # ── 会话页（进行中的会话和它派出的子 agent）──────────────────────────────────
 #
-# 只读本机文件：Claude Code 的会话记录、子 agent 的 meta，加上 Grok 的 active_sessions.json。
-# 不挂 hook、不联网。--watch 里按 t 切到这一页，画成进程表；--sessions 画一帧就退出。
+# 只读本机：Claude Code 的会话记录和子 agent meta、~/.claude/sessions/<pid>.json 注册表、
+# 一次 ps 进程树，加上 Grok 的 active_sessions.json。不挂 hook、不联网。
+# 注册表目录不存在或读不了时，Claude 的判定和以前一样（只看 transcript mtime）。
+# --watch 里按 t 切到这一页，画成进程表；--sessions 画一帧就退出。
 # SEE_BALANCE_SESSIONS 按 cwd 子串过滤，没设就全部显示。用量页右下角的宠物不在这里画。
 
-SESSIONS_SCAN_SEC    = 2             # 会话页隔这么久才重新扫一遍磁盘
-SESSIONS_SESSION_SEC = 15 * 60       # 会话记录这么久没写过、又不在等你，就不算进行中
+SESSIONS_SCAN_SEC    = 2             # 会话页隔这么久才重新扫一遍磁盘；每次扫描最多一次 ps
+SESSIONS_SESSION_SEC = 15 * 60       # 会话记录这么久没写过、又不在等你、注册表也对不上，就不算进行中
 SESSIONS_SUB_SEC     = 10 * 60       # 子 agent 的记录超过这么久没写，算它停了
 SESSIONS_DONE_SEC    = 2 * 60        # 做完的子 agent 再多留这么久，显示 ✓ 完成
 SESSIONS_TAIL        = 64 * 1024     # 只看记录末尾这一段，判断正在干什么
 SESSIONS_TAIL_BIG    = 1024 * 1024   # 最后一条比 64KB 还长、没有完整记录时，放宽再读一次
+SESSIONS_PS_TIMEOUT  = 2             # ps 超过这么久，或失败，就跳过进程树这一截增强
+SESSIONS_START_SLACK = 5             # procStart 和 etime 反推的启动时间，差几秒仍算同一个进程
+SESSIONS_BASH_KEEP   = 20            # 子 agent 末尾窗口里留多少条 Bash，最近的在前；再多不留，避免把整段记录都搁在内存里
 
 _ACTIVITY_CACHE = {}
 
@@ -3553,6 +3612,12 @@ _ACTIVITY_CACHE = {}
 def _claude_projects_dir():
     base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     return os.path.join(base, "projects")
+
+
+def _claude_sessions_dir():
+    """注册表目录。基目录和 _claude_projects_dir 一样，尊重 CLAUDE_CONFIG_DIR。"""
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "sessions")
 
 
 def _parse_time(value):
@@ -3644,6 +3709,31 @@ def _tool_summary(name, inp):
     return f"{name}: {extra}" if extra else name
 
 
+def _record_bashes(rec):
+    """这条记录里的 Bash tool_use 命令，按出现顺序。没有返回 []。"""
+    if not isinstance(rec, dict):
+        return []
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return []
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    found = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        if _clean(item.get("name")) != "Bash":
+            continue
+        inp = item.get("input")
+        if not isinstance(inp, dict):
+            continue
+        cmd = inp.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            found.append(cmd)
+    return found
+
+
 def _activity_from_record(rec):
     """一条 user / assistant 记录在干什么。不是这两种、或是空的，返回 None（接着往前看）。"""
     if not isinstance(rec, dict) or rec.get("type") not in ("assistant", "user"):
@@ -3688,17 +3778,20 @@ _CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 def _tail_activity(path):
-    """jsonl 末尾最后一条有效记录在干什么。返回 {state, doing, ts, cwd}。
+    """jsonl 末尾最后一条有效记录在干什么。返回 {state, doing, ts, cwd, bash}。
+
+    bash 是这段末尾窗口里的 Bash tool_use 命令，最近的在前，最多 SESSIONS_BASH_KEEP 条。
+    子 agent 常常先起一条长命令，再继续发别的 Bash；只留最后一条，进程树上那个 shell 就挂不上。
     按 (路径, 大小) 缓存，文件没变就不重读。最后一条比 64KB 还长时，放宽到 1MB 再试一次。"""
     try:
         size = os.stat(path).st_size
     except OSError:
-        return {"state": "空闲", "doing": "空闲", "ts": 0.0, "cwd": ""}
+        return {"state": "空闲", "doing": "空闲", "ts": 0.0, "cwd": "", "bash": []}
     hit = _ACTIVITY_CACHE.get(path)
     if hit and hit[0] == size:
         return hit[1]
     prev_cwd = (hit[1].get("cwd") or "") if hit else ""
-    text, activity, cwd, parsed = "", None, "", False
+    text, activity, cwd, bashes = "", None, "", []
     for window in (SESSIONS_TAIL, SESSIONS_TAIL_BIG):
         try:
             with open(path, "rb") as fh:
@@ -3711,7 +3804,7 @@ def _tail_activity(path):
         if size > window:   # 窗口从半截记录切开，丢掉第一行残段
             nl = body.find("\n")
             body = body[nl + 1:] if nl >= 0 else ""
-        activity, cwd, parsed = None, "", False
+        activity, cwd, parsed, bashes = None, "", False, []
         for line in body.splitlines():
             line = line.strip()
             if not line:
@@ -3725,6 +3818,12 @@ def _tail_activity(path):
             parsed = True
             if isinstance(rec.get("cwd"), str) and rec["cwd"]:
                 cwd = rec["cwd"]
+            cmds = _record_bashes(rec)
+            if cmds:
+                bashes.extend(cmds)
+                extra = len(bashes) - SESSIONS_BASH_KEEP
+                if extra > 0:   # 只留窗口里最近的若干条，前面的丢掉
+                    del bashes[:extra]
             got = _activity_from_record(rec)
             if got:
                 activity = got
@@ -3746,6 +3845,7 @@ def _tail_activity(path):
                 cwd = got
         cwd = cwd or prev_cwd
     activity["cwd"] = cwd
+    activity["bash"] = list(reversed(bashes))   # 最近的在前，挂 shell 时先看它
     if not activity.get("ts"):
         try:
             activity["ts"] = os.stat(path).st_mtime
@@ -3791,6 +3891,7 @@ def _subagent_tree(session_dir, now):
                 meta = loaded
         except (OSError, ValueError):
             meta = {}
+        bash = ""
         if meta.get("finished"):
             done_at = max(meta_mtime, st.st_mtime)
             if now - done_at > SESSIONS_DONE_SEC:
@@ -3801,6 +3902,7 @@ def _subagent_tree(session_dir, now):
                 continue
             act = _tail_activity(path)
             state, doing, ts = act["state"], act["doing"], act["ts"] or st.st_mtime
+            bash = act.get("bash") or ""
         atype = _clean(meta.get("agentType")) or "agent"
         desc = _clean(meta.get("description"))
         if len(desc) > 80:   # 省略号留给表格那一列，这里只硬截
@@ -3809,7 +3911,8 @@ def _subagent_tree(session_dir, now):
         if parent.startswith("agent-"):
             parent = parent[len("agent-"):]
         nodes[aid] = {"aid": aid, "name": f"{atype}「{desc}」" if desc else atype,
-                      "state": state, "doing": doing, "ts": ts, "children": [], "_parent": parent}
+                      "state": state, "doing": doing, "ts": ts, "bash": bash,
+                      "children": [], "_parent": parent}
     parent_of = {aid: node.get("_parent") or "" for aid, node in nodes.items()}
 
     def _ancestors(aid):
@@ -3904,13 +4007,574 @@ def _apply_wait(session, w):
     _stamp_wait(session, w)   # 子 agent 在等你时，这一会话也标成等你，排序才排到前面
 
 
-def _make_claude_session(path, sid, session_dir, mtime, waiting, now):
+# 注册表文件名是 <pid>.json。同目录的 <pid>.<hash>.key 不是会话，跳过。
+_REG_FILE_RE = re.compile(r"^(\d+)\.json$")
+# Bash 工具的 shell：source …/shell-snapshots/… && eval '<命令>'
+_TOOL_SHELL_RE = re.compile(r"\bsource\b.*shell-snapshots/.*\beval\s+'", re.DOTALL)
+# ps 把不可见字符印成 \NNN（三位八进制）。换行是 \012，制表是 \011。
+_PS_OCTAL_RE = re.compile(r"\\([0-7]{3})")
+# 命令本身是 grok / codex（可带路径、sudo、前面的 VAR=value）。不要匹配 codex-review 这种词。
+# 换行也算一条新命令的开头：ps 的 \012 还原之后，命令会跨行。
+_EXT_CMD_RE = re.compile(
+    r"(?:^|&&|\|\||[;|&`(\n])\s*"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:sudo\s+)?"
+    r"(?:\S*/)?"
+    r"(grok|codex)"
+    r"(?=$|[\s;|&<>)`])",
+    re.IGNORECASE,
+)
+_PROC_START_RE = re.compile(
+    r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})$"
+)
+_MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+# 短名字里跳过的壳层词，后面还有真正的命令
+_SKIP_CMD = {
+    "cd", "export", "source", "pushd", "popd", "true", "false", "builtin",
+    "command", "exec", "time", "nohup", "nice", "sudo", "env", ":",
+}
+
+
+def _epoch_ms(value):
+    """unix 秒或毫秒。解析不了返回 0。注册表的 startedAt 是毫秒。"""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if n <= 0:
+        return 0.0
+    if n > 1e12:
+        n /= 1000.0
+    return n
+
+
+def _parse_proc_start(text):
+    """注册表 procStart，例如 'Fri Oct 16 06:06:48 2026'。这是 UTC，失败返回 None。
+
+    本机注册表里它和 startedAt 的 UTC 时钟一致；ps 的 etime 反推的也是真实启动时刻。
+    按本地时区解析会整段对不上，活会话会被当成 pid 复用。
+    不用 strptime 的 %a / %b：那两个跟 locale 走，中文环境下对不上英文缩写。
+    """
+    if not text:
+        return None
+    matched = _PROC_START_RE.match(str(text).strip())
+    if not matched:
+        return None
+    try:
+        return datetime(int(matched.group(6)), _MONTHS[matched.group(1)], int(matched.group(2)),
+                        int(matched.group(3)), int(matched.group(4)), int(matched.group(5)),
+                        tzinfo=timezone.utc).timestamp()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _parse_etime(text):
+    """ps 的 etime（[[dd-]hh:]mm:ss）换成秒。解析不了返回 None。"""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    days = 0
+    if "-" in text:
+        day_s, _, rest = text.partition("-")
+        if not day_s.isdigit() or not rest:
+            return None
+        days = int(day_s)
+        text = rest
+    parts = text.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts):
+        return None
+    nums = [int(part) for part in parts]
+    if len(nums) == 2:
+        hours, mins, secs = 0, nums[0], nums[1]
+    else:
+        hours, mins, secs = nums
+        if mins > 59:
+            return None
+    if secs > 59:
+        return None
+    return days * 86400 + hours * 3600 + mins * 60 + secs
+
+
+def _parse_ps(text):
+    """ps -axo pid=,ppid=,etime=,command= 的输出。pid → {pid, ppid, etime, cmd, kids}。"""
+    by_pid = {}
+    for line in str(text or "").splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        if pid <= 0:
+            continue
+        by_pid[pid] = {"pid": pid, "ppid": ppid, "etime": _parse_etime(parts[2]),
+                       "cmd": parts[3], "kids": []}
+    for proc in by_pid.values():
+        parent = by_pid.get(proc["ppid"])
+        if parent is not None and parent is not proc:
+            parent["kids"].append(proc)
+    return by_pid
+
+
+def _ps_snapshot():
+    """一次 ps。失败返回 (None, None)，调用方跳过进程树增强，启动时间改为只看 pid。
+
+    live_sessions 每次扫描只调这一次。参数是本机核实过的写法。
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,etime=,command="],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=SESSIONS_PS_TIMEOUT,
+        )
+        taken = time.time()
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    if proc.returncode != 0:
+        return None, None
+    text = (proc.stdout or b"").decode("utf-8", "replace")
+    return _parse_ps(text), taken
+
+
+def _walk_procs(proc, seen=None):
+    """proc 的子孙。环（pid 互相指）到此为止，不把 proc 自己算进去。"""
+    if seen is None:
+        seen = set()
+        root = proc.get("pid")
+        if root is not None:
+            seen.add(root)
+    for kid in proc.get("kids") or []:
+        pid = kid.get("pid")
+        if pid in seen:
+            continue
+        seen.add(pid)
+        yield kid
+        yield from _walk_procs(kid, seen)
+
+
+def _is_zsh_bash(cmd):
+    tok = (cmd or "").strip().split(None, 1)
+    if not tok:
+        return False
+    base = os.path.basename(tok[0].lstrip("-")).lower()
+    return base in ("zsh", "bash")
+
+
+def _is_tool_shell(cmd):
+    """Bash 工具的 shell：zsh/bash，并且是 source shell-snapshots + eval '…'。
+
+    MCP server、常驻辅助进程、没有这层包装的 shell 都不是。
+    """
+    if not _is_zsh_bash(cmd):
+        return False
+    return _TOOL_SHELL_RE.search(cmd or "") is not None
+
+
+def _unescape_ps_octal(text):
+    """把 ps 印出来的 \\NNN 还原成字符。没有这种转义时原样返回。
+
+    换行、制表留在文本里，规整和显示时再当成空白。不在这里收成空格，
+    这样取出来的命令还能和 transcript 里带换行的 Bash 对上。
+    """
+    if not text or "\\" not in text:
+        return text or ""
+    return _PS_OCTAL_RE.sub(lambda matched: chr(int(matched.group(1), 8)), text)
+
+
+def _extract_eval_command(command):
+    """从 `source …/shell-snapshots/… && eval '<命令>'` 里取出命令。
+
+    单引号有两种转义，都还原成一个单引号：'"'"'（Claude Code 现在的写法）和 '\\''。
+    ps 把换行印成 \\012，这里还原成真正的换行。不是这种写法返回 ""。
+    ps 把行截断、收尾引号丢了时，已经读到的那段仍然返回。
+    """
+    if not command or "shell-snapshots" not in command:
+        return ""
+    mark = "eval '"
+    pos = command.find(mark)
+    if pos < 0:
+        return ""
+    head = command[:pos]
+    if "source" not in head or "shell-snapshots" not in head:
+        return ""
+    i = pos + len(mark)
+    out, n = [], len(command)
+    # '"'"' 是 5 个字符，'\'' 是 4 个。都从这一个单引号开始，要先认长的那种。
+    quote_dq = "'\"'\"'"
+    quote_bs = "'\\''"
+    while i < n:
+        if command.startswith(quote_dq, i):
+            out.append("'")
+            i += 5
+            continue
+        if command.startswith(quote_bs, i):
+            out.append("'")
+            i += 4
+            continue
+        if command[i] == "'":
+            break
+        out.append(command[i])
+        i += 1
+    return _unescape_ps_octal("".join(out)).strip()
+
+
+def _norm_cmd(text):
+    """空白收成单空格，便于前缀匹配。换行、制表也算空白。"""
+    return " ".join(str(text or "").split())
+
+
+def _cmd_prefix_match(shell_cmd, tool_cmd):
+    """空白规整后，较短的那边是较长那边的前缀（边界是结尾或空格）才算同一条命令。"""
+    a, b = _norm_cmd(shell_cmd), _norm_cmd(tool_cmd)
+    if not a or not b:
+        return False
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if not long.startswith(short):
+        return False
+    return len(short) == len(long) or long[len(short)] == " "
+
+
+def _text_external(cmd):
+    """命令文本里第一个像 grok / codex 可执行文件的词。没有返回 ""。"""
+    matched = _EXT_CMD_RE.search(cmd or "")
+    if not matched:
+        return ""
+    return "Grok" if matched.group(1).lower() == "grok" else "Codex"
+
+
+def _proc_external(cmd):
+    """进程的 argv0 是 grok 或 codex 就返回名字，否则 ""。"""
+    tok = (cmd or "").strip().split(None, 1)
+    if not tok:
+        return ""
+    base = os.path.basename(tok[0].lstrip("-")).strip("'\"").lower()
+    if base == "grok":
+        return "Grok"
+    if base == "codex":
+        return "Codex"
+    return ""
+
+
+def _external_kind(shell, raw):
+    """eval 出来的命令，或这个 shell 的任一子孙进程，是 grok / codex 就返回 Grok / Codex。"""
+    kind = _text_external(raw)
+    if kind:
+        return kind
+    for proc in _walk_procs(shell):
+        kind = _proc_external(proc.get("cmd") or "")
+        if kind:
+            return kind
+    return ""
+
+
+def _command_short_name(cmd):
+    """⚙ 命令这一行的短名字：跳过 cd / 赋值，取第一个像可执行文件的词。"""
+    for part in re.split(r"\s*(?:&&|\|\||[;|&])\s*", str(cmd or "")):
+        tokens = part.strip().split()
+        i = 0
+        while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i] or ""):
+            i += 1
+        if i >= len(tokens):
+            continue
+        base = os.path.basename(tokens[i].strip("'\""))
+        if not base or base in _SKIP_CMD or base.startswith("-"):
+            continue
+        return _clean(base) or "Bash"
+    return "Bash"
+
+
+def _shell_row(shell, now):
+    """一条 Bash 工具 shell → 表格子行。取不出 eval 命令就返回 None（包装噪音不单列）。"""
+    raw = _extract_eval_command(shell.get("cmd") or "")
+    if not raw.strip():
+        return None
+    summary = _one_line(raw)
+    if not summary:
+        return None
+    ext = _external_kind(shell, raw)
+    if ext:
+        name, state = f"外部 {ext}", "外部"
+    else:
+        name, state = _command_short_name(raw), "命令"
+    etime = shell.get("etime")
+    if isinstance(etime, (int, float)) and not isinstance(etime, bool) and etime >= 0:
+        ts = now - float(etime)
+    else:
+        ts = now
+    return {"name": name, "state": state, "doing": summary, "ts": ts, "children": [], "_raw": raw}
+
+
+def _tool_shells(procs, pid, direct_only):
+    """pid 下面的 Bash 工具 shell。
+
+    Claude 只要直接的 zsh/bash 子进程。Grok 放宽到全部子孙，嵌套的只留最外层，
+    避免用户命令自己再套一层同样的包装时列两次。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return []
+    root = procs.get(pid)
+    if not root:
+        return []
+    if direct_only:
+        return [p for p in (root.get("kids") or []) if _is_tool_shell(p.get("cmd") or "")]
+    matched = [p for p in _walk_procs(root) if _is_tool_shell(p.get("cmd") or "")]
+    return _outermost_shells(matched, procs)
+
+
+def _outermost_shells(shells, procs):
+    keep = {p["pid"] for p in shells}
+    out = []
+    for proc in shells:
+        parent = proc.get("ppid")
+        seen, nested = set(), False
+        while parent and parent not in seen:
+            seen.add(parent)
+            if parent in keep:
+                nested = True
+                break
+            up = procs.get(parent)
+            parent = up.get("ppid") if up else 0
+        if not nested:
+            out.append(proc)
+    return out
+
+
+def _command_rows(procs, pids, now, direct_only):
+    """这些 pid 上的 ⚙ 行，跑得久的排在前面。procs 为空就没有。"""
+    if not procs:
+        return []
+    rows, seen = [], set()
+    for pid in pids:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid in seen:
+            continue
+        seen.add(pid)
+        for shell in _tool_shells(procs, pid, direct_only):
+            row = _shell_row(shell, now)
+            if row:
+                rows.append(row)
+    rows.sort(key=lambda row: (float(row.get("ts") or 0), row.get("name") or ""))
+    return rows
+
+
+def _node_bash_cmds(node):
+    """这个子 agent 末尾窗口里的 Bash。最近的在前。旧数据是一条字符串时也认。"""
+    raw = node.get("bash")
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list):
+        return [cmd for cmd in raw if isinstance(cmd, str) and cmd.strip()]
+    return []
+
+
+def _match_bash_host(nodes, shell_cmd):
+    """进行中的子 agent 里，末尾窗口的某条 Bash 和 shell 命令对得上的那个。
+
+    每个子 agent 只看留住的那几条（最近的在前），任一匹配就行。
+    多个都像时，留对得上的命令里更长的（更具体）；一样长就留树上更靠后的。做完的不算。
+    """
+    best, best_len = None, -1
+    for node in _walk_nodes(nodes):
+        if not node.get("aid") or _node_kind(node) == "完成":
+            continue
+        matched = -1
+        for tool in _node_bash_cmds(node):
+            if not _cmd_prefix_match(shell_cmd, tool):
+                continue
+            n = len(_norm_cmd(tool))
+            if n > matched:
+                matched = n
+        if matched > 0 and matched >= best_len:
+            best, best_len = node, matched
+    return best
+
+
+def _place_command_rows(session, rows):
+    """对得上子 agent 的挂到它下面，其余挂在会话下面。"""
+    if not rows:
+        return
+    children = session.setdefault("children", [])
+    for row in rows:
+        raw = row.pop("_raw", "")
+        host = _match_bash_host(children, raw)
+        if host is not None:
+            host.setdefault("children", []).append(row)
+        else:
+            children.append(row)
+
+
+def _attach_command_rows(session, pid, procs, now, direct_only):
+    if not procs:
+        return
+    _place_command_rows(session, _command_rows(procs, [pid], now, direct_only))
+
+
+def _load_claude_registry():
+    """读 ~/.claude/sessions/<pid>.json。
+
+    目录不存在或列不出来返回 None：调用方完全按 transcript mtime 的旧规则来。
+    忽略 <pid>.<hash>.key。单个文件读坏就跳过。目录在、只是没有会话时返回 []。
+    """
+    root = _claude_sessions_dir()
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return None
+    recs = []
+    for ent in entries:
+        matched = _REG_FILE_RE.match(ent.name)
+        if not matched:
+            continue
+        try:
+            if not ent.is_file():
+                continue
+            with open(ent.path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        sid = str(data.get("sessionId") or "").strip()
+        if not sid:
+            continue
+        try:
+            pid = int(data.get("pid"))
+        except (TypeError, ValueError):
+            try:
+                pid = int(matched.group(1))
+            except ValueError:
+                continue
+        if pid <= 0:
+            continue
+        recs.append({
+            "pid": pid,
+            "sessionId": sid,
+            "cwd": data.get("cwd") if isinstance(data.get("cwd"), str) else "",
+            "procStart": data.get("procStart") if isinstance(data.get("procStart"), str) else "",
+            "status": data.get("status") if isinstance(data.get("status"), str) else "",
+            "name": data.get("name") if isinstance(data.get("name"), str) else "",
+            "startedAt": data.get("startedAt"),
+            "statusUpdatedAt": data.get("statusUpdatedAt") or 0,
+        })
+    return recs
+
+
+def _start_aligned(rec, procs, ps_at):
+    """procStart 和 etime 反推的启动时间。
+
+    True 对得上，False 明确不是同一个进程（pid 被复用），None 比不了。
+    """
+    if not procs or ps_at is None:
+        return None
+    try:
+        pid = int(rec.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    proc = procs.get(pid)
+    if not proc or proc.get("etime") is None:
+        return None
+    started = _parse_proc_start(rec.get("procStart"))
+    if started is None:
+        return None
+    if abs((ps_at - proc["etime"]) - started) <= SESSIONS_START_SLACK:
+        return True
+    return False
+
+
+def _registry_live(rec, procs, ps_at):
+    """这条注册表还指着正在跑的那个进程吗。pid 不在了就不算；启动时间比不了就只看 pid。"""
+    if not _pid_alive(rec.get("pid")):
+        return False
+    aligned = _start_aligned(rec, procs, ps_at)
+    if aligned is None:
+        return True
+    return aligned
+
+
+def _live_registry(recs, procs, ps_at):
+    """sessionId → {rec, pids}。只留进程还对得上的。
+
+    同一 sid 多条都活着时，状态用 statusUpdatedAt 更新的那条，pid 都留着，命令行一起算。
+    """
+    grouped = {}
+    for rec in recs or []:
+        if not _registry_live(rec, procs, ps_at):
+            continue
+        sid = rec["sessionId"]
+        slot = grouped.get(sid)
+        if slot is None:
+            grouped[sid] = {"rec": rec, "pids": [rec["pid"]]}
+            continue
+        if rec["pid"] not in slot["pids"]:
+            slot["pids"].append(rec["pid"])
+        if _updated_at(rec) >= _updated_at(slot["rec"]):
+            slot["rec"] = rec
+    return grouped
+
+
+def _updated_at(rec):
+    try:
+        return float(rec.get("statusUpdatedAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_registry_status(session, slot, procs, now):
+    """用注册表 status 盖住会话自己这一行，并把该 pid 的 Bash shell 挂成 ⚙ 行。
+
+    busy → 运行，在做什么仍用 transcript 末尾的细节（有的话）。
+    shell → 运行，在做什么写成「后台命令 / 那条命令」。
+    idle → 空闲（等你、等 N 个子 agent 之后仍会盖上来）。
+    不认识的 status 不动 transcript 推出的状态，命令行还是照挂。
+    """
+    reg = slot["rec"]
+    pids = slot.get("pids") or [reg.get("pid")]
+    rows = _command_rows(procs, pids, now, direct_only=True) if procs else []
+    status = str(reg.get("status") or "").strip()
+    if status == "busy":
+        session["reg"] = "busy"
+        session["state"] = "工作中"
+        if (session.get("doing") or "") in ("", "空闲"):
+            session["doing"] = ""
+    elif status == "shell":
+        session["reg"] = "shell"
+        session["state"] = "工作中"
+        cmd = rows[0]["doing"] if rows else ""
+        session["doing"] = f"后台命令 / {cmd}" if cmd else "后台命令"
+    elif status == "idle":
+        session["reg"] = "idle"
+        session["state"] = "空闲"
+        session["doing"] = "空闲"
+    _place_command_rows(session, rows)
+
+
+def _make_claude_session(path, sid, session_dir, mtime, waiting, now, slot=None, procs=None):
     act = _tail_activity(path)
+    reg = (slot or {}).get("rec") if slot else None
     cwd = act.get("cwd") or (waiting or {}).get("cwd") or ""
+    if not cwd and reg:
+        cwd = reg.get("cwd") or ""
     session = {"src": "claude", "sid": sid, "cwd": cwd,
                "title": session_title(path) or (waiting or {}).get("title") or "",
                "state": act["state"], "doing": act["doing"], "ts": act["ts"] or mtime,
                "children": _subagent_tree(session_dir, now)}
+    if slot is not None:
+        _apply_registry_status(session, slot, procs, now)
     _apply_wait(session, waiting)
     return session
 
@@ -3921,7 +4585,25 @@ def _session_from_wait(w, now):
             "ts": float(w.get("ts") or now), "children": []}
 
 
-def _claude_live(now, ended, waits):
+def _session_from_registry(slot, procs, waiting, now):
+    """注册表说进程还在，但项目目录里没有这份 transcript。用注册表的 cwd / 名字顶上。"""
+    reg = slot["rec"]
+    ts = _parse_proc_start(reg.get("procStart")) or _epoch_ms(reg.get("startedAt")) or now
+    session = {"src": "claude", "sid": reg["sessionId"], "cwd": reg.get("cwd") or (waiting or {}).get("cwd") or "",
+               "title": (waiting or {}).get("title") or _clean(reg.get("name")) or "",
+               "state": "空闲", "doing": "空闲", "ts": ts, "children": []}
+    _apply_registry_status(session, slot, procs, now)
+    _apply_wait(session, waiting)
+    return session
+
+
+def _claude_live(now, ended, waits, procs=None, ps_at=None, registry=None):
+    """进行中的 Claude 会话。
+
+    registry 是 None（目录读不了）时，判断和以前完全一样：transcript 15 分钟内写过，或正在等你。
+    registry 是列表时，进程还对得上的会话不管 mtime 多旧都留着；对不上的退回 mtime 规则。
+    """
+    live = None if registry is None else _live_registry(registry, procs, ps_at)
     found = {}
     root = _claude_projects_dir()
     for proj in _safe_scandir(root):
@@ -3948,36 +4630,51 @@ def _claude_live(now, ended, waits):
                 continue
             sid = name[:-len(".jsonl")]
             end_ts = ended.get(("claude", sid))
-            # 记录比 SessionEnd 晚 1 秒以上：resume / --continue 写过了，会话复活
-            if not sid or (end_ts is not None and mtime <= end_ts + 1):
+            slot = live.get(sid) if live else None
+            # 记录比 SessionEnd 晚 1 秒以上：resume / --continue 写过了，会话复活。
+            # 注册表确认还是同一个进程时，不因为旧的 SessionEnd / 旧 mtime 把它丢掉。
+            if not sid or (end_ts is not None and mtime <= end_ts + 1 and not slot):
                 continue
             waiting = waits.get(("claude", sid))
-            if now - mtime > SESSIONS_SESSION_SEC and not waiting:
+            if slot is None and now - mtime > SESSIONS_SESSION_SEC and not waiting:
                 continue
-            found[sid] = _make_claude_session(ent.path, sid, dirs.get(sid), mtime, waiting, now)
+            found[sid] = _make_claude_session(ent.path, sid, dirs.get(sid), mtime, waiting, now,
+                                              slot=slot, procs=procs)
     for key, w in waits.items():
         if key[0] != "claude" or key[1] in found:
             continue
         path = w.get("transcript") or ""
         end_ts = ended.get(key)
+        slot = live.get(key[1]) if live else None
         if path and os.path.isfile(path):
             try:
                 mtime = os.stat(path).st_mtime
             except OSError:
                 mtime = now
-            if end_ts is not None and mtime <= end_ts + 1:
+            if end_ts is not None and mtime <= end_ts + 1 and not slot:
                 continue
             parent = os.path.dirname(path)
             session_dir = os.path.join(parent, key[1])
             found[key[1]] = _make_claude_session(path, key[1], session_dir if os.path.isdir(session_dir) else None,
-                                                mtime, w, now)
-        elif end_ts is None:
-            found[key[1]] = _session_from_wait(w, now)
+                                                mtime, w, now, slot=slot, procs=procs)
+        elif end_ts is None or slot is not None:
+            if slot is not None:
+                found[key[1]] = _session_from_registry(slot, procs, w, now)
+            else:
+                found[key[1]] = _session_from_wait(w, now)
+    if live:
+        for sid, slot in live.items():
+            if sid not in found:
+                found[sid] = _session_from_registry(slot, procs, waits.get(("claude", sid)), now)
     return list(found.values())
 
 
-def _grok_live(now, ended, waits):
-    path = os.path.expanduser("~/.grok/active_sessions.json")
+def _grok_sessions_path():
+    return os.path.expanduser("~/.grok/active_sessions.json")
+
+
+def _grok_live(now, ended, waits, procs=None):
+    path = _grok_sessions_path()
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -3998,6 +4695,8 @@ def _grok_live(now, ended, waits):
         session = {"src": "grok", "sid": sid, "cwd": item.get("cwd") or "", "title": (w or {}).get("title") or "",
                    "state": "空闲", "doing": "空闲", "ts": opened or now, "children": []}
         _apply_wait(session, w)
+        # 和 Claude 一样尽力挂 ⚙ 行；Grok 的 shell 不一定是直接子进程，所以看整棵子孙
+        _attach_command_rows(session, item.get("pid"), procs, now, direct_only=False)
         out.append(session)
     return out
 
@@ -4006,7 +4705,9 @@ def live_sessions(now=None, decided=None):
     """进行中的会话：[{src, sid, cwd, title, state, doing, ts, children}]。
 
     children 是子 agent：{aid, name, state, doing, ts, children}，parentAgentId 挂到对应的子 agent 下，
-    没有就挂在会话下。Grok 只有会话、没有子 agent，状态只有空闲或等你。
+    没有就挂在会话下。⚙ 命令 / ⚙ 外部也在 children 里，没有 aid，不算子 agent。
+    注册表在的 Claude 会话，status 决定自己这一行；不在注册表里的仍看 transcript。
+    Grok 没有子 agent，状态只有空闲或等你；它的 shell 一样尽量挂成 ⚙ 行。
     decided 是刚在宠物上决定过的 rid，这些先不算在等你。
     SEE_BALANCE_SESSIONS 设了的话，cwd 不含其中任一子串的会话不返回（--watch 和 --sessions 都走这里）。
     """
@@ -4016,7 +4717,14 @@ def live_sessions(now=None, decided=None):
         items = [w for w in items if w.get("rid") not in decided]
     waits = {(w.get("src"), w["sid"]): w for w in items if w.get("sid")}
     ended = _ended_sids(now)
-    sessions = _claude_live(now, ended, waits) + _grok_live(now, ended, waits)
+    registry = _load_claude_registry()   # None：目录读不了，Claude 走原来的 mtime 规则，这次也不为它调 ps
+    # 有活着的注册表进程，或有 Grok 会话文件，才值得调那一次 ps。都没有就和以前一样不调。
+    want_ps = os.path.isfile(_grok_sessions_path())
+    if not want_ps and registry:
+        want_ps = any(_pid_alive(rec.get("pid")) for rec in registry)
+    procs, ps_at = _ps_snapshot() if want_ps else (None, None)
+    sessions = (_claude_live(now, ended, waits, procs, ps_at, registry)
+                + _grok_live(now, ended, waits, procs))
     parts = load_env_sessions()
     if parts:
         sessions = [s for s in sessions if _cwd_ok(s, parts)]
