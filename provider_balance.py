@@ -3605,8 +3605,16 @@ SESSIONS_TAIL_BIG    = 1024 * 1024   # 最后一条比 64KB 还长、没有完�
 SESSIONS_PS_TIMEOUT  = 2             # ps 超过这么久，或失败，就跳过进程树这一截增强
 SESSIONS_START_SLACK = 5             # procStart 和 etime 反推的启动时间，差几秒仍算同一个进程
 SESSIONS_BASH_KEEP   = 20            # 末尾窗口里留多少条 Bash（会话自己和子 agent 都用），最近的在前；再多不留，避免把整段记录都搁在内存里
+SESSIONS_BASH_CHUNK    = 4 << 20     # 对不上时从末尾往前翻，一块读 4MB
+SESSIONS_BASH_OVERLAP  = 64 << 10    # 相邻两块重叠 64KB，避免一条记录被切开
+SESSIONS_BASH_CAP      = 256 << 20   # 每个文件最多往回翻 256MB
+SESSIONS_BASH_BUDGET   = 32 << 20    # --watch 每一轮最多读 32MB
+SESSIONS_BASH_ONCE     = 1 << 30     # --sessions 一次性最多读 1GB
+SESSIONS_BASH_SKEW     = 120         # 记录早于 shell 启动 120 秒就停
+SESSIONS_BASH_SCAN_SEC = 2           # --watch 每一轮最多翻 2 秒；出错保持「后台命令」
 
 _ACTIVITY_CACHE = {}
+_BASH_DESC_CACHE = {}  # (owner, shell pid, 启动秒) → {fi, pos, desc, head}；shell 不在了就删
 
 
 def _claude_projects_dir():
@@ -4102,7 +4110,7 @@ def _parse_etime(text):
 
 
 def _parse_ps(text):
-    """ps -axo pid=,ppid=,etime=,command= 的输出。pid → {pid, ppid, etime, cmd, kids}。"""
+    """ps -axww -o pid=,ppid=,etime=,command= 的输出。pid → {pid, ppid, etime, cmd, kids}。"""
     by_pid = {}
     for line in str(text or "").splitlines():
         parts = line.strip().split(None, 3)
@@ -4127,11 +4135,11 @@ def _parse_ps(text):
 def _ps_snapshot():
     """一次 ps。失败返回 (None, None)，调用方跳过进程树增强，启动时间改为只看 pid。
 
-    live_sessions 每次扫描只调这一次。参数是本机核实过的写法。
+    live_sessions 每次扫描只调这一次。-ww 让长命令不被截断。
     """
     try:
         proc = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,etime=,command="],
+            ["ps", "-axww", "-o", "pid=,ppid=,etime=,command="],
             capture_output=True,
             stdin=subprocess.DEVNULL,
             timeout=SESSIONS_PS_TIMEOUT,
@@ -4276,7 +4284,7 @@ def _external_kind(shell, raw):
     return ""
 
 
-def _shell_row(shell, now):
+def _shell_row(shell, now, owner=0):
     """一条 Bash 工具 shell → 表格子行。取不出 eval 命令就返回 None（包装噪音不单列）。
 
     名字先写「后台命令」，或「外部 Grok」/「外部 Codex」。
@@ -4299,7 +4307,15 @@ def _shell_row(shell, now):
         ts = now - float(etime)
     else:
         ts = now
-    return {"name": name, "state": state, "doing": summary, "ts": ts, "children": [], "_raw": raw}
+    row = {"name": name, "state": state, "doing": summary, "ts": ts, "children": [], "_raw": raw}
+    try:
+        shell_pid = int(shell.get("pid"))
+        owner_pid = int(owner)
+        row["_shell_pid"] = shell_pid
+        row["_owner"] = owner_pid
+    except (TypeError, ValueError):
+        pass
+    return row
 
 
 def _tool_shells(procs, pid, direct_only):
@@ -4353,7 +4369,7 @@ def _command_rows(procs, pids, now, direct_only):
             continue
         seen.add(pid)
         for shell in _tool_shells(procs, pid, direct_only):
-            row = _shell_row(shell, now)
+            row = _shell_row(shell, now, pid)
             if row:
                 rows.append(row)
     rows.sort(key=lambda row: (float(row.get("ts") or 0), row.get("name") or ""))
@@ -4423,15 +4439,20 @@ def _shell_desc(session, shell_cmd):
     return best
 
 
+def _name_shell(row, desc):
+    """外部写成「外部 X · 说明」，其余直接用说明。"""
+    if row.get("state") == "外部":
+        name = row.get("name") or "外部"
+        row["name"] = f"{name} · {desc}"
+    else:
+        row["name"] = desc
+
+
 def _apply_shell_desc(session, row, raw):
     """对得上就用 description 当名字。外部行写成「外部 Grok · 说明」。对不上保持原名。"""
     desc = _shell_desc(session, raw)
-    if not desc:
-        return
-    if row.get("state") == "外部":
-        row["name"] = f"{row.get('name') or '外部'} · {desc}"
-        return
-    row["name"] = desc
+    if desc:
+        _name_shell(row, desc)
 
 
 def _match_bash_host(nodes, shell_cmd):
@@ -4465,7 +4486,7 @@ def _place_command_rows(session, rows):
         return
     children = session.setdefault("children", [])
     for row in rows:
-        raw = row.pop("_raw", "")
+        raw = row.get("_raw") or ""
         _apply_shell_desc(session, row, raw)
         host = _match_bash_host(children, raw)
         if host is not None:
@@ -4629,7 +4650,7 @@ def _make_claude_session(path, sid, session_dir, mtime, waiting, now, slot=None,
                "title": session_title(path) or (waiting or {}).get("title") or "",
                "state": act["state"], "doing": act["doing"], "ts": act["ts"] or mtime,
                "bash": act.get("bash") or [],
-               "children": _subagent_tree(session_dir, now)}
+               "children": _subagent_tree(session_dir, now), "_path": path or "", "_dir": session_dir or ""}
     if slot is not None:
         _apply_registry_status(session, slot, procs, now)
     _apply_wait(session, waiting)
@@ -4758,7 +4779,236 @@ def _grok_live(now, ended, waits, procs=None):
     return out
 
 
-def live_sessions(now=None, decided=None):
+def _bash_needle(cmd):
+    """命令第一行（_norm_cmd 后）前 60 字的 JSON 转义。换行不并进去。"""
+    first_line = str(cmd or "").split("\n", 1)[0]
+    first = _norm_cmd(first_line)[:60]
+    if not first:
+        return b""
+    try:
+        escaped = json.dumps(first, ensure_ascii=False)[1:-1]
+        return escaped.encode()
+    except (TypeError, ValueError, UnicodeError):
+        return b""
+
+
+def _bash_on_line(line, cmd, not_before):
+    """(说明, 过旧)。整行才解析；timestamp 早于 not_before 则过旧。"""
+    try:
+        rec = json.loads(line)
+    except (ValueError, UnicodeError):
+        return "", False
+    if not isinstance(rec, dict):
+        return "", False
+    ts = _parse_time(rec.get("timestamp"))
+    if ts and not_before and ts < not_before:
+        return "", True
+    for command, desc in _record_bashes(rec):
+        text = _one_line(_clean(desc))
+        if text and _cmd_prefix_match(cmd, command):
+            return text, False
+    return "", False
+
+
+def _find_bash_desc(path, cmd, not_before, budget):
+    """从末尾按块往前找。找到、翻完或块首记录过旧时 pos=0。整行在块内才解析，游标只往回。"""
+    needle = _bash_needle(cmd)
+    end = None
+    if not needle:
+        budget["pos"] = 0
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            pos = budget.get("pos")
+            if not isinstance(pos, int) or pos <= 0 or pos > size:
+                end = size
+            else:
+                end = pos
+            floor = max(0, size - SESSIONS_BASH_CAP)
+            while end > floor and budget["left"] > 0 and time.monotonic() < budget["deadline"]:
+                start = max(floor, end - SESSIONS_BASH_CHUNK)
+                if end >= size:
+                    read_end = end
+                else:
+                    read_end = min(size, end + SESSIONS_BASH_OVERLAP)
+                if start >= end:
+                    break
+                want = read_end - start
+                if want <= 0 or want > budget["left"]:
+                    break
+                fh.seek(start)
+                buf = fh.read(want)
+                budget["left"] -= len(buf)
+                if len(buf) != want:
+                    break
+                limit = len(buf)
+                while limit > 0:
+                    hit = buf.rfind(needle, 0, limit)
+                    if hit < 0 or hit >= limit:
+                        break
+                    line_start = buf.rfind(b"\n", 0, hit) + 1
+                    line_end = buf.find(b"\n", hit)
+                    limit = hit
+                    # 这一行没完整落在块里：开头被截，或还没读到行尾
+                    if (line_start == 0 and start) or (line_end < 0 and read_end < size):
+                        continue
+                    if line_end < 0:
+                        line = buf[line_start:]
+                    else:
+                        line = buf[line_start:line_end]
+                    desc, old = _bash_on_line(line, cmd, not_before)
+                    if old or desc:
+                        budget["pos"] = 0
+                        return desc
+                if start == 0:
+                    off = 0
+                else:
+                    off = buf.find(b"\n") + 1
+                if start == 0 or off:
+                    newline = buf.find(b"\n", off)
+                else:
+                    newline = -1
+                try:
+                    if not_before and newline > off:
+                        rec = json.loads(buf[off:newline])
+                    else:
+                        rec = None
+                except (ValueError, UnicodeError):
+                    rec = None
+                if isinstance(rec, dict):
+                    ts = _parse_time(rec.get("timestamp"))
+                    if ts and ts < not_before:
+                        budget["pos"] = 0
+                        return ""
+                end = start
+            budget["pos"] = 0 if end <= floor else end
+            return ""
+    except (OSError, ValueError, UnicodeError):
+        budget["pos"] = 0 if end is None else end
+        return ""
+
+
+def _bash_files(session, started):
+    """mtime ≥ 启动−2s 的子 agent jsonl（含已完成，新的在前），然后是会话记录。"""
+    root = session.get("_dir") or ""
+    cut = float(started) - 2
+    rows = []
+    if root:
+        entries = _safe_scandir(os.path.join(root, "subagents"))
+    else:
+        entries = ()
+    for ent in entries:
+        try:
+            is_log = (
+                ent.name.startswith("agent-")
+                and ent.name.endswith(".jsonl")
+                and ent.is_file()
+            )
+            mt = ent.stat().st_mtime if is_log else None
+        except OSError:
+            continue
+        if mt is not None and mt >= cut:
+            rows.append((-mt, ent.name, ent.path))
+    paths = [path for _mtime, _name, path in sorted(rows)]
+    own = [session["_path"]] if session.get("_path") else []
+    return paths + own
+
+
+def _shell_key(row):
+    """(owner, shell pid, 启动秒)。差不超过 1 秒就沿用已有键。"""
+    try:
+        owner = int(row["_owner"])
+        pid = int(row["_shell_pid"])
+        started = int(float(row["ts"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(owner, pid, started) <= 0:
+        return None
+    for key in _BASH_DESC_CACHE:
+        if key[:2] == (owner, pid) and abs(key[2] - started) <= 1:
+            return key
+    return (owner, pid, started)
+
+
+def _backfill_shell_descs(sessions, limit):
+    """过滤之后补「后台命令」和没说明的「外部 X」。Grok 不翻。出错保持原名。"""
+    now = time.monotonic()
+    if limit > SESSIONS_BASH_BUDGET:
+        window = 1e9
+    else:
+        window = SESSIONS_BASH_SCAN_SEC
+    deadline = now + window
+    left = max(0, int(limit))
+    seen = set()
+    for session in sessions or []:
+        try:
+            if session.get("src") == "grok":
+                continue
+            for row in _walk_nodes(session.get("children")):
+                key = _shell_key(row)
+                raw = row.get("_raw") or ""
+                name = row.get("name") or ""
+                state = row.get("state")
+                needs = state in ("命令", "外部") and (
+                    name == "后台命令" or (state == "外部" and " · " not in name)
+                )
+                if not key or not needs or not raw:
+                    continue
+                seen.add(key)
+                hit = _BASH_DESC_CACHE.get(key)
+                if hit and hit.get("desc"):
+                    _name_shell(row, hit["desc"])
+                    continue
+                if left <= 0 or time.monotonic() >= deadline:
+                    continue
+                started = float(row.get("ts") or key[2])
+                files = _bash_files(session, started)
+                head = files[0] if files else ""
+                same = bool(hit) and hit.get("head") == head
+                if same:
+                    file_index = int(hit.get("fi") or 0)
+                    cursor = hit.get("pos")
+                    fi = file_index
+                    pos = cursor
+                    desc = ""
+                else:
+                    fi = 0
+                    pos = None
+                    desc = ""
+                while fi < len(files) and left > 0 and time.monotonic() < deadline:
+                    box = {"left": left, "deadline": deadline, "pos": pos}
+                    file_path = files[fi]
+                    not_before = started - SESSIONS_BASH_SKEW
+                    desc = _find_bash_desc(file_path, raw, not_before, box)
+                    left = box["left"]
+                    if desc or box["pos"]:
+                        pos = box["pos"]
+                        break
+                    fi = fi + 1
+                    pos = None
+                if desc:
+                    _name_shell(row, desc)
+                cached_pos = 0 if desc or fi >= len(files) else pos
+                _BASH_DESC_CACHE[key] = {
+                    "fi": fi,
+                    "pos": cached_pos,
+                    "desc": desc,
+                    "head": head,
+                }
+        except Exception:
+            pass
+        finally:
+            for obj in (session, *_walk_nodes(session.get("children"))):
+                for field in ("_path", "_dir", "_raw", "_shell_pid", "_owner"):
+                    obj.pop(field, None)
+    stale = [key for key in _BASH_DESC_CACHE if key not in seen]
+    for key in stale:
+        _BASH_DESC_CACHE.pop(key, None)
+
+
+def live_sessions(now=None, decided=None, bash_limit=None):
     """进行中的会话：[{src, sid, cwd, title, state, doing, ts, children}]。
 
     children 是子 agent：{aid, name, state, doing, ts, children}，parentAgentId 挂到对应的子 agent 下，
@@ -4785,6 +5035,11 @@ def live_sessions(now=None, decided=None):
     parts = load_env_sessions()
     if parts:
         sessions = [s for s in sessions if _cwd_ok(s, parts)]
+    if bash_limit is None:
+        limit = SESSIONS_BASH_BUDGET
+    else:
+        limit = bash_limit
+    _backfill_shell_descs(sessions, limit)
     return sessions
 
 
@@ -4793,7 +5048,13 @@ def show_sessions():
     size = shutil.get_terminal_size(fallback=(80, 24))
     rows = max(1, size.lines - 1) if sys.stdout.isatty() else max(size.lines, 200)
     label = ",".join(load_env_sessions())
-    print("\n".join(session_lines(live_sessions(), max(1, size.columns), rows, filt=label or None)))
+    lines = session_lines(
+        live_sessions(bash_limit=SESSIONS_BASH_ONCE),
+        max(1, size.columns),
+        rows,
+        filt=label or None,
+    )
+    print("\n".join(lines))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
