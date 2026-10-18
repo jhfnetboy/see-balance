@@ -149,6 +149,20 @@ def load_env_grok_key():
                         return val
     return ""
 
+def load_env_anthropic_admin_key():
+    """Load ANTHROPIC_ADMIN_KEY from env → ~/.see-balance.env（查 opencode 那个 key 的过期时间用，可选）。"""
+    val = os.environ.get("ANTHROPIC_ADMIN_KEY", "")
+    if val:
+        return val.strip('"').strip("'")
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("ANTHROPIC_ADMIN_KEY="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
+    return ""
+
 def load_env_grok_bot_token():
     """Load CURSOR_SESSION_TOKEN / GROK_BOT_TOKEN from env → ~/.see-balance.env."""
     for var in ("CURSOR_SESSION_TOKEN", "GROK_BOT_TOKEN"):
@@ -1338,6 +1352,26 @@ def _opencode_spend(now=None):
         v["cost"] = round(v["cost"], 4)
     return out
 
+OPENCODE_KEY_EXPIRY_WARN_SEC = 7 * 86400   # key 离过期不足此时长就提醒
+
+def _anthropic_key_info(key, admin_key):
+    """用 Admin API 列出组织里的 key，按 partial_key_hint（如 sk-ant-api03-R2D...igAA）对上这个 key。"""
+    after = None
+    for _ in range(10):   # 最多翻 10 页（1000 个 key）
+        url = "https://api.anthropic.com/v1/organizations/api_keys?limit=100" + (f"&after_id={after}" if after else "")
+        status, obj = http_get(url, headers={"x-api-key": admin_key, "anthropic-version": "2023-06-01"})
+        if status != 200 or not isinstance(obj, dict):
+            err = obj.get("_transport_error") if isinstance(obj, dict) and obj.get("_transport_error") else f"http {status}"
+            return None, f"Admin API 查询失败：{err}"
+        for k in obj.get("data") or []:
+            head, sep, tail = (k.get("partial_key_hint") or "").partition("...")
+            if sep and key.startswith(head) and key.endswith(tail):
+                return k, None
+        if not obj.get("has_more") or not obj.get("last_id"):
+            break
+        after = obj["last_id"]
+    return None, "Admin API 里没找到这个 key（是不是别的组织的？）"
+
 def fetch_opencode():
     auth = _opencode_auth()
     if not auth:
@@ -1361,6 +1395,16 @@ def fetch_opencode():
     else:
         err = obj.get("_transport_error") if isinstance(obj, dict) and obj.get("_transport_error") else f"http {status}"
         out["warning"] = f"key 校验失败：{err}"
+    admin_key = load_env_anthropic_admin_key()
+    if admin_key:
+        info, err = _anthropic_key_info(key, admin_key)
+        if info:
+            out["key_name"]   = info.get("name")
+            out["key_status"] = info.get("status")
+            out["expires_at"] = parse_reset(info.get("expires_at"))   # None = 永不过期
+            out["expiry_known"] = True
+        else:
+            out["expiry_error"] = err
     return out
 
 # ── Render ────────────────────────────────────────────────────────────────────
@@ -1689,6 +1733,25 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None, oc=Non
 def _fmt_tokens(n):
     return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(n)
 
+def opencode_expiry_text(oc, now=None):
+    """key 过期时间：配了 ANTHROPIC_ADMIN_KEY 才有；没配返回 None。"""
+    if oc.get("expiry_error"):
+        return f"— ({oc['expiry_error']})"
+    if not oc.get("expiry_known"):
+        return None
+    name = f"「{oc['key_name']}」" if oc.get("key_name") else ""
+    if oc.get("key_status") not in (None, "active"):
+        return f"⚠ {name}状态 {oc['key_status']}"
+    ts = oc.get("expires_at")
+    if not ts:
+        return f"{name}永不过期"
+    left = ts - (now or time.time())
+    when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    if left <= 0:
+        return f"⚠ {name}已于 {when} 过期"
+    flag = "⚠ " if left < OPENCODE_KEY_EXPIRY_WARN_SEC else ""
+    return f"{flag}{name}{when}（还剩 {fmt_countdown(left)}）"
+
 def opencode_lines(oc):
     lines = ["  ⚪ OpenCode (Anthropic)"]
     if "error" in oc:
@@ -1696,6 +1759,8 @@ def opencode_lines(oc):
     status = {True: " ✓ 可用", False: " ✗ 不可用"}.get(oc.get("key_ok"), "")
     lines.append(f"     auth        {oc.get('auth', '?')}{status}")
     if oc.get("warning"): lines.append(f"     ⚠ {oc['warning']}")
+    exp = opencode_expiry_text(oc)
+    if exp: lines.append(f"     expires     {exp}")
     sp = oc.get("spend")
     if sp:
         lines.append("     spent       " + "   ".join(
@@ -1791,6 +1856,9 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
             parts = [f"OC [{oc.get('auth', '?')}]"]
             if sp:
                 parts.append(f"today ${sp['today']['cost']:.2f}  7d ${sp['7d']['cost']:.2f}  30d ${sp['30d']['cost']:.2f}")
+            exp = opencode_expiry_text(oc)
+            if exp:
+                parts.append(f"expires {exp}")
             if oc.get("warning"):
                 parts.append(f"⚠ {oc['warning']}")
             print("  ".join(parts))
