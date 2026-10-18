@@ -199,6 +199,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.3.0 | 支持 OpenCode 的 Anthropic API key：验 key 是否可用，按 opencode 本地记录统计今天 / 7 天 / 30 天花费 |
 | 1.2.2 | README：更新方式与版本记录 |
 | 1.2.1 | 每 10 分钟检查一次更新（`--watch` 期间后台检查，带 ETag，上游没变只回 304） |
 | 1.2.0 | Claude 宠物（升级选项、会话提醒）、跨订阅调度建议、自动更新 |
