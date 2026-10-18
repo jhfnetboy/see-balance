@@ -2660,7 +2660,7 @@ def _demo_sessions(now=None):
               ]},
              {"aid": "a3", "name": "grok-review「双审」", "state": "完成",
               "doing": "✓ 完成", "ts": now - 60, "children": []},
-             {"name": "gh", "state": "命令", "doing": "gh pr checks --watch",
+             {"name": "等 PR checks", "state": "命令", "doing": "gh pr checks --watch",
               "ts": now - 45, "children": []},
          ]},
         {"src": "claude", "sid": "demo-idle", "cwd": "/work/Agent24", "title": "HANDOFF 文档",
@@ -3604,7 +3604,7 @@ SESSIONS_TAIL        = 64 * 1024     # 只看记录末尾这一段，判断正�
 SESSIONS_TAIL_BIG    = 1024 * 1024   # 最后一条比 64KB 还长、没有完整记录时，放宽再读一次
 SESSIONS_PS_TIMEOUT  = 2             # ps 超过这么久，或失败，就跳过进程树这一截增强
 SESSIONS_START_SLACK = 5             # procStart 和 etime 反推的启动时间，差几秒仍算同一个进程
-SESSIONS_BASH_KEEP   = 20            # 子 agent 末尾窗口里留多少条 Bash，最近的在前；再多不留，避免把整段记录都搁在内存里
+SESSIONS_BASH_KEEP   = 20            # 末尾窗口里留多少条 Bash（会话自己和子 agent 都用），最近的在前；再多不留，避免把整段记录都搁在内存里
 
 _ACTIVITY_CACHE = {}
 
@@ -3710,7 +3710,10 @@ def _tool_summary(name, inp):
 
 
 def _record_bashes(rec):
-    """这条记录里的 Bash tool_use 命令，按出现顺序。没有返回 []。"""
+    """这条记录里的 Bash tool_use，按出现顺序。每条是 (命令, description)。
+
+    description 没有、或不是字符串时，第二项是 ""。没有 Bash 返回 []。
+    """
     if not isinstance(rec, dict):
         return []
     msg = rec.get("message")
@@ -3730,7 +3733,8 @@ def _record_bashes(rec):
             continue
         cmd = inp.get("command")
         if isinstance(cmd, str) and cmd.strip():
-            found.append(cmd)
+            desc = inp.get("description")
+            found.append((cmd, desc if isinstance(desc, str) else ""))
     return found
 
 
@@ -3780,8 +3784,10 @@ _CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
 def _tail_activity(path):
     """jsonl 末尾最后一条有效记录在干什么。返回 {state, doing, ts, cwd, bash}。
 
-    bash 是这段末尾窗口里的 Bash tool_use 命令，最近的在前，最多 SESSIONS_BASH_KEEP 条。
+    bash 是这段末尾窗口里的 Bash tool_use，最近的在前，最多 SESSIONS_BASH_KEEP 条。
+    每条是 (命令, description)；没有 description 时第二项是 ""。
     子 agent 常常先起一条长命令，再继续发别的 Bash；只留最后一条，进程树上那个 shell 就挂不上。
+    会话自己的窗口也留这份，⚙ 行的名字从这里取 description。
     按 (路径, 大小) 缓存，文件没变就不重读。最后一条比 64KB 还长时，放宽到 1MB 再试一次。"""
     try:
         size = os.stat(path).st_size
@@ -3845,7 +3851,7 @@ def _tail_activity(path):
                 cwd = got
         cwd = cwd or prev_cwd
     activity["cwd"] = cwd
-    activity["bash"] = list(reversed(bashes))   # 最近的在前，挂 shell 时先看它
+    activity["bash"] = list(reversed(bashes))   # 最近的在前；每条是 (命令, description)
     if not activity.get("ts"):
         try:
             activity["ts"] = os.stat(path).st_mtime
@@ -4033,13 +4039,6 @@ _MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
 }
-# 短名字里跳过的壳层词，后面还有真正的命令
-_SKIP_CMD = {
-    "cd", "export", "source", "pushd", "popd", "true", "false", "builtin",
-    "command", "exec", "time", "nohup", "nice", "sudo", "env", ":",
-}
-
-
 def _epoch_ms(value):
     """unix 秒或毫秒。解析不了返回 0。注册表的 startedAt 是毫秒。"""
     if isinstance(value, bool):
@@ -4277,24 +4276,13 @@ def _external_kind(shell, raw):
     return ""
 
 
-def _command_short_name(cmd):
-    """⚙ 命令这一行的短名字：跳过 cd / 赋值，取第一个像可执行文件的词。"""
-    for part in re.split(r"\s*(?:&&|\|\||[;|&])\s*", str(cmd or "")):
-        tokens = part.strip().split()
-        i = 0
-        while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i] or ""):
-            i += 1
-        if i >= len(tokens):
-            continue
-        base = os.path.basename(tokens[i].strip("'\""))
-        if not base or base in _SKIP_CMD or base.startswith("-"):
-            continue
-        return _clean(base) or "Bash"
-    return "Bash"
-
-
 def _shell_row(shell, now):
-    """一条 Bash 工具 shell → 表格子行。取不出 eval 命令就返回 None（包装噪音不单列）。"""
+    """一条 Bash 工具 shell → 表格子行。取不出 eval 命令就返回 None（包装噪音不单列）。
+
+    名字先写「后台命令」，或「外部 Grok」/「外部 Codex」。
+    对得上 transcript 里的 description 时，_place_command_rows 再改这一列。
+    「在做什么」仍是命令本身。
+    """
     raw = _extract_eval_command(shell.get("cmd") or "")
     if not raw.strip():
         return None
@@ -4305,7 +4293,7 @@ def _shell_row(shell, now):
     if ext:
         name, state = f"外部 {ext}", "外部"
     else:
-        name, state = _command_short_name(raw), "命令"
+        name, state = "后台命令", "命令"
     etime = shell.get("etime")
     if isinstance(etime, (int, float)) and not isinstance(etime, bool) and etime >= 0:
         ts = now - float(etime)
@@ -4372,14 +4360,78 @@ def _command_rows(procs, pids, now, direct_only):
     return rows
 
 
-def _node_bash_cmds(node):
-    """这个子 agent 末尾窗口里的 Bash。最近的在前。旧数据是一条字符串时也认。"""
-    raw = node.get("bash")
+def _node_bash_entries(node):
+    """末尾窗口里的 Bash：(命令, description)，最近的在前。
+
+    旧数据是一条字符串，或命令字符串列表，那时没有 description。
+    新数据是 (命令, description) 的列表。挂 shell 时两种都认。
+    """
+    raw = node.get("bash") if isinstance(node, dict) else None
     if isinstance(raw, str):
-        return [raw] if raw.strip() else []
-    if isinstance(raw, list):
-        return [cmd for cmd in raw if isinstance(cmd, str) and cmd.strip()]
-    return []
+        return [(raw, "")] if raw.strip() else []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if isinstance(item, str):
+            if item.strip():
+                out.append((item, ""))
+            continue
+        if isinstance(item, (tuple, list)) and item:
+            cmd = item[0]
+            desc = item[1] if len(item) > 1 else ""
+            if isinstance(cmd, str) and cmd.strip():
+                out.append((cmd, desc if isinstance(desc, str) else ""))
+    return out
+
+
+def _node_bash_cmds(node):
+    """这个子 agent 末尾窗口里的 Bash 命令。最近的在前。旧数据是一条字符串时也认。"""
+    return [cmd for cmd, _desc in _node_bash_entries(node)]
+
+
+def _bash_desc_on(node, shell_cmd):
+    """这个节点里，和 shell 命令对得上、而且有 description 的最具体一条。
+
+    一样长留先看到的：列表是最近的在前。没有返回 ("", -1)。
+    description 先 _clean 再 _one_line，空的不算。
+    """
+    best, best_len = "", -1
+    for cmd, desc in _node_bash_entries(node):
+        text = _one_line(_clean(desc))
+        if not text or not _cmd_prefix_match(shell_cmd, cmd):
+            continue
+        n = len(_norm_cmd(cmd))
+        if n > best_len:
+            best, best_len = text, n
+    return best, best_len
+
+
+def _shell_desc(session, shell_cmd):
+    """会话自己的末尾窗口，和进行中的子 agent，里面对得上的 description。
+
+    多个都像时留命令更长的那条；一样长就留树上更靠后的子 agent
+    （和 _match_bash_host 同一条规矩）。没有返回 ""。
+    """
+    best, best_len = _bash_desc_on(session, shell_cmd)
+    for node in _walk_nodes(session.get("children")):
+        if not node.get("aid") or _node_kind(node) == "完成":
+            continue
+        text, n = _bash_desc_on(node, shell_cmd)
+        if n > 0 and n >= best_len:
+            best, best_len = text, n
+    return best
+
+
+def _apply_shell_desc(session, row, raw):
+    """对得上就用 description 当名字。外部行写成「外部 Grok · 说明」。对不上保持原名。"""
+    desc = _shell_desc(session, raw)
+    if not desc:
+        return
+    if row.get("state") == "外部":
+        row["name"] = f"{row.get('name') or '外部'} · {desc}"
+        return
+    row["name"] = desc
 
 
 def _match_bash_host(nodes, shell_cmd):
@@ -4405,12 +4457,16 @@ def _match_bash_host(nodes, shell_cmd):
 
 
 def _place_command_rows(session, rows):
-    """对得上子 agent 的挂到它下面，其余挂在会话下面。"""
+    """对得上子 agent 的挂到它下面，其余挂在会话下面。
+
+    名字在挂上去之前定：对得上的 Bash 有 description 就用它，否则 ⚙ 命令行保持「后台命令」。
+    """
     if not rows:
         return
     children = session.setdefault("children", [])
     for row in rows:
         raw = row.pop("_raw", "")
+        _apply_shell_desc(session, row, raw)
         host = _match_bash_host(children, raw)
         if host is not None:
             host.setdefault("children", []).append(row)
@@ -4538,7 +4594,8 @@ def _apply_registry_status(session, slot, procs, now):
     """用注册表 status 盖住会话自己这一行，并把该 pid 的 Bash shell 挂成 ⚙ 行。
 
     busy → 运行，在做什么仍用 transcript 末尾的细节（有的话）。
-    shell → 运行，在做什么写成「后台命令 / 那条命令」。
+    shell → 运行。有 ⚙ 行时在做什么写成「跑着 N 条命令」，N 是这个会话直接的那些行
+    （还没分给子 agent 之前数好的）；一条都没有就写成「后台命令」。
     idle → 空闲（等你、等 N 个子 agent 之后仍会盖上来）。
     不认识的 status 不动 transcript 推出的状态，命令行还是照挂。
     """
@@ -4554,8 +4611,7 @@ def _apply_registry_status(session, slot, procs, now):
     elif status == "shell":
         session["reg"] = "shell"
         session["state"] = "工作中"
-        cmd = rows[0]["doing"] if rows else ""
-        session["doing"] = f"后台命令 / {cmd}" if cmd else "后台命令"
+        session["doing"] = f"跑着 {len(rows)} 条命令" if rows else "后台命令"
     elif status == "idle":
         session["reg"] = "idle"
         session["state"] = "空闲"
@@ -4572,6 +4628,7 @@ def _make_claude_session(path, sid, session_dir, mtime, waiting, now, slot=None,
     session = {"src": "claude", "sid": sid, "cwd": cwd,
                "title": session_title(path) or (waiting or {}).get("title") or "",
                "state": act["state"], "doing": act["doing"], "ts": act["ts"] or mtime,
+               "bash": act.get("bash") or [],
                "children": _subagent_tree(session_dir, now)}
     if slot is not None:
         _apply_registry_status(session, slot, procs, now)
