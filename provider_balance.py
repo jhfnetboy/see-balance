@@ -2009,7 +2009,7 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
     """返回 (情绪, 气泡文字)。看 Claude 的用量；优先级：开心 > 献爱心 > 生气 > 冲刺 > 鼓励 > 日常。
 
     周额度用完排最前：用完了就该庆祝，再提醒“慢点用”已没有意义。
-    传了 data（全部订阅）时，劝歇的同时指一家有余量的订阅去用。
+    劝歇只提醒，不推荐别家（换哪家看底下的调度建议）；传了 data（全部订阅）时用来判断要不要劝冲刺 / 多用。
     """
     now = now or time.time()
     if not cl or "error" in cl:
@@ -2019,13 +2019,10 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
     fh_pct = fh.get("pct")
     pct    = wk.get("pct")
     stats  = sub_status(data, now, hist) if data else []
-    alt    = best_spare(stats, "claude")
 
     if pct is not None and float(pct) >= PET_HAPPY_PCT:
         return "happy", "Claude 周额度用完啦！好棒！"
     if fh_pct is not None and float(fh_pct) >= EXHAUSTED_PCT:   # 和调度建议同一口径
-        if alt:
-            return "caring", f"5h 用光啦，试试 {alt['short']} 吧？♥"
         return "caring", "5h 额度用光啦，起来走走吧 ♥"
     if proj and proj[1] > PACE_FAST_PCT:   # 只提醒；换哪家看底下的调度建议
         return "caring", f"照这样到期要用 {proj[1]:.0f}% 啦 ♥"
@@ -2035,8 +2032,6 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
         if r and r["per_hour"] > 0.005 and reset_in_h >= 0.25:
             exhaust_h = max(0.0, 100.0 - float(fh_pct)) / r["per_hour"]
             if exhaust_h < reset_in_h:
-                if alt:
-                    return "caring", f"5h {fmt_countdown(exhaust_h * 3600)} 后见底，试试 {alt['short']}？♥"
                 return "caring", f"5h 额度 {fmt_countdown(exhaust_h * 3600)} 后见底，慢点 ♥"
 
     angry = (pet_state or {}).get("angry") or {}
@@ -2153,7 +2148,7 @@ def pet_draw(pet_lines, top, col):
 def pet_demo():
     """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
     view  = PetView()
-    shows = [("caring", "要用到 135% 啦，试试 Grok？♥"), ("happy", "Claude 周额度用完啦！好棒！"),
+    shows = [("caring", "照这样到期要用 135% 啦 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "剩 45% 要过期啦，试试 Opus？"),
              ("encourage", "还剩 62% 呢，多用用嘛～加油！"),
              ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒"),
