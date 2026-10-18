@@ -1937,6 +1937,10 @@ PET_FRAMES = {
 }
 
 # 日常小动作：(气泡文字, 帧序列)；没别的情绪时每隔几秒随机换一个
+# 用量情绪（劝歇、鼓励、生气……）会一连挂好几天，一直显示就把别的小动作都挡住了：
+# 变了先说 USAGE_MOOD_FIRST 秒，之后每 USAGE_MOOD_EVERY 秒再说 USAGE_MOOD_SHOW 秒，其余时间做日常小动作
+USAGE_MOOD_FIRST, USAGE_MOOD_EVERY, USAGE_MOOD_SHOW = 20, 180, 10
+
 PET_IDLE = [
     ("发呆中…",         [_pf()] * 5 + [_BLINK]),
     ("摇尾巴～",        [_pf(), _pf(t="∽"), _pf(), _pf(t=" ~")]),
@@ -2023,10 +2027,8 @@ def claude_pet_mood(cl, hist, pet_state, now=None, data=None):
         if alt:
             return "caring", f"5h 用光啦，试试 {alt['short']} 吧？♥"
         return "caring", "5h 额度用光啦，起来走走吧 ♥"
-    if proj and proj[1] > PACE_FAST_PCT:
-        if alt:
-            return "caring", f"要用到 {proj[1]:.0f}% 啦，试试 {alt['short']}？♥"
-        return "caring", f"照这样到期要用 {proj[1]:.0f}%，歇一歇 ♥"
+    if proj and proj[1] > PACE_FAST_PCT:   # 只提醒；换哪家看底下的调度建议
+        return "caring", f"照这样到期要用 {proj[1]:.0f}% 啦 ♥"
     if fh_pct is not None and fh.get("reset_at"):
         r          = burn_rate(hist, "claude_5h", 5 * 3600)
         reset_in_h = max(0.0, fh["reset_at"] - now) / 3600.0
@@ -3128,7 +3130,12 @@ def main():
         if update_prompt():
             state["pet"].set_mood("update", f"新版本 v{state['update_ver']}！u 立即升级\nk 跳过本次 · n 不要提醒")
             return
-        mood = state.get("usage_mood") or ("idle", None)
+        mood, now = state.get("usage_mood") or ("idle", None), time.time()
+        if mood != state.get("usage_shown"):     # 用量情绪变了：从头开始算，先说一会儿
+            state["usage_shown"], state["usage_since"] = mood, now
+        age = now - state["usage_since"]
+        if mood[0] != "idle" and age >= USAGE_MOOD_FIRST and (age - USAGE_MOOD_FIRST) % USAGE_MOOD_EVERY >= USAGE_MOOD_SHOW:
+            mood = ("idle", None)                # 没轮到就做日常小动作
         if mood[0] == "idle" and state.get("update_hint") and not state.get("can_update"):
             mood = ("encourage", "有新版本啦，看看底下～")
         state["pet"].set_mood(*mood)
@@ -3304,6 +3311,9 @@ def main():
                 paint()               # 底部“等了多久”按分钟走
             elif len(state.get("attention") or []) > 1:
                 set_pet_mood()        # 气泡轮到下一个会话（没到点就不变）
+        if not state.get("attention") and not state.get("busy") and now - state.get("mood_at", 0) >= 1:
+            state["mood_at"] = now    # 用量提醒该说或该停了（没到点就不变）
+            set_pet_mood()
         if pet_mode and state["pet_visible"]:
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排
