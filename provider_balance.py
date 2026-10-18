@@ -2527,18 +2527,25 @@ elif ev == "PermissionRequest":  # 决策框刚弹出来：记下要你决定的
         rec["tsize"] = os.stat(rec["transcript"]).st_size
     except OSError:
         pass
-    if rec["src"] == "claude" and pet_alive(5):   # 宠物开着：这一框可以在宠物上决定
-        rec["rid"] = f"{time.time_ns()}-{os.getpid()}"
+    # 宠物上看不全的（超长的命令 / 问题 / 选项，或者计划——只记了标题）记成 cut：只显示，不让在宠物上决定
     if tool == "AskUserQuestion":
-        rec["qs"] = [{"q": str(q.get("question") or "")[:200], "multi": bool(q.get("multiSelect")),
-                      "opts": [str(o.get("label") or "")[:40] for o in (q.get("options") or []) if isinstance(o, dict)][:6]}
-                     for q in (ti.get("questions") or []) if isinstance(q, dict)][:4]
+        qs = [q for q in (ti.get("questions") or []) if isinstance(q, dict)]
+        rec["qs"] = [{"q": str(q.get("question") or "")[:500], "multi": bool(q.get("multiSelect")),
+                      "opts": [str(o.get("label") or "")[:100] for o in (q.get("options") or []) if isinstance(o, dict)][:9]}
+                     for q in qs][:4]
+        rec["cut"] = len(qs) > 4 or any(len(str(q.get("question") or "")) > 500 or len(q.get("options") or []) > 9
+                                        or any(len(str(o.get("label") or "")) > 100 for o in (q.get("options") or [])
+                                               if isinstance(o, dict)) for q in qs)
     elif tool == "ExitPlanMode":   # 只记计划的第一行（一般是标题）
         rec["what"] = next((l.strip().lstrip("#").strip() for l in str(ti.get("plan") or "").splitlines() if l.strip()), "")[:200]
-    else:                          # 命令 / 文件 / 网址；认不出的工具记一小段输入
+        rec["cut"] = True
+    else:                          # 命令 / 文件 / 网址；认不出的工具记一段输入
         v = next((ti[k] for k in ("command", "file_path", "notebook_path", "url", "path", "pattern", "query")
                   if isinstance(ti.get(k), str) and ti[k]), None)
-        rec["what"] = (v if v is not None else json.dumps(ti, ensure_ascii=False))[:200]
+        full = v if v is not None else json.dumps(ti, ensure_ascii=False)
+        rec["what"], rec["cut"] = full[:1000], len(full) > 1000
+    if rec["src"] == "claude" and not rec["cut"] and pet_alive(5):   # 宠物开着、看得全：这一框可以在宠物上决定
+        rec["rid"] = f"{time.time_ns()}-{os.getpid()}"
 elif ev == "Stop":               # 最后一句是不是在问你：之后的“空闲等待”才算在等你回复
     tail = str(e.get("last_assistant_message") or "")[-400:].rstrip().rstrip("\"'”’)）】*_` ")[-300:]   # 先截短：长文本上正则会很慢
     m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
@@ -2857,7 +2864,7 @@ def attention_items(now=None):
             s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "",
                          "kind": DECIDE_KINDS.get(tool, "确认"), "ts": float(r.get("ts") or 0), "msg": "",
                          "tool": tool, "what": r.get("what") or "", "qs": r.get("qs") or [], "rid": r.get("rid") or "",
-                         "tsize": r.get("tsize"),
+                         "tsize": r.get("tsize"), "cut": bool(r.get("cut")),
                          "transcript": r.get("transcript") or "", "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Notification":
             typ  = r.get("type") or ""
@@ -3012,10 +3019,14 @@ def attention_lines(items, now=None, focus=None, qi=0, picks=None):
         what   = f"：{_clean(w['msg'])}" if w["msg"] and not detail else ""
         mine   = w is focus and decidable(w, now)
         out.append(f"{'👉' if mine else '🔔'} {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
-        if mine:
-            detail = decision_lines(w, len(items), qi, picks)
-        elif decidable(w, now) and len(items) > 1:
+        if mine:   # 要在宠物上决定的：内容一个字都不截，看清楚再按
+            out += [f"     {d}" for d in decision_lines(w, len(items), qi, picks)]
+            continue
+        if decidable(w, now) and len(items) > 1:
             detail = detail + ["（按 Tab 切过来，就能在这里决定）"]
+        elif w.get("cut"):
+            detail = detail + [f"（{'计划全文' if w.get('tool') == 'ExitPlanMode' else '内容太长'}在宠物上看不全，"
+                               f"请回 {_session_label(w)} 那个会话里看完再决定）"]
         out += [f"     {_clip(d, 200)}" for d in detail]
     if len(items) > 5:
         out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
@@ -3118,8 +3129,10 @@ def main():
     def set_pet_mood():
         """会话在等你最优先，其次升级选项（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
         if state.get("attention"):   # 刚按过键：固定显示选中的那个会话，不轮播
+            # 有能在宠物上决定的框：气泡固定显示 👉 选中的那个，数字键按的就是气泡上这个；都不能决定时才轮播
             w    = focused()
-            pick = state["attention"].index(w) if time.time() - state["touched"] < 30 else None
+            pin  = time.time() - state["touched"] < 30 or any(decidable(x) for x in state["attention"])
+            pick = state["attention"].index(w) if pin else None
             state["pet"].set_mood("call", attention_bubble(state["attention"], pick=pick))
             return
         if update_prompt():
@@ -3239,15 +3252,16 @@ def main():
         except OSError:
             pass
         state["decide_msg"], state["pick_for"] = (msg, time.time()), None
+        state["cooldown"] = time.time() + 1.5   # 交完别让连按 / 按住的数字落到下一个会话上
         refresh_attention()
         set_pet_mood()
         paint()
 
     def decide_key(ch):
-        """数字选选项 / 允许拒绝，回车提交多选，Tab 换下一个会话。"""
+        """数字选选项 / 允许拒绝，回车提交多选，Tab 换下一个会话。交出了决定返回 True。"""
         items = state.get("attention") or []
-        if not items:
-            return
+        if not items or (ch != "\t" and time.time() < state.get("cooldown", 0)):
+            return False
         sync_focus()
         w = focused()
         state["touched"] = time.time()
@@ -3256,31 +3270,33 @@ def main():
             state["focus"] = (nxt["src"], nxt["sid"])
             set_pet_mood()
             paint()
-            return
+            return False
         if not decidable(w):
-            return
+            return False
         if not w.get("qs"):
             if ch in ("1", "2"):
                 submit(w, {"allow": ch == "1"})
-            return
+                return True
+            return False
         qi, q = state["qi"], w["qs"][state["qi"]]
         picks = state["picks"].setdefault(qi, [])
         if ch.isdigit():
             k = int(ch) - 1
             if k >= len(q.get("opts") or []):
-                return
+                return False
             if q.get("multi"):   # 多选：按一下选上，再按一下取消，选好按回车
                 picks.remove(k) if k in picks else picks.append(k)
                 paint()
-                return
+                return False
             picks[:] = [k]
         elif not (q.get("multi") and picks):
-            return
+            return False
         if qi + 1 < len(w["qs"]):   # 还有下一道题
             state["qi"] = qi + 1
             paint()
-            return
+            return False
         submit(w, {"allow": True, "picks": [sorted(state["picks"].get(j, [])) for j in range(len(w["qs"]))]})
+        return True
 
     def pump(timeout):
         """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
@@ -3323,8 +3339,8 @@ def main():
             return None
         for ch in keys.lower():
             if ch in "123456789\t\r\n":
-                if state.get("attention"):
-                    decide_key(ch)
+                if state.get("attention") and decide_key(ch):
+                    break             # 一次只交一个决定：同一批按键里剩下的不再往下个会话落
                 continue
             if ch == "q":
                 return "quit"
