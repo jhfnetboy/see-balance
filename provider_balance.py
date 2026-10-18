@@ -2158,6 +2158,7 @@ def pet_merge_static(text: str, pet_lines, cols: int) -> str:
 #
 # 用量页右下角的宠物不动。这一页只有表格：状态、会话名、在做什么、时长。
 # 每个单元格只按自己的列宽裁一次（至多一个「…」），拼好的行不再整行裁。
+# 名称列按这一屏里最宽的名字定宽（上限约 50 列），剩下的全给「在做什么」。
 
 # 等你 > 运行 > 思考 > 自己空闲但还在等子 agent > 空闲 > 完成
 # 「等子」不是某一行的状态符号，只参与会话头的排序
@@ -2363,23 +2364,57 @@ def _fit_groups(groups, slots):
     return shown, 0
 
 
-def _table_widths(cols, stat_need, dur_need):
+def _table_widths(cols, stat_need, dur_need, name_need=0):
     """(indent, stat_w, name_w, doing_w, dur_w, gap)。拼起来正好是 cols 列。
 
-    先保证四列都在、名称和「在做什么」都至少 4 列；放不下再裁状态 / 时长，最后才拿掉「在做什么」。
+    名称列等于这一屏 row["name"] 里最宽的一格（树前缀在状态列，不重复算）：
+    不超过 50，至少表头「会话 / agent」。剩下的宽度全部给「在做什么」。
+
+    窄到放不下时，先把名称收到约 20（name_need 更小就收到 name_need），
+    让「在做什么」保持 16 列；还不够再把「在做什么」收到 16 以下，名称停在这个下限。
+    两列都还要至少 4 列——为了守住这 4 列，名称可以再往下收。
+    再守不住就裁状态 / 时长，最后才拿掉「在做什么」。
     """
+    # 宽屏名称最多 50 列；再窄先收到约 20，然后才把「在做什么」收到 16 以下
+    name_cap, name_floor_at, doing_keep, side_min = 50, 20, 16, 4
+    header_w = display_width("会话 / agent")
+    name_need = max(0, int(name_need))
+    name_want = min(name_cap, max(name_need, header_w, 1))
+    if name_need <= 0:
+        name_floor = 1
+    elif name_need < name_floor_at:
+        name_floor = name_need
+    else:
+        name_floor = name_floor_at
+    name_floor = max(1, min(name_floor, name_want))
+
+    def split(elastic):
+        """elastic >= 2。名称和「在做什么」加起来正好是 elastic。"""
+        if elastic >= name_want + doing_keep:
+            name_w = name_want
+        elif elastic >= name_floor + doing_keep:
+            name_w = elastic - doing_keep
+        else:
+            name_w = min(name_floor, elastic - 1)
+        doing_w = elastic - name_w
+        # 原来的下限：两列都至少 4，先不裁状态 / 时长
+        if doing_w < side_min and elastic >= side_min * 2:
+            name_w = elastic - side_min
+            doing_w = side_min
+        if name_w < 1:
+            name_w, doing_w = 1, elastic - 1
+        elif doing_w < 1:
+            name_w, doing_w = elastic - 1, 1
+        return name_w, doing_w
+
     def layout(indent, stat_w, dur_w, gap, doing_on):
-        # 状态 | 名称 | [在做什么 |] 时长。两列弹性字段夹在中间，间隔数是 2 或 3
+        # 状态 | 名称 | [在做什么 |] 时长。间隔数是 2 或 3
         gaps_n = 2 + int(doing_on)
         elastic = cols - indent - stat_w - dur_w - gap * gaps_n
         if elastic < (2 if doing_on else 1) or stat_w < 1 or dur_w < 1:
             return None
         if doing_on:
-            # 名称略宽于「在做什么」：先看清是谁，长命令再裁
-            name_w = max(1, elastic * 3 // 5)
-            doing_w = elastic - name_w
-            if doing_w < 1:
-                name_w, doing_w = elastic - 1, 1
+            name_w, doing_w = split(elastic)
         else:
             name_w, doing_w = elastic, 0
         return (indent, stat_w, name_w, doing_w, dur_w, gap)
@@ -2420,11 +2455,16 @@ def _table_widths(cols, stat_need, dur_need):
 
 
 def _needs(rows):
-    stat, dur = display_width("状态"), display_width("时长")
+    """这一屏状态、时长、名称的内容宽度。名称只量 row["name"]。
+
+    树前缀写在状态单元格上，已经算进状态列，不加进名称。
+    """
+    stat, dur, name = display_width("状态"), display_width("时长"), 0
     for row in rows:
         stat = max(stat, display_width(row["stat"]))
         dur = max(dur, display_width(row["dur"]))
-    return stat, dur
+        name = max(name, display_width(row["name"]))
+    return stat, dur, name
 
 
 def _table_cells(stat, name, doing, dur, spec):
@@ -2509,6 +2549,7 @@ def session_lines(sessions, cols, rows, filt=None):
     并写进标题（「会话 · Agent24 · …」）。None 或空串不过滤，也不读环境变量。
     一屏放不下时等你 > 运行 > 思考 > 等子 agent > 空闲，多出来的会话收成一行。
     返回的每行显示宽度不超过 cols。每个单元格至多一个「…」。
+    名称列按这一屏里最宽的名字定宽（不超过约 50 列，至少表头），剩下的给「在做什么」。
     """
     cols, rows = max(1, int(cols or 1)), max(1, int(rows or 1))
     parts = _filt_parts(filt)
