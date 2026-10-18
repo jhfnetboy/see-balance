@@ -7,6 +7,7 @@ see-balance — query usage/balance for AI providers.
   Claude      : GET  api.anthropic.com/api/oauth/usage        (Keychain OAuth)
   Antigravity : POST daily-cloudcode-pa.googleapis.com        (Keychain / Google OAuth)
   Grok (xAI)  : GET  cli-chat-proxy.grok.com/v1/billing       (~/.grok/auth.json or XAI_API_KEY)
+  OpenCode    : GET  api.anthropic.com/v1/models + local opencode.db spend  (opencode auth.json)
 
 Usage:
   python3 provider_balance.py                  # one-shot, human-readable
@@ -43,7 +44,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.2.2"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.3.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -146,6 +147,20 @@ def load_env_grok_key():
                     val = line.split("=", 1)[1].strip().strip('"').strip("'")
                     if val:
                         return val
+    return ""
+
+def load_env_anthropic_admin_key():
+    """Load ANTHROPIC_ADMIN_KEY from env → ~/.see-balance.env（查 opencode 那个 key 的过期时间用，可选）。"""
+    val = os.environ.get("ANTHROPIC_ADMIN_KEY", "")
+    if val:
+        return val.strip('"').strip("'")
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("ANTHROPIC_ADMIN_KEY="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
     return ""
 
 def load_env_grok_bot_token():
@@ -1287,6 +1302,111 @@ def fetch_grok():
 
     return {"error": err or "auth failed"}
 
+# ── OpenCode（Anthropic API key）────────────────────────────────────────────
+#
+# Anthropic 没有给普通 API key 查余额的接口：这里只验 key 是否还能用（GET /v1/models，不耗 token），
+# 花了多少从 opencode 自己的本地库里按消息累加（opencode 每条回复都记了 cost 和 tokens）。
+
+OPENCODE_DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode"
+
+def _opencode_auth():
+    try:
+        with open(OPENCODE_DATA_DIR / "auth.json") as f:
+            entry = json.load(f).get("anthropic")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return entry if isinstance(entry, dict) else None
+
+def _opencode_spend(now=None):
+    """opencode 本地库里 anthropic 回复的花费：今天 / 近 7 天 / 近 30 天。读不了返回 None。"""
+    import sqlite3
+    db = OPENCODE_DATA_DIR / "opencode.db"
+    if not db.exists():
+        return None
+    now       = now or time.time()
+    day_start = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    spans     = {"today": day_start, "7d": now - 7 * 86400, "30d": now - 30 * 86400}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = conn.execute(
+                "SELECT time_created, json_extract(data, '$.cost'),"
+                " json_extract(data, '$.tokens.input'), json_extract(data, '$.tokens.output'), json_extract(data, '$.tokens.reasoning'),"
+                " json_extract(data, '$.tokens.cache.read'), json_extract(data, '$.tokens.cache.write')"
+                " FROM message WHERE time_created >= ?"
+                " AND json_extract(data, '$.role') = 'assistant'"
+                " AND json_extract(data, '$.providerID') = 'anthropic'",
+                (int(spans["30d"] * 1000),)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    out = {k: {"cost": 0.0, "tokens": 0, "msgs": 0} for k in spans}
+    for ts_ms, cost, *toks in rows:
+        for k, start in spans.items():
+            if (ts_ms or 0) / 1000 >= start:
+                out[k]["cost"]   += float(cost or 0)
+                out[k]["tokens"] += sum(int(t or 0) for t in toks)
+                out[k]["msgs"]   += 1
+    for v in out.values():
+        v["cost"] = round(v["cost"], 4)
+    return out
+
+OPENCODE_KEY_EXPIRY_WARN_SEC = 7 * 86400   # key 离过期不足此时长就提醒
+
+def _anthropic_key_info(key, admin_key):
+    """用 Admin API 列出组织里的 key，按 partial_key_hint（如 sk-ant-api03-R2D...igAA）对上这个 key。"""
+    after = None
+    for _ in range(10):   # 最多翻 10 页（1000 个 key）
+        url = "https://api.anthropic.com/v1/organizations/api_keys?limit=100" + (f"&after_id={after}" if after else "")
+        status, obj = http_get(url, headers={"x-api-key": admin_key, "anthropic-version": "2023-06-01"})
+        if status != 200 or not isinstance(obj, dict):
+            err = obj.get("_transport_error") if isinstance(obj, dict) and obj.get("_transport_error") else f"http {status}"
+            return None, f"Admin API 查询失败：{err}"
+        for k in obj.get("data") or []:
+            head, sep, tail = (k.get("partial_key_hint") or "").partition("...")
+            if sep and key.startswith(head) and key.endswith(tail):
+                return k, None
+        if not obj.get("has_more") or not obj.get("last_id"):
+            break
+        after = obj["last_id"]
+    return None, "Admin API 里没找到这个 key（是不是别的组织的？）"
+
+def fetch_opencode():
+    auth = _opencode_auth()
+    if not auth:
+        return {"error": "no anthropic auth in opencode (run `opencode auth login`)"}
+    out = {"spend": _opencode_spend()}
+    if auth.get("type") == "oauth":
+        out["auth"] = "Claude 订阅 (OAuth)"
+        out["note"] = "走的是 Claude 订阅，额度和上面的 Claude Code 共用"
+        return out
+    key = auth.get("key") or ""
+    if not key:
+        return {"error": "opencode anthropic auth has no key"}
+    out["auth"] = f"API key …{key[-4:]}"
+    status, obj = http_get("https://api.anthropic.com/v1/models?limit=1",
+                           headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
+    if status == 200:
+        out["key_ok"] = True
+    elif status in (401, 403):
+        out["key_ok"] = False
+        out["warning"] = f"key 无效或已停用 (http {status})"
+    else:
+        err = obj.get("_transport_error") if isinstance(obj, dict) and obj.get("_transport_error") else f"http {status}"
+        out["warning"] = f"key 校验失败：{err}"
+    admin_key = load_env_anthropic_admin_key()
+    if admin_key:
+        info, err = _anthropic_key_info(key, admin_key)
+        if info:
+            out["key_name"]   = info.get("name")
+            out["key_status"] = info.get("status")
+            out["expires_at"] = parse_reset(info.get("expires_at"))   # None = 永不过期
+            out["expiry_known"] = True
+        else:
+            out["expiry_error"] = err
+    return out
+
 # ── Render ────────────────────────────────────────────────────────────────────
 
 # ── 跨订阅调度建议 ───────────────────────────────────────────────────────────
@@ -1435,7 +1555,7 @@ def dispatch_advice(data, now=None, hist=None):
     return lines
 
 
-def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
+def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None, oc=None):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
 
@@ -1598,6 +1718,10 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
             lines.append(f"     on-demand   ${gr['on_demand_used']:.2f} / ${gr.get('on_demand_cap', 0):.2f}")
     lines.append("")
 
+    if oc is not None:
+        lines += opencode_lines(oc)
+        lines.append("")
+
     advice = dispatch_advice({"codex": cx, "claude": cl, "agy": agy, "grok": gr}, hist=hist)
     if advice:
         lines.append("  🧭 调度建议")
@@ -1605,6 +1729,47 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None):
         lines.append("")
     lines.append("═" * 54)
     return "\n".join(lines)
+
+def _fmt_tokens(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(n)
+
+def opencode_expiry_text(oc, now=None):
+    """key 过期时间：配了 ANTHROPIC_ADMIN_KEY 才有；没配返回 None。"""
+    if oc.get("expiry_error"):
+        return f"— ({oc['expiry_error']})"
+    if not oc.get("expiry_known"):
+        return None
+    name = f"「{oc['key_name']}」" if oc.get("key_name") else ""
+    if oc.get("key_status") not in (None, "active"):
+        return f"⚠ {name}状态 {oc['key_status']}"
+    ts = oc.get("expires_at")
+    if not ts:
+        return f"{name}永不过期"
+    left = ts - (now or time.time())
+    when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    if left <= 0:
+        return f"⚠ {name}已于 {when} 过期"
+    flag = "⚠ " if left < OPENCODE_KEY_EXPIRY_WARN_SEC else ""
+    return f"{flag}{name}{when}（还剩 {fmt_countdown(left)}）"
+
+def opencode_lines(oc):
+    lines = ["  ⚪ OpenCode (Anthropic)"]
+    if "error" in oc:
+        return lines + [f"     ⚠ {oc['error']}"]
+    status = {True: " ✓ 可用", False: " ✗ 不可用"}.get(oc.get("key_ok"), "")
+    lines.append(f"     auth        {oc.get('auth', '?')}{status}")
+    if oc.get("warning"): lines.append(f"     ⚠ {oc['warning']}")
+    exp = opencode_expiry_text(oc)
+    if exp: lines.append(f"     expires     {exp}")
+    sp = oc.get("spend")
+    if sp:
+        lines.append("     spent       " + "   ".join(
+            f"{lbl} ${sp[k]['cost']:.2f} ({_fmt_tokens(sp[k]['tokens'])} tok)"
+            for k, lbl in (("today", "今天"), ("7d", "7天"), ("30d", "30天"))))
+    else:
+        lines.append("     spent       — (读不到 opencode 本地库)")
+    lines.append("     note        " + (oc.get("note") or "按 opencode 本地记录估算；余额请到 console.anthropic.com 查看"))
+    return lines
 
 def render_compact(data, prev_snap, today_bl: dict, hist=None):
     ds  = data.get("deepseek", {})
@@ -1680,6 +1845,22 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
                     parts.append("✓ online")
             if provider.get("warning"):
                 parts.append(f"⚠ {provider['warning']}")
+            print("  ".join(parts))
+
+    oc = data.get("opencode")
+    if oc is not None:
+        if "error" in oc:
+            print(f"OC ⚠ {oc['error']}")
+        else:
+            sp    = oc.get("spend") or {}
+            parts = [f"OC [{oc.get('auth', '?')}]"]
+            if sp:
+                parts.append(f"today ${sp['today']['cost']:.2f}  7d ${sp['7d']['cost']:.2f}  30d ${sp['30d']['cost']:.2f}")
+            exp = opencode_expiry_text(oc)
+            if exp:
+                parts.append(f"expires {exp}")
+            if oc.get("warning"):
+                parts.append(f"⚠ {oc['warning']}")
             print("  ".join(parts))
 
 # ── Pet（Claude 用量宠物）─────────────────────────────────────────────────────
@@ -2625,6 +2806,7 @@ def collect(update=True):
         "claude":   fetch_claude(),
         "agy":      fetch_agy(),
         "grok":     fetch_grok(),
+        "opencode": fetch_opencode(),
     }
     if update:
         data["update"] = check_update(load_state().get("update"))
@@ -2881,7 +3063,7 @@ def main():
 
     def do_query(data=None):
         full      = state["full"]
-        prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok") if k in full}
+        prev_data = {k: full[k] for k in ("deepseek", "codex", "claude", "agy", "grok", "opencode") if k in full}
         data      = data if data is not None else collect(update_mode)
 
         # ── History（实测消耗速率的数据源）──────────────────────────────────
@@ -2956,7 +3138,7 @@ def main():
                 body = buf.getvalue().rstrip("\n")
             else:
                 body = render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
-                                  prev_data, today_bl, hist)
+                                  prev_data, today_bl, hist, oc=data.get("opencode"))
             if interactive:
                 state["body"] = body
                 paint()

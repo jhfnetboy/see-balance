@@ -1,6 +1,6 @@
 # see-balance
 
-查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) 五个 AI provider 的余额和用量。
+查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) / OpenCode (Anthropic API key) 六个 AI provider 的余额和用量。
 
 ## 安装
 
@@ -21,6 +21,8 @@ bash install.sh
 DEEPSEEK_API_KEY=sk-your-key-here
 # 可选：手动指定 XAI_API_KEY
 # XAI_API_KEY=xai-your-key-here
+# 可选：查 opencode 那个 Anthropic key 的过期时间
+# ANTHROPIC_ADMIN_KEY=sk-ant-admin-your-key-here
 
 # 如需代理（VPN 场景）：
 # HTTPS_PROXY=http://127.0.0.1:7890
@@ -32,6 +34,11 @@ DEEPSEEK_API_KEY=sk-your-key-here
 - **Grok (xAI)**：自动读取 `~/.grok/auth.json`（运行 `grok` / `grok login` 生成）或 `XAI_API_KEY`，直连 `cli-chat-proxy.grok.com` 查询：
   - **主周池**（Chat · Imagine · Voice · Build）：7d 使用百分比、进度与重置倒计时；
   - **Grok Bot 池**（Bot / Cursor 独立周额度）：独立周额度不占用主池；支持在 `~/.see-balance.env` 配置 `CURSOR_SESSION_TOKEN` 同步实测用量。
+- **OpenCode (Anthropic)**：自动读取 opencode 的 `~/.local/share/opencode/auth.json`（`opencode auth login` 生成，遵循 `XDG_DATA_HOME`）里的 `anthropic` 条目：
+  - **API key**：用 `GET api.anthropic.com/v1/models` 验 key 是否可用（不耗 token）；Anthropic 没有给普通 API key 查余额的接口，余额请到 [console.anthropic.com](https://console.anthropic.com/settings/billing) 看；
+  - **花费**：从 opencode 本地库 `opencode.db` 只读累加 Anthropic 回复记下的 cost / tokens，显示今天 / 近 7 天 / 近 30 天（只算这台机器上 opencode 的用量，同一个 key 在别处的消耗不在内）；
+  - **过期时间（可选）**：在 `~/.see-balance.env` 里加 `ANTHROPIC_ADMIN_KEY=sk-ant-admin...`（[Console → Admin keys](https://platform.claude.com/settings/admin-keys) 创建，需要组织 admin 权限），就会用 Admin API 按 key 的前后缀对上这个 key，显示名称和到期时间，离过期不足 7 天时标 ⚠。普通 API key 查不了自己的过期时间；
+  - 用 Claude 订阅（OAuth）登录的，额度和 Claude Code 共用，只显示本地花费估算。
 - **Antigravity (AGY)**：自动读取 macOS Keychain / Google OAuth 凭据，识别 `paidTier` 套餐；直连服务端 `retrieveUserQuotaSummary` 读真实配额。
 
 两个互不相通的池，各自带 **5h + weekly** 两个窗口：
@@ -195,6 +202,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.3.0 | 支持 OpenCode 的 Anthropic API key：验 key 是否可用，按 opencode 本地记录统计今天 / 7 天 / 30 天花费；配 `ANTHROPIC_ADMIN_KEY` 后显示 key 的过期时间 |
 | 1.2.2 | README：更新方式与版本记录 |
 | 1.2.1 | 每 10 分钟检查一次更新（`--watch` 期间后台检查，带 ETag，上游没变只回 304） |
 | 1.2.0 | Claude 宠物（升级选项、会话提醒）、跨订阅调度建议、自动更新 |
