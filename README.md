@@ -64,6 +64,7 @@ python3 ~/bin/provider_balance.py --compact    # 每 provider 一行
 python3 ~/bin/provider_balance.py --json       # 原始 JSON
 python3 ~/bin/provider_balance.py --no-pet     # 不显示 Claude 宠物（或设 SEE_BALANCE_PET=0）
 python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的每种情绪
+python3 ~/bin/provider_balance.py --sessions   # 只画一帧「会话」页，不查余额
 python3 ~/bin/provider_balance.py --update     # 马上检查并安装上游最新版
 python3 ~/bin/provider_balance.py --version    # 看当前版本
 python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 SEE_BALANCE_UPDATE=0）
@@ -71,7 +72,7 @@ python3 ~/bin/provider_balance.py --install-hooks    # 开启会话提醒（见�
 python3 ~/bin/provider_balance.py --uninstall-hooks  # 关掉会话提醒
 ```
 
-`--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`s`** 切换宠物（猫 / 兔子 / 小熊），**`r`** 立即刷新，**`q`** 退出；有新版本时还有 **`u`** / **`k`** / **`n`**（见下）。
+`--watch` 在终端里运行时支持快捷键：**`p`** 显示/隐藏宠物，**`s`** 切换宠物（猫 / 兔子 / 小熊），**`t`** 在「用量」和「会话」两页之间切换，**`r`** 立即刷新，**`q`** 退出；有新版本时还有 **`u`** / **`k`** / **`n`**（见下）。
 
 ## 会话提醒
 
@@ -109,6 +110,32 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 - 宠物上的优先级：会话提醒 > 升级选项 > 用量情绪。
 - 日志超过 1MB 时轮换，只保留 12 小时内的记录，还在等的提醒不会丢。
 - Codex、Antigravity 暂时没有可靠的“在等你”信号，还不支持。
+
+## 会话视图
+
+`--watch` 里按 **`t`** 在「用量」（默认）和「会话」之间切换。会话页是一张进程表，进行中的会话和它派出的子 agent 排成树，谁在干活、谁在等你，一眼能看完：
+
+```
+会话 · Agent24 · 3 个会话（1 等你 · 1 运行）· 4 个子 agent       [用量] ‹会话› · t 切换 · q 退出
+
+  状态     会话 / agent                                  在做什么                         时长
+  ◆ 等你   Agent24「CI 修复」                            确认 Bash: git push origin feat/x   3m
+  ● 运行   Agent24-wt-02b「知识组件集成」                Bash: cargo test -p kb           14s
+  ├ ● 运行 codex-review「双审」                          Bash: codex exec …                6m
+  │ └ ○ 思考 general-purpose「核实发现 #2」              —                                12s
+  └ ✓ 完成 grok-review「双审」                                                         1m 前
+  ○ 空闲   Agent24「HANDOFF 文档」                       —                                 18m
+```
+
+- **算进行中的**：Claude Code 的会话记录（`~/.claude/projects/`，遵循 `CLAUDE_CONFIG_DIR`）15 分钟内还有写入，或者正在等你（见「会话提醒」）；日志里已经 `SessionEnd` 的不算。Grok 看 `~/.grok/active_sessions.json`，进程还在才显示，名字写成「项目 的 Grok」（和底部提醒一样；Claude 的会话名不变），只有「空闲」和「等你」，没有子 agent。
+- **子 agent**：挂在派出它的会话下面，树前缀是 `├` / `└` / `│`；它自己再派出的，再缩进一层。记录 10 分钟没更新就收起来；做完的再留 2 分钟，状态是 `✓ 完成`，时长写成 `1m 前`。
+- **状态**：`◆ 等你`，`● 运行`（工具正在跑），`○ 思考`，`○ 空闲`，`✓ 完成`。Grok 用同样的一行。
+- **在做什么**：正在跑的工具和一小段参数（`Bash: git push…`、`Read provider_balance.py`、`Grep <pattern>`、`Agent: 派出 …`）；思考，以及没有活着的子 agent 的空闲，是 `—`；主会话自己空闲、但还有没做完的子 agent 时写成 `等 N 个子 agent`（N 含嵌套，完成的不算，状态仍是 `○ 空闲`）；等你时是要你决定的那一行（和底部提醒同一份，不再重复「等你」）。时长在最右：进行中是 `14s` / `3m`，刚做完的带「前」。
+- **排序**：等你 > 运行 > 思考 > 自己空闲但仍有活着的子 agent > 空闲。子树里更紧急的算在会话头上，做完的不抬优先级。一屏放不下时，多出来的收成一行「…还有 N 个会话」。
+- **过滤**：`SEE_BALANCE_SESSIONS` 是逗号分隔的子串（环境变量或 `~/.see-balance.env`）。会话的目录里含有其中任一个（不区分大小写）才显示；没设或空着就全部显示。`--watch` 和 `--sessions` 都认。设了的话标题会写出过滤词，例如 `SEE_BALANCE_SESSIONS=Agent24` 时是「会话 · Agent24 · …」。
+- 列宽随终端变：名称和「在做什么」分掉剩余宽度，时长右对齐。用量页右下角那只宠物的逻辑不变。
+- `Tab` 和数字键在两页里都照旧：切到在等你的那一框、在宠物上做决定。
+- 只看一眼、不进 `--watch`：`python3 provider_balance.py --sessions`（不查余额）。
 
 ## 自动更新
 
@@ -197,6 +224,7 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 | 变量 | 作用 |
 |---|---|
 | `SEE_BALANCE_STATE` | 换一个 state 文件（测试 / 多账号） |
+| `SEE_BALANCE_SESSIONS` | 会话页只显示目录里含这些子串的会话（逗号分隔，不区分大小写）。例：`SEE_BALANCE_SESSIONS=Agent24`。空着显示全部 |
 | `SEE_BALANCE_UPDATE` | 设成 `0` 关掉每日更新检查 |
 | `SEE_BALANCE_UPDATE_URL` | 换一个更新源（测试用） |
 | `SEE_BALANCE_CLAUDE_SETTINGS` | `--install-hooks` 改哪个 settings 文件（默认 `~/.claude/settings.json`，测试用） |
@@ -220,6 +248,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.5.0 | `--watch` 按 `t` 切换「用量 / 会话」。会话页用一张进程表列出进行中的 Claude Code 会话和它派出的子 agent（Grok 只有会话本身），能看到状态、在做什么、时长；`SEE_BALANCE_SESSIONS` 按目录过滤；`--sessions` 只画一帧、不查余额 |
 | 1.4.0 | 会话提醒显示决策内容（问题和选项、命令 / 文件、计划标题）和会话标题，宠物气泡依次轮播；`--watch` 里可以直接在宠物上做决定（数字选选项、1 允许 / 2 拒绝、Tab 换会话），决定交回对应的会话继续执行；Claude 的 5h / 7d 实测消耗和建议各自紧跟在自己那个窗口下面；宠物的用量提醒不再一直挂着（先说 20 秒，之后每 3 分钟说 10 秒），劝歇只提醒、不再推荐别家 |
 | 1.3.0 | 支持 OpenCode 的 Anthropic API key：验 key 是否可用，按 opencode 本地记录统计今天 / 7 天 / 30 天花费；配 `ANTHROPIC_ADMIN_KEY` 后显示 key 的过期时间 |
 | 1.2.2 | README：更新方式与版本记录 |

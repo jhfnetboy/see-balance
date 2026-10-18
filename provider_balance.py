@@ -17,17 +17,19 @@ Usage:
   python3 provider_balance.py --json           # raw JSON
   python3 provider_balance.py --no-pet         # hide the Claude pet (or SEE_BALANCE_PET=0)
   python3 provider_balance.py --pet-demo       # preview every pet mood, no API calls
+  python3 provider_balance.py --sessions       # print the live session table once, no API calls
   python3 provider_balance.py --update         # install the latest version from upstream main now
   python3 provider_balance.py --version        # print the version
   python3 provider_balance.py --no-update      # skip the daily update check (or SEE_BALANCE_UPDATE=0)
   python3 provider_balance.py --install-hooks  # pet reminds you when a Claude Code / Grok session waits for you
   python3 provider_balance.py --uninstall-hooks
 
-  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear), r refreshes now,
+  In --watch on a terminal: p toggles the pet, s switches pet (cat/bunny/bear),
+  t switches the 用量 / 会话 tab, r refreshes now,
   u installs a downloaded update and restarts, q quits.
 
 Config:
-  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, and proxy settings here
+  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, SEE_BALANCE_SESSIONS, and proxy settings here
   State cached at:     ~/.see-balance/state.json
 
 No secrets ever leave this machine.
@@ -44,7 +46,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.4.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.5.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -178,6 +180,20 @@ def load_env_grok_bot_token():
                     if val:
                         return val
     return ""
+
+def load_env_sessions():
+    """SEE_BALANCE_SESSIONS：逗号分隔的目录子串。环境变量优先，空着再看 ~/.see-balance.env。
+
+    两边都没设或空着返回 []，会话页不过滤。某一段两边的空白会去掉。
+    """
+    val = os.environ.get("SEE_BALANCE_SESSIONS", "")
+    if not val and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SEE_BALANCE_SESSIONS="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    return [p.strip() for p in (val or "").split(",") if p.strip()]
 
 def load_state():
     if STATE_FILE.exists():
@@ -1951,7 +1967,6 @@ PET_IDLE = [
     ("Zzz…",            [_pf(el="-", er="-", x1="z"), _pf(el="-", er="-", x1="zZ"), _pf(el="-", er="-", x1="zZz", x2="z")]),
 ]
 
-
 def display_width(s: str) -> int:
     """终端显示宽度：全角/宽字符算 2 列，组合字符算 0 列。"""
     return sum(0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in "WF" else 1)
@@ -1959,6 +1974,10 @@ def display_width(s: str) -> int:
 
 def _pad(s: str, width: int) -> str:
     return s + " " * max(0, width - display_width(s))
+
+def _rpad(s: str, width: int) -> str:
+    """右对齐。调用方保证 s 的显示宽度不超过 width。"""
+    return " " * max(0, width - display_width(s)) + s
 
 def _clip(s: str, width: int) -> str:
     if display_width(s) <= width:
@@ -2135,6 +2154,444 @@ def pet_merge_static(text: str, pet_lines, cols: int) -> str:
     return "\n".join(lines)
 
 
+# ── 会话表（ps / htop 那种进程表，不画宠物）────────────────────────────────
+#
+# 用量页右下角的宠物不动。这一页只有表格：状态、会话名、在做什么、时长。
+# 每个单元格只按自己的列宽裁一次（至多一个「…」），拼好的行不再整行裁。
+
+# 等你 > 运行 > 思考 > 自己空闲但还在等子 agent > 空闲 > 完成
+# 「等子」不是某一行的状态符号，只参与会话头的排序
+_KIND_RANK = {"等你": 0, "运行": 1, "思考": 2, "等子": 3, "空闲": 4, "完成": 5}
+_KIND_LABEL = {
+    "等你": "◆ 等你",
+    "运行": "● 运行",
+    "思考": "○ 思考",
+    "空闲": "○ 空闲",
+    "完成": "✓ 完成",
+}
+# 标题行右侧的页签。窄到放不下就只留左边的标题，不把这一截裁出省略号
+_SESSION_HINT = "[用量] ‹会话› · t 切换 · q 退出"
+
+
+def _filt_parts(filt):
+    """逗号分隔的过滤词。None / 空串 → []，表示不过滤。不读环境变量。"""
+    if filt is None:
+        return []
+    if isinstance(filt, (list, tuple)):
+        items = filt
+    else:
+        items = str(filt).split(",")
+    return [str(p).strip() for p in items if str(p).strip()]
+
+
+def _cwd_ok(session, parts):
+    """cwd 里含任意一个子串（不区分大小写）才显示。parts 空则全部通过。"""
+    if not parts:
+        return True
+    cwd = str(session.get("cwd") or "").lower()
+    return any(p.lower() in cwd for p in parts)
+
+
+def _node_kind(node):
+    """◆ 等你 / ● 运行（工具在跑）/ ○ 思考 / ○ 空闲 / ✓ 完成。"""
+    state = node.get("state") or "空闲"
+    doing = node.get("doing") or ""
+    if state == "等你":
+        return "等你"
+    if state == "完成" or (isinstance(doing, str) and doing.startswith("✓")):
+        return "完成"
+    if doing == "思考中":
+        return "思考"
+    if state == "工作中":
+        return "运行"
+    return "空闲"
+
+
+def _living_subagents(nodes):
+    """还没做完的子 agent 有几个。嵌套的一起算；完成的节点本身不算，接着数它下面的。"""
+    total = 0
+    for node in nodes or []:
+        if _node_kind(node) != "完成":
+            total += 1
+        total += _living_subagents(node.get("children"))
+    return total
+
+
+def _session_rank(session):
+    """等你 > 运行 > 思考 > 等子 agent > 空闲。
+
+    子树里更紧急的那个算在会话头上；做完的不抬优先级。
+    主会话自己是空闲、子树里也没有更紧急的，但还有活着的子 agent 时，
+    排在运行 / 思考之后、普通空闲之前。
+    """
+    best = _node_kind(session)
+    if best == "完成":
+        best = "空闲"
+
+    def walk(nodes):
+        nonlocal best
+        for node in nodes or []:
+            kind = _node_kind(node)
+            if kind != "完成" and _KIND_RANK[kind] < _KIND_RANK[best]:
+                best = kind
+            walk(node.get("children"))
+
+    walk(session.get("children"))
+    if best == "空闲" and _living_subagents(session.get("children")):
+        best = "等子"
+    return _KIND_RANK[best]
+
+
+def _count_nodes(nodes):
+    n = 0
+    for node in nodes or []:
+        n += 1 + _count_nodes(node.get("children"))
+    return n
+
+
+def _dur_text(ts, done=False, now=None):
+    """进行中写 14s / 3m / 2h05m；刚做完的子 agent 加「前」（1m 前）。"""
+    now = time.time() if now is None else now
+    try:
+        sec = int(now - float(ts))
+    except (TypeError, ValueError):
+        sec = 0
+    sec = max(0, sec)
+    if sec < 60:
+        text = f"{sec}s"
+    elif sec < 3600:
+        text = f"{sec // 60}m"
+    elif sec < 86400:
+        hours, mins = divmod(sec // 60, 60)
+        text = f"{hours}h{mins:02d}m" if mins else f"{hours}h"
+    else:
+        days, hours = divmod(sec // 3600, 24)
+        text = f"{days}d{hours:02d}h" if hours else f"{days}d"
+    return f"{text} 前" if done else text
+
+
+def _doing_text(node):
+    """在做什么。思考 / 空闲是一横；做完了留空（状态列已经是 ✓）；等你时不再重复「等你」。"""
+    kind = _node_kind(node)
+    doing = _clean(node.get("doing"))
+    if kind == "完成":
+        return ""
+    if kind in ("思考", "空闲"):
+        return "—"
+    if kind == "等你":
+        # 状态列已经是「等你」。去掉这个前缀，并把「确认：Bash：…」收成「确认 Bash：…」
+        if doing.startswith("等你"):
+            doing = doing[len("等你"):].lstrip()
+        head, sep, rest = doing.partition("：")
+        if sep and rest and len(head) <= 8 and " " not in head:
+            doing = f"{head} {rest}"
+        return doing.strip() or "—"
+    return doing or "—"
+
+
+def _row_name(node):
+    """会话名。Grok 写成「项目 的 Grok」，和底部提醒同一句式；有标题就嵌在中间。
+    这里不写省略号，名字列按宽度只裁一次。"""
+    if node.get("sid"):
+        title = _clean(node.get("title"))
+        cwd = node.get("cwd") or ""
+        proj = _project({"cwd": cwd}) if cwd else "~"
+        if node.get("src") == "grok":
+            return f"{proj}「{title}」的 Grok" if title else f"{proj} 的 Grok"
+        return proj + (f"「{title}」" if title else "")
+    return _clean(node.get("name")) or "agent"
+
+
+def _row_of(node, prefix):
+    kind = _node_kind(node)
+    return {
+        "stat": prefix + _KIND_LABEL[kind],
+        "name": _row_name(node),
+        "doing": _doing_text(node),
+        "dur": _dur_text(node.get("ts"), done=(kind == "完成")),
+    }
+
+
+def _child_rows(nodes, ancestors_last):
+    """树前缀：├ / └ 分叉，│ 把上面没完的枝接下来。ancestors_last 记下每一层是不是最后一个。"""
+    out, nodes = [], list(nodes or [])
+    for i, node in enumerate(nodes):
+        last = i == len(nodes) - 1
+        prefix = "".join("  " if was_last else "│ " for was_last in ancestors_last)
+        prefix += "└ " if last else "├ "
+        out.append(_row_of(node, prefix))
+        out.extend(_child_rows(node.get("children"), ancestors_last + [last]))
+    return out
+
+
+def _session_group(session):
+    head = _row_of(session, "")
+    # 自己是空闲时状态仍是 ○。下面还有活着的子 agent，就在「在做什么」里写等它们
+    if _node_kind(session) == "空闲":
+        alive = _living_subagents(session.get("children"))
+        if alive:
+            head["doing"] = f"等 {alive} 个子 agent"
+    return [head] + _child_rows(session.get("children"), [])
+
+
+def _fit_groups(groups, slots):
+    """按顺序放会话。返回 (放进去的行组, 没放进去的会话数)。
+
+    后面还有会话放不下时留一行给「…还有 N 个」。第一个会话比空位还高，就先露出上面几行。
+    """
+    if slots <= 0 or not groups:
+        return [], len(groups)
+    if sum(len(group) for group in groups) <= slots:
+        return [list(group) for group in groups], 0
+    shown, used = [], 0
+    for i, group in enumerate(groups):
+        later = len(groups) - i - 1
+        left = slots - used
+        if later == 0:
+            if left > 0:
+                shown.append(group[:left])
+            return shown, 0
+        if len(group) <= left - 1:
+            shown.append(group)
+            used += len(group)
+            continue
+        room = left - 1
+        if room > 0:
+            shown.append(group[:room])
+            return shown, later
+        return shown, later + 1
+    return shown, 0
+
+
+def _table_widths(cols, stat_need, dur_need):
+    """(indent, stat_w, name_w, doing_w, dur_w, gap)。拼起来正好是 cols 列。
+
+    先保证四列都在、名称和「在做什么」都至少 4 列；放不下再裁状态 / 时长，最后才拿掉「在做什么」。
+    """
+    def layout(indent, stat_w, dur_w, gap, doing_on):
+        # 状态 | 名称 | [在做什么 |] 时长。两列弹性字段夹在中间，间隔数是 2 或 3
+        gaps_n = 2 + int(doing_on)
+        elastic = cols - indent - stat_w - dur_w - gap * gaps_n
+        if elastic < (2 if doing_on else 1) or stat_w < 1 or dur_w < 1:
+            return None
+        if doing_on:
+            # 名称略宽于「在做什么」：先看清是谁，长命令再裁
+            name_w = max(1, elastic * 3 // 5)
+            doing_w = elastic - name_w
+            if doing_w < 1:
+                name_w, doing_w = elastic - 1, 1
+        else:
+            name_w, doing_w = elastic, 0
+        return (indent, stat_w, name_w, doing_w, dur_w, gap)
+
+    gap_opts = (2, 1) if cols >= 72 else (1,)
+    indent_opts = (2, 0) if cols >= 48 else (0,)
+    stat_cap = min(max(int(stat_need), 1), max(1, cols))
+    dur_cap = min(max(int(dur_need), 1), max(1, cols))
+
+    def search(doing_on, min_side, shrink):
+        stats = range(stat_cap, 0, -1) if shrink else (stat_cap,)
+        durs = range(dur_cap, 0, -1) if shrink else (dur_cap,)
+        for stat_w in stats:
+            for dur_w in durs:
+                for gap in gap_opts:
+                    for indent in indent_opts:
+                        spec = layout(indent, stat_w, dur_w, gap, doing_on)
+                        if not spec:
+                            continue
+                        name_w, doing_w = spec[2], spec[3]
+                        side = min(name_w, doing_w) if doing_on else name_w
+                        if side >= min_side:
+                            return spec
+        return None
+
+    for shrink in (False, True):
+        spec = search(True, 4, shrink)
+        if spec:
+            return spec
+    spec = search(True, 1, True)
+    if spec:
+        return spec
+    for shrink in (False, True):
+        spec = search(False, 1, shrink)
+        if spec:
+            return spec
+    return (0, 0, max(1, cols), 0, 0, 0)
+
+
+def _needs(rows):
+    stat, dur = display_width("状态"), display_width("时长")
+    for row in rows:
+        stat = max(stat, display_width(row["stat"]))
+        dur = max(dur, display_width(row["dur"]))
+    return stat, dur
+
+
+def _table_cells(stat, name, doing, dur, spec):
+    """四个单元格，各裁一次、补到列宽。宽度是 0 的列不出现。"""
+    _indent, stat_w, name_w, doing_w, dur_w, _gap = spec
+    cells = []
+    if stat_w:
+        cells.append(_pad(_clip(stat, stat_w), stat_w))
+    if name_w:
+        cells.append(_pad(_clip(name, name_w), name_w))
+    if doing_w:
+        cells.append(_pad(_clip(doing, doing_w), doing_w))
+    if dur_w:
+        cells.append(_rpad(_clip(dur, dur_w), dur_w))
+    return cells
+
+
+def _join_cells(cells, spec):
+    indent, _stat_w, _name_w, _doing_w, _dur_w, gap = spec
+    body = (" " * gap).join(cells) if gap else "".join(cells)
+    return (" " * indent) + body
+
+
+def _title_line(title, cols):
+    hint = _SESSION_HINT
+    if display_width(hint) + 2 < cols and display_width(title) + 2 + display_width(hint) <= cols:
+        return _pad(title, cols - display_width(hint)) + hint
+    if display_width(title) <= cols:
+        return title
+    return _clip(title, cols)
+
+
+def _overflow_line(hidden, cols):
+    text = f"…还有 {hidden} 个会话"
+    if display_width(text) <= cols:
+        return text
+    # 前导 … 是这句话本身；太窄时改由裁剪加唯一的省略号，避免叠成两个
+    return _clip(f"还有 {hidden} 个会话", max(1, cols))
+
+
+def _clip_lines(text, width):
+    """一段文字里的每一行收到 width 列以内。没超的原样留着，超了的用 _clip 裁一次。"""
+    return "\n".join(line if display_width(line) <= width else _clip(line, width)
+                     for line in str(text).split("\n"))
+
+
+def _sessions_title(sessions, parts):
+    """会话 · [过滤词 ·] N 个会话[（N 等你 · N 运行）][· N 个子 agent]。
+
+    括号只数会话自己的状态：等你，以及正在跑工具或思考的（都记成「运行」）。
+    哪一项是 0 就不写；两项都是 0 就没有括号。子 agent 是 0 也不写。
+    有括号时右括号后直接接「· N」（「）· 3 个子 agent」）；没有括号时仍用「 · 」。
+    """
+    n_wait = n_run = 0
+    for session in sessions:
+        kind = _node_kind(session)
+        if kind == "等你":
+            n_wait += 1
+        elif kind in ("运行", "思考"):
+            n_run += 1
+    n_sub = sum(_count_nodes(session.get("children")) for session in sessions)
+    title = "会话"
+    if parts:
+        title += " · " + ",".join(parts)
+    title += f" · {len(sessions)} 个会话"
+    detail = []
+    if n_wait:
+        detail.append(f"{n_wait} 等你")
+    if n_run:
+        detail.append(f"{n_run} 运行")
+    if detail:
+        title += "（" + " · ".join(detail) + "）"
+    if n_sub:
+        title += f"{'' if detail else ' '}· {n_sub} 个子 agent"
+    return title
+
+
+def session_lines(sessions, cols, rows, filt=None):
+    """会话页要画的行（标题、表头、进程树）。不读文件、不画宠物。
+
+    filt 是逗号分隔的目录子串：传了就只留 cwd 含其中任一个的会话（不区分大小写），
+    并写进标题（「会话 · Agent24 · …」）。None 或空串不过滤，也不读环境变量。
+    一屏放不下时等你 > 运行 > 思考 > 等子 agent > 空闲，多出来的会话收成一行。
+    返回的每行显示宽度不超过 cols。每个单元格至多一个「…」。
+    """
+    cols, rows = max(1, int(cols or 1)), max(1, int(rows or 1))
+    parts = _filt_parts(filt)
+    sessions = [s for s in (sessions or []) if _cwd_ok(s, parts)]
+    head = _title_line(_sessions_title(sessions, parts), cols)
+    if not sessions:
+        lines = [head]
+        if rows >= 3:
+            lines += ["", "没有进行中的会话"]
+        elif rows >= 2:
+            lines.append("没有进行中的会话")
+        return lines[:rows]
+    if rows <= 1:
+        return [head]
+
+    ranked = sorted(sessions, key=lambda s: (
+        _session_rank(s), -float(s.get("ts") or 0), str(s.get("sid") or "")))
+    groups = [_session_group(s) for s in ranked]
+    remain = rows - 1
+    if remain >= 3:
+        use_blank, use_head, slots = True, True, remain - 2
+    elif remain == 2:
+        use_blank, use_head, slots = False, True, 1
+    else:
+        use_blank, use_head, slots = False, False, remain
+    shown, hidden = _fit_groups(groups, slots)
+    flat = [row for group in shown for row in group]
+    spec = _table_widths(cols, *_needs(flat))
+    lines = [head]
+    if use_blank:
+        lines.append("")
+    if use_head:
+        lines.append(_join_cells(_table_cells("状态", "会话 / agent", "在做什么", "时长", spec), spec))
+    for row in flat:
+        lines.append(_join_cells(
+            _table_cells(row["stat"], row["name"], row["doing"], row["dur"], spec), spec))
+    if hidden and slots > 0:
+        lines.append(_overflow_line(hidden, cols))
+    return lines[:rows]
+
+
+def _demo_sessions(now=None):
+    """--pet-demo 用的假会话：一个在等你的、一棵子 agent、一个空闲的、一个 Grok。"""
+    now = now or time.time()
+    return [
+        {"src": "claude", "sid": "demo-wait", "cwd": "/work/Agent24", "title": "CI 修复",
+         "state": "等你", "doing": "等你确认：Bash: git push origin feat/x", "ts": now - 180,
+         "children": []},
+        {"src": "claude", "sid": "demo-run", "cwd": "/work/Agent24-wt-02b", "title": "知识组件集成",
+         "state": "工作中", "doing": "Bash: cargo test -p kb", "ts": now - 14,
+         "children": [
+             {"aid": "a1", "name": "codex-review「双审」", "state": "工作中",
+              "doing": "Bash: codex exec review", "ts": now - 6 * 60, "children": [
+                  {"aid": "a2", "name": "general-purpose「核实发现 #2」", "state": "工作中",
+                   "doing": "思考中", "ts": now - 12, "children": []},
+              ]},
+             {"aid": "a3", "name": "grok-review「双审」", "state": "完成",
+              "doing": "✓ 完成", "ts": now - 60, "children": []},
+         ]},
+        {"src": "claude", "sid": "demo-idle", "cwd": "/work/Agent24", "title": "HANDOFF 文档",
+         "state": "空闲", "doing": "空闲", "ts": now - 18 * 60, "children": []},
+        {"src": "grok", "sid": "demo-grok", "cwd": "/work/WeKnora", "title": "",
+         "state": "空闲", "doing": "空闲", "ts": now - 40 * 60, "children": []},
+    ]
+
+
+
+def _watch_frame(text, clear):
+    """watch 里一帧要写到终端的内容。clear 时整屏清掉再画：用量页每次都这样，
+    会话页只在切换 tab 或终端尺寸变了时清一次。平时会话页把光标拉回左上，
+    每行清到行尾，最后清掉下面缩下去的残留。"""
+    if clear:
+        return "\033[H\033[2J" + text
+    parts = ["\033[H"]
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if i:
+            parts.append("\n")
+        parts.append(line + "\033[K")
+    parts.append("\033[J")
+    return "".join(parts)
+
+
 def pet_draw(pet_lines, top, col):
     """在屏幕绝对位置 (0 起算) 画一帧，画完把光标放回原处。"""
     out = ["\0337"]
@@ -2146,7 +2603,7 @@ def pet_draw(pet_lines, top, col):
 
 
 def pet_demo():
-    """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场）。"""
+    """--pet-demo：不查接口，依次演示每种情绪和日常小动作（宠物轮流上场），再印一帧会话表。"""
     view  = PetView()
     shows = [("caring", "照这样到期要用 135% 啦 ♥"), ("happy", "Claude 周额度用完啦！好棒！"),
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "剩 45% 要过期啦，试试 Opus？"),
@@ -2159,6 +2616,7 @@ def pet_demo():
             view.species = PET_SPECIES_ORDER[i % len(PET_SPECIES_ORDER)]
             view.set_idle(arg) if mood == "idle" else view.set_mood(mood, arg)
             print(f"── {PET_SPECIES[view.species][0]} · {mood}\n" + "\n".join(l.rstrip() for l in view.frame()) + "\n")
+        print("── 会话\n" + "\n".join(session_lines(_demo_sessions(), 80, 40)) + "\n")
         return
     sys.stdout.write("\033[?25l")
     try:
@@ -2170,6 +2628,8 @@ def pet_demo():
                 sys.stdout.write(f"\033[{PET_H}F" + "\n".join(view.frame()) + "\n")
                 sys.stdout.flush()
                 time.sleep(PET_TICK_SEC)
+        size = shutil.get_terminal_size()
+        print("\n".join(session_lines(_demo_sessions(), max(1, size.columns), max(8, size.lines - 1))))
     except KeyboardInterrupt:
         pass
     finally:
@@ -3033,6 +3493,503 @@ def attention_lines(items, now=None, focus=None, qi=0, picks=None):
     return out
 
 
+# ── 会话页（进行中的会话和它派出的子 agent）──────────────────────────────────
+#
+# 只读本机文件：Claude Code 的会话记录、子 agent 的 meta，加上 Grok 的 active_sessions.json。
+# 不挂 hook、不联网。--watch 里按 t 切到这一页，画成进程表；--sessions 画一帧就退出。
+# SEE_BALANCE_SESSIONS 按 cwd 子串过滤，没设就全部显示。用量页右下角的宠物不在这里画。
+
+SESSIONS_SCAN_SEC    = 2             # 会话页隔这么久才重新扫一遍磁盘
+SESSIONS_SESSION_SEC = 15 * 60       # 会话记录这么久没写过、又不在等你，就不算进行中
+SESSIONS_SUB_SEC     = 10 * 60       # 子 agent 的记录超过这么久没写，算它停了
+SESSIONS_DONE_SEC    = 2 * 60        # 做完的子 agent 再多留这么久，显示 ✓ 完成
+SESSIONS_TAIL        = 64 * 1024     # 只看记录末尾这一段，判断正在干什么
+SESSIONS_TAIL_BIG    = 1024 * 1024   # 最后一条比 64KB 还长、没有完整记录时，放宽再读一次
+
+_ACTIVITY_CACHE = {}
+
+
+def _claude_projects_dir():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "projects")
+
+
+def _parse_time(value):
+    """ISO 时间或 unix 秒，解析不了返回 0。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OSError):
+        return 0.0
+
+
+def _pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+ONE_LINE_MAX = 200   # 工具参数收成一行后按字符硬截到这么长；省略号不在这里加
+
+
+def _one_line(text):
+    """连续空白并成一个空格，再硬截到 ONE_LINE_MAX 个字符。不加「…」。
+
+    截断可以正好落在两个词之间的那个空格上。省略号留到画表格的时候，
+    按那一列剩下的宽度只加一次。
+    """
+    out, gap = [], False
+    for ch in _clean(text):
+        if ch.isspace():
+            gap = bool(out)
+            continue
+        if gap:
+            out.append(" ")
+            gap = False
+            if len(out) >= ONE_LINE_MAX:
+                break
+        out.append(ch)
+        if len(out) >= ONE_LINE_MAX:
+            break
+    return "".join(out)
+
+
+def _tool_summary(name, inp):
+    """工具名加一小段参数：Bash: git push…、Read provider_balance.py、Grep <pattern>、Agent: 派出 …。"""
+    name = _clean(name) or "工具"
+    inp = inp if isinstance(inp, dict) else {}
+
+    def field(*keys):
+        for key in keys:
+            val = inp.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return ""
+
+    if name == "Bash":
+        cmd = _one_line(field("command", "description"))
+        return f"Bash: {cmd}" if cmd else "Bash"
+    if name in ("Read", "Write", "Edit", "NotebookEdit", "MultiEdit"):
+        base = os.path.basename(field("file_path", "notebook_path", "path").rstrip("/"))
+        return f"{name} {base}" if base else name
+    if name == "Grep":
+        pat = _one_line(field("pattern"))
+        return f"Grep {pat}" if pat else "Grep"
+    if name in ("Agent", "Task"):
+        desc = _one_line(field("description", "prompt"))
+        return f"Agent: 派出 {desc}" if desc else "Agent: 派出"
+    if name == "Glob":
+        pat = _one_line(field("pattern"))
+        return f"Glob {pat}" if pat else "Glob"
+    if name in ("WebSearch", "WebFetch"):
+        extra = _one_line(field("query", "url"))
+        return f"{name} {extra}" if extra else name
+    extra = _one_line(field("command", "file_path", "pattern", "query", "url", "description", "path"))
+    return f"{name}: {extra}" if extra else name
+
+
+def _activity_from_record(rec):
+    """一条 user / assistant 记录在干什么。不是这两种、或是空的，返回 None（接着往前看）。"""
+    if not isinstance(rec, dict) or rec.get("type") not in ("assistant", "user"):
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    content, tool = msg.get("content"), None
+    has_text = has_result = has_thinking = False
+    if isinstance(content, str) and content.strip():
+        has_text = True
+    elif isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("type")
+            if kind == "tool_use":
+                tool = item
+            elif kind == "tool_result":
+                has_result = True
+            elif kind == "text" and str(item.get("text") or "").strip():
+                has_text = True
+            elif kind == "thinking" and str(item.get("thinking") or item.get("text") or "").strip():
+                has_thinking = True
+    elif content:
+        return None
+    if not (has_text or has_result or has_thinking or tool or rec.get("type") == "user"):
+        return None
+    ts = _parse_time(rec.get("timestamp") or rec.get("ts"))
+    if rec.get("type") == "user" or has_result:
+        return {"state": "工作中", "doing": "思考中", "ts": ts}
+    if tool:
+        return {"state": "工作中", "doing": _tool_summary(tool.get("name"), tool.get("input")), "ts": ts}
+    if has_text:
+        return {"state": "空闲", "doing": "空闲", "ts": ts}
+    if has_thinking:
+        return {"state": "工作中", "doing": "思考中", "ts": ts}
+    return None
+
+
+_CWD_RE = re.compile(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _tail_activity(path):
+    """jsonl 末尾最后一条有效记录在干什么。返回 {state, doing, ts, cwd}。
+    按 (路径, 大小) 缓存，文件没变就不重读。最后一条比 64KB 还长时，放宽到 1MB 再试一次。"""
+    try:
+        size = os.stat(path).st_size
+    except OSError:
+        return {"state": "空闲", "doing": "空闲", "ts": 0.0, "cwd": ""}
+    hit = _ACTIVITY_CACHE.get(path)
+    if hit and hit[0] == size:
+        return hit[1]
+    prev_cwd = (hit[1].get("cwd") or "") if hit else ""
+    text, activity, cwd, parsed = "", None, "", False
+    for window in (SESSIONS_TAIL, SESSIONS_TAIL_BIG):
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - window))
+                raw = fh.read()
+        except OSError:
+            raw = b""
+        text = raw.decode("utf-8", "replace")
+        body = text
+        if size > window:   # 窗口从半截记录切开，丢掉第一行残段
+            nl = body.find("\n")
+            body = body[nl + 1:] if nl >= 0 else ""
+        activity, cwd, parsed = None, "", False
+        for line in body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            parsed = True
+            if isinstance(rec.get("cwd"), str) and rec["cwd"]:
+                cwd = rec["cwd"]
+            got = _activity_from_record(rec)
+            if got:
+                activity = got
+        if parsed or size <= window:
+            break
+    if not activity:
+        # 放宽到 1MB 仍没有一条完整记录：最后一条还在写，别显示成空闲
+        busy = not parsed and size > SESSIONS_TAIL
+        activity = {"state": "工作中" if busy else "空闲",
+                    "doing": "思考中" if busy else "空闲", "ts": 0.0}
+    if not cwd:
+        found = _CWD_RE.findall(text)
+        if found:
+            try:   # 分组拿到的是 JSON 字符串内容，引号和反斜杠要还原
+                got = json.loads('"' + found[-1] + '"')
+            except ValueError:
+                got = found[-1]
+            if isinstance(got, str) and got:
+                cwd = got
+        cwd = cwd or prev_cwd
+    activity["cwd"] = cwd
+    if not activity.get("ts"):
+        try:
+            activity["ts"] = os.stat(path).st_mtime
+        except OSError:
+            activity["ts"] = 0.0
+    _ACTIVITY_CACHE[path] = (size, activity)
+    return activity
+
+
+def _safe_scandir(path):
+    try:
+        return list(os.scandir(path))
+    except OSError:
+        return []
+
+
+def _subagent_tree(session_dir, now):
+    """一个会话目录下还在的子 agent，按 parentAgentId 挂成树。没有目录返回 []。"""
+    if not session_dir:
+        return []
+    subdir = os.path.join(session_dir, "subagents")
+    fresh = {}
+    for ent in _safe_scandir(subdir):
+        name = ent.name
+        if not name.startswith("agent-") or not name.endswith(".jsonl") or name.endswith(".meta.json"):
+            continue
+        try:
+            st = ent.stat()
+        except OSError:
+            continue
+        if now - st.st_mtime > SESSIONS_SUB_SEC + SESSIONS_DONE_SEC:   # 活着的和刚做完的都更近
+            continue
+        fresh[name[len("agent-"):-len(".jsonl")]] = (ent.path, st)
+    nodes = {}
+    for aid, (path, st) in fresh.items():
+        meta_path = os.path.join(subdir, f"agent-{aid}.meta.json")
+        meta, meta_mtime = {}, 0.0
+        try:
+            meta_mtime = os.stat(meta_path).st_mtime
+            with open(meta_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (OSError, ValueError):
+            meta = {}
+        if meta.get("finished"):
+            done_at = max(meta_mtime, st.st_mtime)
+            if now - done_at > SESSIONS_DONE_SEC:
+                continue
+            state, doing, ts = "完成", "✓ 完成", done_at
+        else:
+            if now - st.st_mtime > SESSIONS_SUB_SEC:
+                continue
+            act = _tail_activity(path)
+            state, doing, ts = act["state"], act["doing"], act["ts"] or st.st_mtime
+        atype = _clean(meta.get("agentType")) or "agent"
+        desc = _clean(meta.get("description"))
+        if len(desc) > 80:   # 省略号留给表格那一列，这里只硬截
+            desc = desc[:80]
+        parent = str(meta.get("parentAgentId") or "")
+        if parent.startswith("agent-"):
+            parent = parent[len("agent-"):]
+        nodes[aid] = {"aid": aid, "name": f"{atype}「{desc}」" if desc else atype,
+                      "state": state, "doing": doing, "ts": ts, "children": [], "_parent": parent}
+    parent_of = {aid: node.get("_parent") or "" for aid, node in nodes.items()}
+
+    def _ancestors(aid):
+        seen, cur = set(), parent_of.get(aid) or ""
+        while cur and cur not in seen:
+            seen.add(cur)
+            cur = parent_of.get(cur) or ""
+        return seen
+
+    roots = []
+    for aid, node in nodes.items():
+        parent = node.pop("_parent", "")
+        host = nodes.get(parent)
+        if host is not None and host is not node and aid not in _ancestors(parent):
+            host["children"].append(node)
+        else:
+            roots.append(node)
+
+    def _sort_nodes(level):
+        level.sort(key=lambda n: (-float(n.get("ts") or 0), n.get("aid") or ""))
+        for node in level:
+            _sort_nodes(node["children"])
+
+    _sort_nodes(roots)
+    return roots
+
+
+def _ended_sids(now):
+    """按日志顺序：SessionEnd 是该 (src, sid) 的最后一条才算结束，返回 {key: end_ts}。
+    resume / --continue 会复用 sid，之后任何事件（含 sub）都让它复活。
+    子 agent 自己的 SessionEnd 不算这个会话结束。"""
+    ended = {}
+    for line in _attention_lines(now):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or not rec.get("sid"):
+            continue
+        key = (rec.get("src") or "claude", rec["sid"])
+        if rec.get("ev") == "SessionEnd" and not rec.get("sub"):
+            try:
+                ended[key] = float(rec.get("ts") or 0)
+            except (TypeError, ValueError):
+                ended[key] = 0.0
+        else:
+            ended.pop(key, None)   # 后面又有事件：会话还活着
+    return ended
+
+
+def _wait_doing(w):
+    """等你<kind>，再接上决策内容的第一行（和底部提醒同一份）。"""
+    kind = _clean(w.get("kind"))
+    head = f"等你{kind}" if kind else "等你"
+    detail = attention_detail(w)
+    if detail:
+        return f"{head}：{_clean(detail[0])}"
+    if w.get("msg"):
+        return f"{head}：{_clean(w['msg'])}"
+    return head
+
+
+def _stamp_wait(node, w):
+    node["state"] = "等你"
+    node["doing"] = _wait_doing(w)
+    if w.get("ts"):
+        node["ts"] = float(w["ts"])
+
+
+def _walk_nodes(nodes):
+    for node in nodes or []:
+        yield node
+        yield from _walk_nodes(node.get("children"))
+
+
+def _find_wait_node(nodes, w):
+    """子 agent 弹的决策框：transcript 文件名对得上就挂到那个子 agent 上。"""
+    base = os.path.basename(w.get("transcript") or "")
+    if not (base.startswith("agent-") and base.endswith(".jsonl")):
+        return None
+    aid = base[len("agent-"):-len(".jsonl")]
+    return next((node for node in _walk_nodes(nodes) if node.get("aid") == aid), None)
+
+
+def _apply_wait(session, w):
+    if not w:
+        return
+    if w.get("sub"):
+        hit = _find_wait_node(session.get("children"), w)
+        if hit:
+            _stamp_wait(hit, w)
+    _stamp_wait(session, w)   # 子 agent 在等你时，这一会话也标成等你，排序才排到前面
+
+
+def _make_claude_session(path, sid, session_dir, mtime, waiting, now):
+    act = _tail_activity(path)
+    cwd = act.get("cwd") or (waiting or {}).get("cwd") or ""
+    session = {"src": "claude", "sid": sid, "cwd": cwd,
+               "title": session_title(path) or (waiting or {}).get("title") or "",
+               "state": act["state"], "doing": act["doing"], "ts": act["ts"] or mtime,
+               "children": _subagent_tree(session_dir, now)}
+    _apply_wait(session, waiting)
+    return session
+
+
+def _session_from_wait(w, now):
+    return {"src": w.get("src") or "claude", "sid": w["sid"], "cwd": w.get("cwd") or "",
+            "title": w.get("title") or "", "state": "等你", "doing": _wait_doing(w),
+            "ts": float(w.get("ts") or now), "children": []}
+
+
+def _claude_live(now, ended, waits):
+    found = {}
+    root = _claude_projects_dir()
+    for proj in _safe_scandir(root):
+        try:
+            if not proj.is_dir():
+                continue
+        except OSError:
+            continue
+        entries = _safe_scandir(proj.path)
+        dirs = {}
+        for ent in entries:
+            try:
+                if ent.is_dir():
+                    dirs[ent.name] = ent.path
+            except OSError:
+                continue
+        for ent in entries:
+            name = ent.name
+            try:
+                if not ent.is_file() or not name.endswith(".jsonl"):
+                    continue
+                mtime = ent.stat().st_mtime
+            except OSError:
+                continue
+            sid = name[:-len(".jsonl")]
+            end_ts = ended.get(("claude", sid))
+            # 记录比 SessionEnd 晚 1 秒以上：resume / --continue 写过了，会话复活
+            if not sid or (end_ts is not None and mtime <= end_ts + 1):
+                continue
+            waiting = waits.get(("claude", sid))
+            if now - mtime > SESSIONS_SESSION_SEC and not waiting:
+                continue
+            found[sid] = _make_claude_session(ent.path, sid, dirs.get(sid), mtime, waiting, now)
+    for key, w in waits.items():
+        if key[0] != "claude" or key[1] in found:
+            continue
+        path = w.get("transcript") or ""
+        end_ts = ended.get(key)
+        if path and os.path.isfile(path):
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                mtime = now
+            if end_ts is not None and mtime <= end_ts + 1:
+                continue
+            parent = os.path.dirname(path)
+            session_dir = os.path.join(parent, key[1])
+            found[key[1]] = _make_claude_session(path, key[1], session_dir if os.path.isdir(session_dir) else None,
+                                                mtime, w, now)
+        elif end_ts is None:
+            found[key[1]] = _session_from_wait(w, now)
+    return list(found.values())
+
+
+def _grok_live(now, ended, waits):
+    path = os.path.expanduser("~/.grok/active_sessions.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out, seen = [], set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("session_id") or "")
+        if not sid or sid in seen or ("grok", sid) in ended or not _pid_alive(item.get("pid")):
+            continue
+        seen.add(sid)
+        w = waits.get(("grok", sid))
+        opened = _parse_time(item.get("opened_at"))
+        session = {"src": "grok", "sid": sid, "cwd": item.get("cwd") or "", "title": (w or {}).get("title") or "",
+                   "state": "空闲", "doing": "空闲", "ts": opened or now, "children": []}
+        _apply_wait(session, w)
+        out.append(session)
+    return out
+
+
+def live_sessions(now=None, decided=None):
+    """进行中的会话：[{src, sid, cwd, title, state, doing, ts, children}]。
+
+    children 是子 agent：{aid, name, state, doing, ts, children}，parentAgentId 挂到对应的子 agent 下，
+    没有就挂在会话下。Grok 只有会话、没有子 agent，状态只有空闲或等你。
+    decided 是刚在宠物上决定过的 rid，这些先不算在等你。
+    SEE_BALANCE_SESSIONS 设了的话，cwd 不含其中任一子串的会话不返回（--watch 和 --sessions 都走这里）。
+    """
+    now = now or time.time()
+    items = attention_items(now)
+    if decided:   # 宠物上刚决定的，别等会话记录更新还显示「等你」
+        items = [w for w in items if w.get("rid") not in decided]
+    waits = {(w.get("src"), w["sid"]): w for w in items if w.get("sid")}
+    ended = _ended_sids(now)
+    sessions = _claude_live(now, ended, waits) + _grok_live(now, ended, waits)
+    parts = load_env_sessions()
+    if parts:
+        sessions = [s for s in sessions if _cwd_ok(s, parts)]
+    return sessions
+
+
+def show_sessions():
+    """--sessions：按当前终端大小画一帧会话表，然后退出。不查余额。"""
+    size = shutil.get_terminal_size(fallback=(80, 24))
+    rows = max(1, size.lines - 1) if sys.stdout.isatty() else max(size.lines, 200)
+    label = ",".join(load_env_sessions())
+    print("\n".join(session_lines(live_sessions(), max(1, size.columns), rows, filt=label or None)))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def collect(update=True):
@@ -3066,6 +4023,9 @@ def main():
     if "--pet-demo" in args:
         pet_demo()
         return
+    if "--sessions" in args:
+        show_sessions()
+        return
     if "--install-hooks" in args or "--uninstall-hooks" in args:
         print("\n".join(install_hooks() if "--install-hooks" in args else uninstall_hooks()))
         return
@@ -3096,7 +4056,7 @@ def main():
     # 宠物只跟完整视图走：--compact / --json / 管道输出保持原样，方便脚本解析
     pet_mode    = ("--no-pet" not in args and os.environ.get("SEE_BALANCE_PET", "1").strip() != "0"
                    and not compact and not json_mode)
-    # 交互 watch：原地重绘 + 宠物动画 + 快捷键（p 宠物 / r 刷新 / q 退出）
+    # 交互 watch：原地重绘 + 宠物动画 + 快捷键（p 宠物 / t 切换会话页 / r 刷新 / q 退出）
     # 只在前台进程启用：`--watch &` 这种后台任务改终端模式会被 SIGTTOU 挂起
     interactive = (watch_mode and not json_mode and termios is not None
                    and sys.stdout.isatty() and sys.stdin.isatty()
@@ -3108,7 +4068,8 @@ def main():
     state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
              "pet_visible": True, "size": None, "place": None,
              "attention_on": not json_mode and not compact and hooks_installed(),
-             "focus": None, "qi": 0, "picks": {}, "pick_for": None, "decided": set(), "touched": 0.0}
+             "focus": None, "qi": 0, "picks": {}, "pick_for": None, "decided": set(), "touched": 0.0,
+             "tab": "usage", "paint_tab": None, "sessions": [], "sessions_at": 0.0, "sessions_filt": ""}
 
     def update_prompt():
         """要不要弹升级选项：有下载好的新版本，这次没跳过，这个版本也没说过“不要提醒”。"""
@@ -3148,10 +4109,20 @@ def main():
             mood = ("encourage", "有新版本啦，看看底下～")
         state["pet"].set_mood(*mood)
 
+    def reload_sessions():
+        """重新扫一遍进行中的会话，并记下过滤词（标题用）。用量页不调用。"""
+        state["sessions"] = live_sessions(decided=state["decided"])
+        state["sessions_at"] = time.time()
+        state["sessions_filt"] = ",".join(load_env_sessions())
+
     def paint():
-        """整屏重画：正文 + footer，再把宠物画在右下角（放不下就在 footer 下提示）。"""
-        size  = shutil.get_terminal_size()
-        keys  = " · p 宠物 · s 换宠物" if pet_mode else ""
+        """整屏重画：正文 + footer，再把宠物画在右下角（放不下就在 footer 下提示）。
+        会话页的正文是进程表，不再往角落叠一只。用量页每次清全屏；
+        会话页连续重画不清屏，切页或终端变了大小才清一次。文本没变就不写。"""
+        size     = shutil.get_terminal_size()
+        tab      = state.get("tab") or "usage"
+        tab_name = "会话" if tab == "sessions" else "用量"
+        keys     = " · p 宠物 · s 换宠物" if pet_mode and tab != "sessions" else ""
         if state.get("update_msg"):
             note = state["update_msg"]
         elif state.get("can_update"):   # 宠物藏起来或放不下时，底下也能看到选项
@@ -3166,10 +4137,35 @@ def main():
         if msg and time.time() - msg[1] < 15:
             calls = (calls + "\n" if calls else "") + msg[0]
         state["attention_min"] = int(time.time() // 60)
-        text  = (state["body"] + (f"\n\n{calls}" if calls else "") + (f"\n\n{note}" if note else "")
-                 + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n")
+        footer = f"🔄 每 {interval_min} 分钟刷新 · {tab_name} · t 切换{keys} · r 刷新 · q 退出"
+        if tab == "sessions":
+            # 标题行右侧已经有页签，不再另画 footer。末尾换行让光标停在下一行。
+            extra = 1
+            if calls:
+                extra += calls.count("\n") + 2
+            if note:
+                extra += note.count("\n") + 2
+            if state.get("busy"):
+                extra += 1
+            # 会话页不清屏重画，每行后面跟 \033[K。一行写满最后一列时，光标停在待换行，
+            # \033[K 会把最后一个字擦掉。宽度只在这里定一次：表格交给 session_lines
+            # （它保证每行 ≤ width，单元格只裁一次），底部的提醒、更新提示、正在刷新另收。
+            width = max(1, size.columns - 1)
+            body = "\n".join(session_lines(state.get("sessions") or [], width,
+                                            max(1, size.lines - extra),
+                                            filt=state.get("sessions_filt") or None))
+            text = body
+            if calls:
+                text += "\n\n" + _clip_lines(calls, width)
+            if note:
+                text += "\n\n" + _clip_lines(note, width)
+            text += "\n"
+        else:
+            body = state["body"]
+            text = (body + (f"\n\n{calls}" if calls else "") + (f"\n\n{note}" if note else "")
+                    + f"\n\n{footer}\n")
         place = None
-        if pet_mode and state["pet_visible"]:
+        if tab != "sessions" and pet_mode and state["pet_visible"]:
             rows    = screen_rows(text, size.columns)   # 末尾空行就是光标所在行
             visible = rows[-size.lines:] + [0] * max(0, size.lines - len(rows))
             place   = pet_place(visible, size.columns, size.lines - PET_H - 1)   # 底下留 1 行给光标
@@ -3177,10 +4173,18 @@ def main():
                 need  = max(visible) + 2 + PET_W + 1
                 text += f"   （终端太窄，宠物先躲起来了：加宽到约 {need} 列可显示；p 隐藏宠物）\n"
         if state.get("busy") and not place:   # 宠物不在屏幕上，就用一行字提示正在刷新
-            text += "⏳ 正在刷新，稍等片刻…\n"
-        sys.stdout.write("\033[H\033[2J" + text)
+            busy = "⏳ 正在刷新，稍等片刻…"
+            if tab == "sessions":
+                busy = _clip_lines(busy, width)
+            text += busy + "\n"
+        clear = tab != "sessions" or state.get("paint_tab") != "sessions" or state.get("size") != size
+        # 没有帧动画：和上一帧一字不差就不写终端。时长跳了、扫描结果变了，文本自然不同
+        if tab == "sessions" and not clear and text == state.get("frame_text"):
+            return
+        sys.stdout.write(_watch_frame(text, clear))
         sys.stdout.flush()
-        state["size"], state["place"] = size, place
+        state["size"], state["place"], state["paint_tab"] = size, place, tab
+        state["frame_text"] = text if tab == "sessions" else None
         if place:
             pet_draw(state["pet"].frame(), *place)
 
@@ -3325,7 +4329,11 @@ def main():
         if not state.get("attention") and not state.get("busy") and now - state.get("mood_at", 0) >= 1:
             state["mood_at"] = now    # 用量提醒该说或该停了（没到点就不变）
             set_pet_mood()
-        if pet_mode and state["pet_visible"]:
+        if (state.get("tab") or "usage") == "sessions":
+            if now - state.get("sessions_at", 0) >= SESSIONS_SCAN_SEC:   # 扫描放这里：用量页不碰这些文件
+                reload_sessions()
+            paint()          # 文本没变时 paint 自己会跳过写入
+        elif pet_mode and state["pet_visible"]:
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排
             elif state["place"]:
@@ -3362,6 +4370,11 @@ def main():
                 paint()
             if ch == "r" and not state.get("busy"):
                 return "refresh"
+            if ch == "t":
+                state["tab"] = "usage" if state.get("tab") == "sessions" else "sessions"
+                if state["tab"] == "sessions":
+                    reload_sessions()
+                paint()
             if ch == "p" and pet_mode:
                 state["pet_visible"] = not state["pet_visible"]
                 paint()
