@@ -2480,10 +2480,16 @@ WAIT_KINDS        = {"permission_prompt": "确认", "elicitation_dialog": "填�
 # 决策框弹出的是哪个工具 → 等你做什么；其余工具都是权限确认
 DECIDE_KINDS      = {"AskUserQuestion": "选择", "ExitPlanMode": "批准计划"}
 ATTENTION_ROTATE_SEC = 4               # 好几个会话在等时，宠物气泡每隔几秒换下一个
+# 在宠物上做决定：--watch 每秒摸一下 PET_ALIVE；hook 看它新鲜，就在决策框弹出时等宠物上的决定（DECISION_DIR 里一框一个文件），
+# 等到了交回会话。终端里的对话框照常显示，哪边先答算哪边。
+PET_ALIVE         = STATE_FILE.parent / "pet.alive"
+DECISION_DIR      = STATE_FILE.parent / "decisions"
+DECIDE_WAIT       = 590                # hook 最多等这么久，之后交回终端（hook 的超时设成 DECIDE_WAIT + 10）
 
 HOOK_SCRIPT = r'''#!/usr/bin/env python3
 # see-balance 会话提醒 hook（由 provider_balance.py --install-hooks 生成，--uninstall-hooks 删除）。
-# 只往日志追加一行：哪个会话、在哪个目录、发生了什么；不输出任何东西，不影响会话本身。
+# 往日志追加一行：哪个会话、在哪个目录、发生了什么。只有一种情况会输出：宠物（see-balance --watch）开着时，
+# Claude Code 的决策框会等你在宠物上做决定，再把决定交回会话；你先在终端答了、宠物关了或等太久，就什么都不输出地退出。
 import json, os, re, sys, time
 raw = sys.stdin.readline()
 try:
@@ -2495,6 +2501,11 @@ except ValueError:              # 不是单行 JSON：读完剩下的再试一�
         sys.exit(0)
 if not isinstance(e, dict):
     sys.exit(0)
+def pet_alive(sec):
+    try:
+        return time.time() - os.stat(__ALIVE__).st_mtime < sec
+    except OSError:
+        return False
 ev  = e.get("hook_event_name") or ""
 sub = bool(e.get("agent_id") or e.get("subagentType"))
 # 子 agent 的输入 / 会话结束不代表主会话；它弹的权限框、它这一轮的结束（只清它自己的提醒）还是要记
@@ -2514,6 +2525,12 @@ elif ev == "PermissionRequest":  # 决策框刚弹出来：记下要你决定的
     ti   = e.get("tool_input") or e.get("toolInput") or {}
     ti   = ti if isinstance(ti, dict) else {}
     rec["tool"], rec["transcript"] = tool[:60], e.get("transcript_path") or ""
+    try:   # 从这里往后，会话记录里出现 user 条目（工具结果、打断、你的新输入）就说明这一框处理完了
+        rec["tsize"] = os.stat(rec["transcript"]).st_size
+    except OSError:
+        pass
+    if rec["src"] == "claude" and pet_alive(5):   # 宠物开着：这一框可以在宠物上决定
+        rec["rid"] = f"{time.time_ns()}-{os.getpid()}"
     if tool == "AskUserQuestion":
         rec["qs"] = [{"q": str(q.get("question") or "")[:200], "multi": bool(q.get("multiSelect")),
                       "opts": [str(o.get("label") or "")[:40] for o in (q.get("options") or []) if isinstance(o, dict)][:6]}
@@ -2534,12 +2551,73 @@ try:
     os.close(fd)
 except OSError:
     pass
+if rec.get("rid"):   # 等宠物上的决定：picks 是每道题选中的选项序号，按原题补全成 answers
+    path, start = os.path.join(__DECIDE__, rec["rid"] + ".json"), time.time()
+    def answered():   # 只认 user 条目：Claude Code 还会在后台补写标题等，那些不算
+        try:
+            with open(rec["transcript"], "rb") as fh:
+                fh.seek(rec.get("tsize", 0))
+                return b'"type":"user"' in fh.read(4 << 20)
+        except OSError:
+            return False
+    while time.time() - start < __WAIT__:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            d = None
+        if isinstance(d, dict):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            dec = {"behavior": "deny", "message": "用户在 see-balance 宠物上拒绝了这一步"}
+            if d.get("allow"):
+                dec = {"behavior": "allow"}
+                if tool == "AskUserQuestion" and isinstance(d.get("picks"), list):
+                    qs, answers = [q for q in (ti.get("questions") or []) if isinstance(q, dict)], {}
+                    for q, picked in zip(qs, d["picks"]):
+                        opts = [o for o in (q.get("options") or []) if isinstance(o, dict)]
+                        labels = [str(opts[i].get("label") or "") for i in picked if isinstance(i, int) and 0 <= i < len(opts)]
+                        if labels:
+                            answers[str(q.get("question") or "")] = ", ".join(labels)
+                    dec["updatedInput"] = dict(ti, answers=answers)
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": dec}},
+                                        ensure_ascii=False))
+            break
+        if answered() or not pet_alive(30):   # 已经在终端里答了，或者宠物关了：交回终端
+            break
+        time.sleep(0.3)
 '''
+
+
+def _hook_script():
+    return (HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG))).replace("__ALIVE__", repr(str(PET_ALIVE)))
+            .replace("__DECIDE__", repr(str(DECISION_DIR))).replace("__WAIT__", str(DECIDE_WAIT)))
 
 
 def _hook_command():
     """永远退出 0、不输出：hook 脚本被删了也不能拦下你的输入（Claude Code / Grok 把退出码 2 当成阻断）。"""
     return f"python3 -S {shlex.quote(str(ATTENTION_HOOK))} >/dev/null 2>&1 || true"
+
+
+def _decide_command():
+    """决策框用的：同样永远退出 0，但留着 stdout，宠物上做的决定从这里交回会话。"""
+    return f"python3 -S {shlex.quote(str(ATTENTION_HOOK))} 2>/dev/null || true"
+
+
+_OUR_HOOK_CMD = re.compile(r"python3 -S (\S+/hook\.py|'[^']*/hook\.py') (>/dev/null 2>&1|2>/dev/null) \|\| true")
+
+
+def _is_our_command(command):
+    """只认 install_hooks 生成的那几种命令（换过 SEE_BALANCE_STATE 装的也认），别的不碰。"""
+    return command in (_hook_command(), _decide_command()) or bool(_OUR_HOOK_CMD.fullmatch(command))
+
+
+def _wanted_hooks(events):
+    """每个事件挂什么命令、超时多少秒。"""
+    return {ev: (_decide_command(), DECIDE_WAIT + 10) if ev == "PermissionRequest" else (_hook_command(), 5)
+            for ev in events}
 
 
 def _handlers(groups):
@@ -2574,17 +2652,22 @@ def _save_settings(path, data):
     _write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode=mode)
 
 
-def _add_hooks(path, events, cmd):
-    """把 cmd 挂到 path 的这些事件上（已挂过的跳过）。返回 (新挂的事件, 错误)。"""
+def _add_hooks(path, wanted):
+    """按 wanted（事件 → (命令, 超时)）挂到 path 上：已挂好的跳过，旧版本挂的换成现在的命令和超时。
+    返回 (新挂或改过的事件, 错误)。"""
     data, err = _load_settings(path)
     if data is None:
         return [], err
     hooks, added = data.setdefault("hooks", {}), []
-    for ev in events:
+    for ev, (cmd, timeout) in wanted.items():
         groups = hooks.setdefault(ev, [])
-        if any(isinstance(h, dict) and h.get("command") == cmd for h in _handlers(groups)):
+        ours = [h for h in _handlers(groups) if isinstance(h, dict) and _is_our_command(str(h.get("command") or ""))]
+        if any(h.get("command") == cmd and h.get("timeout") == timeout for h in ours):
             continue
-        groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
+        if ours:
+            ours[0].update(command=cmd, timeout=timeout)
+        else:
+            groups.append({"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]})
         added.append(ev)
     if added:
         _save_settings(path, data)
@@ -2628,15 +2711,15 @@ def _remove_hooks(path, is_ours):
 def install_hooks():
     """写 hook 脚本，并把它挂到 ~/.claude/settings.json 的几个事件上（已挂过的不重复挂）。返回说明行。"""
     ATTENTION_HOOK.parent.mkdir(parents=True, exist_ok=True)
-    _write_atomic(ATTENTION_HOOK, HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG))), mode=0o700)
-    cmd, out = _hook_command(), [f"✓ hook 脚本：{_short_path(str(ATTENTION_HOOK))}"]
-    added, err = _add_hooks(CLAUDE_SETTINGS, HOOK_EVENTS, cmd)
+    _write_atomic(ATTENTION_HOOK, _hook_script(), mode=0o700)
+    out = [f"✓ hook 脚本：{_short_path(str(ATTENTION_HOOK))}"]
+    added, err = _add_hooks(CLAUDE_SETTINGS, _wanted_hooks(HOOK_EVENTS))
     if err:
         return out + [f"⚠ 读不了 {_short_path(str(CLAUDE_SETTINGS))}：{err}，没有改动"]
     out.append(f"✓ 已挂到 {_short_path(str(CLAUDE_SETTINGS))}：{'、'.join(added)}（原文件备份为 .see-balance.bak）"
                if added else f"✓ {_short_path(str(CLAUDE_SETTINGS))} 里已经挂好了，没有改动")
     if GROK_HOOK_FILE.parent.parent.exists():   # 装了 Grok CLI
-        added, err = _add_hooks(GROK_HOOK_FILE, GROK_ONLY_EVENTS, cmd)
+        added, err = _add_hooks(GROK_HOOK_FILE, _wanted_hooks(GROK_ONLY_EVENTS))
         if err:
             out.append(f"⚠ 读不了 {_short_path(str(GROK_HOOK_FILE))}：{err}，Grok 拒绝权限后的提醒可能要等下一句话才消失")
         elif added:
@@ -2648,11 +2731,8 @@ def install_hooks():
 def uninstall_hooks():
     """把 install_hooks 挂上的条目摘掉（别的 hook 不动），删掉 hook 脚本。返回说明行。"""
     out = []
-    ours = re.compile(r"python3 -S (\S+/hook\.py|'[^']*/hook\.py') >/dev/null 2>&1 \|\| true")
-    def is_ours(command):   # 只认 install_hooks 生成的那种命令（换过 SEE_BALANCE_STATE 装的也认），别的不碰
-        return command == _hook_command() or bool(ours.fullmatch(command))
     for path in (CLAUDE_SETTINGS, GROK_HOOK_FILE):
-        removed, err = _remove_hooks(path, is_ours)
+        removed, err = _remove_hooks(path, _is_our_command)
         if err:
             out.append(f"⚠ 读不了 {_short_path(str(path))}：{err}，没有改动")
         elif removed:
@@ -2684,14 +2764,14 @@ def hooks_installed():
 
 def refresh_hooks():
     """已经开了会话提醒、但 hook 是旧版本装的（自动更新不会重跑 --install-hooks）：
-    把 hook 脚本换成新的，补挂新加的事件。别的 hook 不动；读不了配置就什么都不改。"""
+    把 hook 脚本换成新的，补挂新加的事件、改掉旧的命令和超时。别的 hook 不动；读不了配置就什么都不改。"""
     if not hooks_installed():
         return
-    script = HOOK_SCRIPT.replace("__LOG__", repr(str(ATTENTION_LOG)))
+    script = _hook_script()
     try:
         if ATTENTION_HOOK.read_text(encoding="utf-8") != script:
             _write_atomic(ATTENTION_HOOK, script, mode=0o700)
-        _add_hooks(CLAUDE_SETTINGS, HOOK_EVENTS, _hook_command())
+        _add_hooks(CLAUDE_SETTINGS, _wanted_hooks(HOOK_EVENTS))
     except OSError:
         pass
 
@@ -2736,6 +2816,16 @@ def _attention_lines(now=None):
     return _read_lines(old) + [l for p in leftovers for l in _read_lines(p)] + _read_lines(ATTENTION_LOG)
 
 
+def _answered_since(transcript, offset):
+    """会话记录从 offset 往后有没有 user 条目。Claude Code 会在后台补写标题等，只看 user 条目才不误判。"""
+    try:
+        with open(transcript, "rb") as fh:
+            fh.seek(offset)
+            return b'"type":"user"' in fh.read(4 << 20)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def attention_items(now=None):
     """现在还在等你的会话，按等待时间从早到晚：[{src, sid, cwd, kind, ts, msg}]。
 
@@ -2768,7 +2858,8 @@ def attention_items(now=None):
             tool = r.get("tool") or ""
             s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "",
                          "kind": DECIDE_KINDS.get(tool, "确认"), "ts": float(r.get("ts") or 0), "msg": "",
-                         "tool": tool, "what": r.get("what") or "", "qs": r.get("qs") or [],
+                         "tool": tool, "what": r.get("what") or "", "qs": r.get("qs") or [], "rid": r.get("rid") or "",
+                         "tsize": r.get("tsize"),
                          "transcript": r.get("transcript") or "", "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Notification":
             typ  = r.get("type") or ""
@@ -2792,11 +2883,16 @@ def attention_items(now=None):
         w = s["wait"]
         if not w or now - w["ts"] > ATTENTION_MAX_AGE:
             continue
-        try:   # 会话记录在提醒之后又写了东西：你已经在终端里处理过了
-            if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 1:
+        if isinstance(w.get("tsize"), int):   # 决策框：记录里出现了 user 条目（工具结果、打断、新输入）才算处理完
+            if _answered_since(w["transcript"], w["tsize"]):
                 continue
-        except OSError:
-            pass
+        else:
+            try:   # 会话记录在提醒之后又写了东西：你已经在终端里处理过了
+                if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 1:
+                    continue
+            except OSError:
+                pass
+        w["title"] = session_title(w["transcript"]) if w["src"] == "claude" else ""
         items.append(w)
     return sorted(items, key=lambda w: w["ts"])
 
@@ -2813,8 +2909,47 @@ def _project(w):
     return _clean(os.path.basename(w["cwd"].rstrip("/"))) or "~"
 
 
+_TITLE_CACHE = {}
+
+
+def session_title(transcript):
+    """会话标题：/rename 起的名字优先，其次 Claude Code 自动起的（终端标签页上显示的那个）。读不到返回 ""。
+    同一个项目开了好几个会话时，靠它分清是哪个在等你。按文件大小缓存，没变就不重读。"""
+    try:
+        size = os.stat(transcript).st_size
+    except (OSError, TypeError, ValueError):
+        return ""
+    hit = _TITLE_CACHE.get(transcript)
+    if hit and hit[0] == size:
+        return hit[1]
+    title = ""
+    try:
+        with open(transcript, "rb") as fh:
+            fh.seek(max(0, size - 512 * 1024))      # 标题会反复写进记录，看最后一段就够
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    for key in ("customTitle", "aiTitle"):
+        found = re.findall(r'"%s":\s*("(?:[^"\\]|\\.)*")' % key, tail)
+        if found:
+            try:
+                title = str(json.loads(found[-1]))
+            except ValueError:
+                pass
+            break
+    _TITLE_CACHE[transcript] = (size, title)
+    return title
+
+
+def _session_label(w):
+    title = _clean(w.get("title"))
+    return _project(w) + (f"「{_clip(title, 30)}」" if title else "")
+
+
 def _attention_name(w):
-    return f"{_project(w)} 的 {SOURCE_NAMES.get(w['src'], _clean(w['src']))}"
+    title = _clean(w.get("title"))
+    return (f"{_project(w)}" + (f"「{_clip(title, 30)}」" if title else " ")
+            + f"的 {SOURCE_NAMES.get(w['src'], _clean(w['src']))}")
 
 
 def attention_detail(w):
@@ -2829,24 +2964,60 @@ def attention_detail(w):
     return []
 
 
-def attention_bubble(items, now=None):
-    """宠物气泡（两行）：好几个会话在等时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个。"""
-    i = int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(items)
+def decidable(w, now=None):
+    """这一框能不能在宠物上决定：hook 正在等宠物（有 rid），也还没等到超时。"""
+    return bool(w.get("rid")) and (now or time.time()) - w["ts"] < DECIDE_WAIT
+
+
+def attention_bubble(items, now=None, pick=None):
+    """宠物气泡（两行）：好几个会话在等时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个；pick 指定就固定显示那一个。"""
+    i = pick if pick is not None else int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(items)
     w, n = items[i], len(items)
-    head = f"{_project(w)} 等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
+    title = _clean(w.get("title"))
+    head = (f"等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
+            + f"：{_project(w)}" + (f"·{title}" if title else ""))
     detail = [_clean(w["qs"][0].get("q"))] if w.get("qs") else attention_detail(w)
     return f"{head}\n{detail[0] if detail else '快去看看 ♥'}"
 
 
-def attention_lines(items, now=None):
-    """底部提醒行：每个等你的会话一行，带上等了多久和那句话；决策框再逐行列出要你决定的内容。"""
+def decision_lines(w, n, qi=0, picks=None):
+    """选中的那一框：列出能按的选项和提示。"""
+    picks, out = picks or {}, []
+    if w.get("qs"):
+        multi = False
+        for j, q in enumerate(w["qs"]):
+            mark  = "▸ " if len(w["qs"]) > 1 and j == qi else ""
+            multi = multi or (j == qi and q.get("multi"))
+            text  = _clean(q.get("q"))
+            out.append(f"{mark}❓ {text}{'（可多选）' if q.get('multi') and '多选' not in text else ''}")
+            out.append("   " + "   ".join(f"{'✓' if k in picks.get(j, []) else ''}{k + 1} {_clean(o)}"
+                                          for k, o in enumerate(q.get("opts") or [])))
+        keys = "按数字选择" + ("，选好按回车" if multi else "")
+    else:
+        out += attention_detail(w)
+        ok = "批准" if w.get("tool") == "ExitPlanMode" else "允许"
+        out.append(f"   1 {ok}   2 拒绝")
+        keys = "按 1 / 2 决定"
+    out.append(f"   {keys}{' · Tab 换下一个会话' if n > 1 else ''}"
+               f" · 有别的想法就回 {_session_label(w)} 那个会话里自己写，那边的选项还在")
+    return out
+
+
+def attention_lines(items, now=None, focus=None, qi=0, picks=None):
+    """底部提醒行：每个等你的会话一行，带上等了多久和那句话；决策框再逐行列出要你决定的内容。
+    focus 是选中的那一框：能在宠物上决定的话，列出按键。"""
     now = now or time.time()
     out = []
     for w in items[:5]:
         ago    = fmt_countdown(now - w["ts"])
         detail = attention_detail(w)
         what   = f"：{_clean(w['msg'])}" if w["msg"] and not detail else ""
-        out.append(f"🔔 {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
+        mine   = w is focus and decidable(w, now)
+        out.append(f"{'👉' if mine else '🔔'} {_attention_name(w)} 在等你{w['kind']}（{ago} 前）{what}")
+        if mine:
+            detail = decision_lines(w, len(items), qi, picks)
+        elif decidable(w, now) and len(items) > 1:
+            detail = detail + ["（按 Tab 切过来，就能在这里决定）"]
         out += [f"     {_clip(d, 200)}" for d in detail]
     if len(items) > 5:
         out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
@@ -2927,7 +3098,8 @@ def main():
     full0 = load_state()
     state = {"full": full0, "pet": PetView(species=(full0.get("pet") or {}).get("species", "cat")),
              "pet_visible": True, "size": None, "place": None,
-             "attention_on": not json_mode and not compact and hooks_installed()}
+             "attention_on": not json_mode and not compact and hooks_installed(),
+             "focus": None, "qi": 0, "picks": {}, "pick_for": None, "decided": set(), "touched": 0.0}
 
     def update_prompt():
         """要不要弹升级选项：有下载好的新版本，这次没跳过，这个版本也没说过“不要提醒”。"""
@@ -2937,7 +3109,9 @@ def main():
     def refresh_attention():
         """重读“哪些会话在等你”；有变化返回 True。没装 hook 就什么都不做。"""
         items = attention_items() if state["attention_on"] else []
-        key   = [(w["src"], w["sid"], w["kind"], w["ts"], w.get("what"), str(w.get("qs"))) for w in items]
+        items = [w for w in items if w.get("rid") not in state["decided"]]   # 刚在宠物上决定的，别等会话记录更新再消失
+        key   = [(w["src"], w["sid"], w["kind"], w["ts"], w.get("what"), str(w.get("qs")), w.get("rid"), w.get("title"))
+                 for w in items]
         if key == state.get("attention_key"):
             return False
         state["attention"], state["attention_key"] = items, key
@@ -2945,8 +3119,10 @@ def main():
 
     def set_pet_mood():
         """会话在等你最优先，其次升级选项（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
-        if state.get("attention"):
-            state["pet"].set_mood("call", attention_bubble(state["attention"]))
+        if state.get("attention"):   # 刚按过键：固定显示选中的那个会话，不轮播
+            w    = focused()
+            pick = state["attention"].index(w) if time.time() - state["touched"] < 30 else None
+            state["pet"].set_mood("call", attention_bubble(state["attention"], pick=pick))
             return
         if update_prompt():
             state["pet"].set_mood("update", f"新版本 v{state['update_ver']}！u 立即升级\nk 跳过本次 · n 不要提醒")
@@ -2967,7 +3143,12 @@ def main():
                     "u 立即升级 · k 跳过本次 · n 不要提醒") if update_prompt() else None
         else:
             note = state.get("update_hint")
-        calls = "\n".join(attention_lines(state.get("attention") or []))
+        sync_focus()
+        calls = "\n".join(attention_lines(state.get("attention") or [], focus=focused(),
+                                          qi=state["qi"], picks=state["picks"]))
+        msg   = state.get("decide_msg")
+        if msg and time.time() - msg[1] < 15:
+            calls = (calls + "\n" if calls else "") + msg[0]
         state["attention_min"] = int(time.time() // 60)
         text  = (state["body"] + (f"\n\n{calls}" if calls else "") + (f"\n\n{note}" if note else "")
                  + f"\n\n🔄 每 {interval_min} 分钟刷新{keys} · r 刷新 · q 退出\n")
@@ -3027,11 +3208,92 @@ def main():
                     box["upd"] = load_state().get("update") or {}
             threading.Thread(target=work, daemon=True).start()
 
+    def focused():
+        """选中的那一框：按过 Tab 选的那个会话，还在等的话；不然就是等得最久的那个。"""
+        items = state.get("attention") or []
+        return next((w for w in items if (w["src"], w["sid"]) == state["focus"]), items[0] if items else None)
+
+    def sync_focus():
+        """选中的换了一框（切了会话，或者同一个会话弹了新的框）：之前选到一半的选项作废。"""
+        w   = focused()
+        key = w and (w["src"], w["sid"], w["ts"])
+        if key != state["pick_for"]:
+            state["pick_for"], state["qi"], state["picks"] = key, 0, {}
+
+    def submit(w, decision):
+        """把决定写给正在等的 hook（它读到就交回会话），顺手清掉没人取的旧决定。"""
+        try:
+            DECISION_DIR.mkdir(parents=True, exist_ok=True)
+            _write_atomic(DECISION_DIR / f"{w['rid']}.json", json.dumps(decision))
+            state["decided"].add(w["rid"])
+            msg = f"✓ 已把你的决定交给 {_session_label(w)} 那个会话"
+        except OSError as e:
+            msg = f"⚠ 没能交出决定（{e}），请回 {_session_label(w)} 那个会话里处理"
+        try:
+            for f in DECISION_DIR.glob("*.json"):
+                if time.time() - f.stat().st_mtime > DECIDE_WAIT + 60:
+                    f.unlink()
+        except OSError:
+            pass
+        state["decide_msg"], state["pick_for"] = (msg, time.time()), None
+        refresh_attention()
+        set_pet_mood()
+        paint()
+
+    def decide_key(ch):
+        """数字选选项 / 允许拒绝，回车提交多选，Tab 换下一个会话。"""
+        items = state.get("attention") or []
+        if not items:
+            return
+        sync_focus()
+        w = focused()
+        state["touched"] = time.time()
+        if ch == "\t":
+            nxt = items[(items.index(w) + 1) % len(items)]
+            state["focus"] = (nxt["src"], nxt["sid"])
+            set_pet_mood()
+            paint()
+            return
+        if not decidable(w):
+            return
+        if not w.get("qs"):
+            if ch in ("1", "2"):
+                submit(w, {"allow": ch == "1"})
+            return
+        qi, q = state["qi"], w["qs"][state["qi"]]
+        picks = state["picks"].setdefault(qi, [])
+        if ch.isdigit():
+            k = int(ch) - 1
+            if k >= len(q.get("opts") or []):
+                return
+            if q.get("multi"):   # 多选：按一下选上，再按一下取消，选好按回车
+                picks.remove(k) if k in picks else picks.append(k)
+                paint()
+                return
+            picks[:] = [k]
+        elif not (q.get("multi") and picks):
+            return
+        if qi + 1 < len(w["qs"]):   # 还有下一道题
+            state["qi"] = qi + 1
+            paint()
+            return
+        submit(w, {"allow": True, "picks": [sorted(state["picks"].get(j, [])) for j in range(len(w["qs"]))]})
+
     def pump(timeout):
         """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
         now = time.time()
         if update_mode:
             poll_update(now)
+        if state["attention_on"] and now - state.get("alive_at", 0) >= 1:
+            state["alive_at"] = now   # 告诉 hook 宠物开着，决策框可以等宠物上的决定（刷新余额时也照常摸）
+            try:
+                PET_ALIVE.touch()
+            except OSError:
+                pass
+        msg = state.get("decide_msg")
+        if msg and now - msg[1] >= 15 and not state.get("busy"):
+            state["decide_msg"] = None
+            paint()
         if state["attention_on"] and now - state.get("attention_at", 0) >= 1 and not state.get("busy"):
             state["attention_at"] = now   # 会话提醒要及时：每秒看一眼日志，不等下一次刷新
             if refresh_attention():
@@ -3054,6 +3316,10 @@ def main():
         if "\033" in keys:   # 方向键 / F 键等转义序列（F1 = ESC O P）整段忽略，免得误触 p
             return None
         for ch in keys.lower():
+            if ch in "123456789\t\r\n":
+                if state.get("attention"):
+                    decide_key(ch)
+                continue
             if ch == "q":
                 return "quit"
             if ch == "u" and state.get("can_update"):
