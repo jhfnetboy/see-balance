@@ -1,6 +1,6 @@
 # see-balance
 
-查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) 五个 AI provider 的余额和用量。
+查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) / OpenCode (Anthropic API key) 六个 AI provider 的余额和用量。
 
 ## 安装
 
@@ -32,6 +32,10 @@ DEEPSEEK_API_KEY=sk-your-key-here
 - **Grok (xAI)**：自动读取 `~/.grok/auth.json`（运行 `grok` / `grok login` 生成）或 `XAI_API_KEY`，直连 `cli-chat-proxy.grok.com` 查询：
   - **主周池**（Chat · Imagine · Voice · Build）：7d 使用百分比、进度与重置倒计时；
   - **Grok Bot 池**（Bot / Cursor 独立周额度）：独立周额度不占用主池；支持在 `~/.see-balance.env` 配置 `CURSOR_SESSION_TOKEN` 同步实测用量。
+- **OpenCode (Anthropic)**：自动读取 opencode 的 `~/.local/share/opencode/auth.json`（`opencode auth login` 生成，遵循 `XDG_DATA_HOME`）里的 `anthropic` 条目：
+  - **API key**：用 `GET api.anthropic.com/v1/models` 验 key 是否可用（不耗 token）；Anthropic 没有给普通 API key 查余额的接口，余额请到 [console.anthropic.com](https://console.anthropic.com/settings/billing) 看；
+  - **花费**：从 opencode 本地库 `opencode.db` 只读累加 Anthropic 回复记下的 cost / tokens，显示今天 / 近 7 天 / 近 30 天（只算这台机器上 opencode 的用量，同一个 key 在别处的消耗不在内）；
+  - 用 Claude 订阅（OAuth）登录的，额度和 Claude Code 共用，只显示本地花费估算。
 - **Antigravity (AGY)**：自动读取 macOS Keychain / Google OAuth 凭据，识别 `paidTier` 套餐；直连服务端 `retrieveUserQuotaSummary` 读真实配额。
 
 两个互不相通的池，各自带 **5h + weekly** 两个窗口：
