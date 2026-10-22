@@ -35,7 +35,7 @@ Config:
 No secrets ever leave this machine.
 """
 
-import base64, http.client, io, json, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
+import base64, http.client, io, json, math, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +46,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.5.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.6.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -3018,6 +3018,14 @@ ATTENTION_LOG     = STATE_FILE.parent / "attention.jsonl"
 ATTENTION_HOOK    = STATE_FILE.parent / "hook.py"
 ATTENTION_MAX_AGE = 12 * 3600          # 超过这么久还没动静的提醒（终端关了等）不再显示
 ATTENTION_ROTATE  = 1024 * 1024        # 日志超过这么大就换新文件（旧的留一份 .old）
+# 外部提醒：别的本机程序写 JSON，宠物才看得到。不建这些文件就跟以前一样。
+NOTICES_DIR         = STATE_FILE.parent / "notices"       # 一个文件一条；删掉文件这条就消失
+ACTIONS_FILE        = STATE_FILE.parent / "actions.json"  # 只有这里登记过的命令能被按键跑
+NOTICE_MAX_BYTES    = 16 * 1024     # 再大的提醒文件不读
+NOTICE_STATUS_MAX   = 3             # 底部状态最多同时几条
+NOTICE_STATUS_LINES = 4             # 每条状态最多几行正文
+ACTION_TIMEOUT      = 60            # actions.json 没写 timeout 时用这个
+_ACTION_KEY_TAKEN   = set("quknrtps")  # q u k n r t p s；再绑这些键就只能按回车。数字、Tab、回车不是小写字母
 CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
                          or (Path.home() / ".claude" / "settings.json"))
 GROK_HOOK_FILE    = Path(os.environ.get("SEE_BALANCE_GROK_HOOKS")
@@ -3525,14 +3533,21 @@ def attention_detail(w):
 
 
 def decidable(w, now=None):
-    """这一框能不能在宠物上决定：hook 正在等宠物（有 rid），也还没等到超时。"""
+    """这一框能不能在宠物上决定：hook 正在等宠物（有 rid），也还没等到超时。外部提醒不能。"""
+    if w.get("notice"):
+        return False
     return bool(w.get("rid")) and (now or time.time()) - w["ts"] < DECIDE_WAIT
 
 
 def attention_bubble(items, now=None, pick=None):
-    """宠物气泡（两行）：好几个会话在等时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个；pick 指定就固定显示那一个。"""
+    """宠物气泡（两行）：好几个在等时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个；pick 指定就固定显示那一个。
+    外部 alert 的两行是 title、text，有好几条时同样标 i/n。"""
     i = pick if pick is not None else int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(items)
     w, n = items[i], len(items)
+    if w.get("notice"):
+        mark = f" {i + 1}/{n}" if n > 1 else ""
+        room = max(1, PET_MSG_MAX - display_width(mark))
+        return f"{_clip(_clean(w.get('title')), room)}{mark}\n{_clip(_clean(w.get('text')), PET_MSG_MAX)}"
     title = _clean(w.get("title"))
     head = (f"等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
             + f"：{_project(w)}" + (f"·{title}" if title else ""))
@@ -3565,10 +3580,11 @@ def decision_lines(w, n, qi=0, picks=None):
 
 def attention_lines(items, now=None, focus=None, qi=0, picks=None):
     """底部提醒行：每个等你的会话一行，带上等了多久和那句话；决策框再逐行列出要你决定的内容。
-    focus 是选中的那一框：能在宠物上决定的话，列出按键。"""
+    focus 是选中的那一框：能在宠物上决定的话，列出按键。外部 alert 排在会话后面。"""
     now = now or time.time()
+    sessions = [w for w in items if not w.get("notice")]
     out = []
-    for w in items[:5]:
+    for w in sessions[:5]:
         ago    = fmt_countdown(now - w["ts"])
         detail = attention_detail(w)
         what   = f"：{_clean(w['msg'])}" if w["msg"] and not detail else ""
@@ -3583,8 +3599,208 @@ def attention_lines(items, now=None, focus=None, qi=0, picks=None):
             detail = detail + [f"（{'计划全文' if w.get('tool') == 'ExitPlanMode' else '内容太长'}在宠物上看不全，"
                                f"请回 {_session_label(w)} 那个会话里看完再决定）"]
         out += [f"     {_clip(d, 200)}" for d in detail]
-    if len(items) > 5:
-        out.append(f"🔔 还有 {len(items) - 5} 个会话在等你")
+    if len(sessions) > 5:
+        out.append(f"🔔 还有 {len(sessions) - 5} 个会话在等你")
+    width = _watch_width()
+    for w in items:
+        if w.get("notice"):
+            out += _alert_notice_lines(w, now, w is focus, width)
+    return out
+
+
+# ── 外部提醒 ──────────────────────────────────────────────────────────────────
+#
+# 别的本机程序往 ~/.see-balance/notices/*.json 丢一条，宠物就能叫你（alert），
+# 或只在底部留一块状态（status，不改情绪）。能按键跑的命令只来自 actions.json，
+# 提醒文件里只写动作的名字，不会拿里面的内容去执行。两个路径都没有时，这里什么都不做。
+
+
+def _watch_width():
+    """和会话页底部提醒同一列宽：最右一列留给清行，避免擦掉最后一个字。"""
+    return max(1, shutil.get_terminal_size().columns - 1)
+
+
+def _epoch(value):
+    """秒级时间戳。布尔和别的类型不算；转不成有限数字的也不算。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _as_text(value):
+    """只收字符串。别的类型（数字、对象）不当成要显示的文字。"""
+    return _clean(value) if isinstance(value, str) else ""
+
+
+def _output_line(text):
+    """命令输出的第一行。没有就空串。"""
+    if not text:
+        return ""
+    lines = str(text).splitlines()
+    return lines[0] if lines else ""
+
+
+def _action_message(label, ok, detail):
+    """动作跑完后底部那句。detail 是 stdout / stderr 的第一行，或 timeout。"""
+    label, detail = _clean(label), _clean(detail)
+    return f"✓ {label}：{detail}" if ok else f"⚠ {label}失败：{detail}"
+
+
+def _read_notice(path, now):
+    """一个提醒文件。不能用就返回 None：不是自己的、太大、太旧、过期、读不了、格式不对。"""
+    try:
+        if not _owned_by_me(path):
+            return None
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > NOTICE_MAX_BYTES:
+            return None
+        if now - st.st_mtime > ATTENTION_MAX_AGE:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    try:
+        if not isinstance(data, dict):
+            return None
+        level = data.get("level")
+        if level not in ("alert", "status"):
+            return None
+        if "expires" in data and data.get("expires") is not None:
+            exp = _epoch(data.get("expires"))
+            if exp is None or exp <= now:   # 过期，或写了却不是时间戳：别留着一条清不掉的提醒
+                return None
+        ts = _epoch(data.get("ts"))
+        if ts is None:
+            return None
+        if level == "alert":
+            action = data.get("action")
+            return "alert", {"notice": True, "src": "notice", "sid": path.name, "kind": "", "ts": ts,
+                             "title": _as_text(data.get("title")), "text": _as_text(data.get("text")),
+                             "action": action if isinstance(action, str) else ""}
+        lines = data.get("lines")
+        body = [_clean(x) for x in lines if isinstance(x, str)] if isinstance(lines, list) else []
+        return "status", {"title": _as_text(data.get("title")), "lines": body, "ts": ts}
+    except Exception:
+        return None   # 这一份解析后出了意外：只丢掉这一份，别让整目录的提醒一起消失
+
+
+def external_notices(now=None):
+    """NOTICES_DIR 里的 *.json → (alerts, statuses)。按文件名排。任何错误都跳过，绝不抛出。"""
+    try:
+        now = now or time.time()
+        try:
+            names = sorted(name for name in os.listdir(NOTICES_DIR)
+                           if name.endswith(".json") and not name.startswith("."))
+        except OSError:
+            return [], []
+        alerts, statuses = [], []
+        for name in names:
+            item = _read_notice(NOTICES_DIR / name, now)
+            if not item:
+                continue
+            if item[0] == "alert":
+                alerts.append(item[1])
+            elif len(statuses) < NOTICE_STATUS_MAX:
+                statuses.append(item[1])
+        return alerts, statuses
+    except Exception:
+        return [], []
+
+
+def _action_timeout(value):
+    """没写、或不是正数时，用 ACTION_TIMEOUT。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return ACTION_TIMEOUT
+    return value
+
+
+def _one_action(name, spec, used):
+    """一条动作。cmd 必须是非空的字符串列表，且第一个是绝对路径的可执行文件。不合就返回 None。"""
+    if not isinstance(name, str) or not name or not isinstance(spec, dict):
+        return None
+    cmd = spec.get("cmd")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        return None
+    exe = cmd[0]
+    if not os.path.isabs(exe) or not os.path.isfile(exe) or not os.access(exe, os.X_OK):
+        return None
+    label = _as_text(spec.get("label")) or _clean(name)
+    key = spec.get("key")
+    if (not isinstance(key, str) or len(key) != 1 or key not in "abcdefghijklmnopqrstuvwxyz"
+            or key in _ACTION_KEY_TAKEN or key in used):
+        key = ""   # 撞上已有的键、或不是单个小写字母：动作还在，只能按回车
+    return {"label": label, "key": key, "cmd": list(cmd), "timeout": _action_timeout(spec.get("timeout"))}
+
+
+def load_actions():
+    """读 ACTIONS_FILE。不是自己的、或群组/其他人写得进，整份不用。出错返回 {}。"""
+    try:
+        if not _owned_by_me(ACTIONS_FILE, private=True):
+            return {}
+        st = os.lstat(ACTIONS_FILE)
+        if not stat.S_ISREG(st.st_mode):
+            return {}
+        data = json.loads(ACTIONS_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out, used = {}, set()
+    for name, spec in data.items():
+        try:
+            act = _one_action(name, spec, used)
+        except Exception:
+            continue
+        if not act:
+            continue
+        out[name] = act
+        if act["key"]:
+            used.add(act["key"])
+    return out
+
+
+def annotate_notice_actions(alerts, actions):
+    """把已登记动作的 label / key 抄到 alert 上，供底部那行用。不抄 cmd。"""
+    actions = actions or {}
+    for w in alerts:
+        act = actions.get(w.get("action") or "")
+        w["action_label"] = act["label"] if act else ""
+        w["action_key"] = act["key"] if act else ""
+    return alerts
+
+
+def _alert_notice_lines(w, now, focused, width):
+    """一条 alert 的底部行。选中且动作已登记时，下一行写出按键。"""
+    ago = fmt_countdown(now - float(w.get("ts") or 0))
+    line = _clip(f"🔔 {_clean(w.get('title'))}：{_clean(w.get('text'))}（{ago} 前）", width)
+    out = [line]
+    if focused and w.get("action_label"):
+        key = w.get("action_key") or ""
+        extra = f" / {key}" if key else ""
+        out.append(_clip(f"   按 Enter{extra} {_clean(w.get('action_label'))}", width))
+    return out
+
+
+def status_notice_lines(items, width):
+    """底部状态块。最多 3 条、每条 4 行，每行裁到 width 列，不换行。"""
+    width = max(1, int(width or 1))
+    out = []
+    for item in (items or [])[:NOTICE_STATUS_MAX]:
+        out.append(_clip(f"📋 {_as_text(item.get('title'))}", width))
+        shown = 0
+        for line in item.get("lines") or []:
+            if shown >= NOTICE_STATUS_LINES:
+                break
+            if not isinstance(line, str):
+                continue
+            out.append(_clip("   " + _clean(line), width))
+            shown += 1
     return out
 
 
@@ -5144,14 +5360,25 @@ def main():
         return bool(v) and not state.get("update_skip") and v != state.get("update_muted")
 
     def refresh_attention():
-        """重读“哪些会话在等你”；有变化返回 True。没装 hook 就什么都不做。"""
+        """重读“哪些会话在等你”，以及外部提醒。有变化返回 True。没装 hook 就不读会话日志。"""
         items = attention_items() if state["attention_on"] else []
         items = [w for w in items if w.get("rid") not in state["decided"]]   # 刚在宠物上决定的，别等会话记录更新再消失
-        key   = [(w["src"], w["sid"], w["kind"], w["ts"], w.get("what"), str(w.get("qs")), w.get("rid"), w.get("title"))
-                 for w in items]
-        if key == state.get("attention_key"):
+        try:
+            alerts, statuses = external_notices()
+            actions = load_actions()
+        except Exception:          # 外部提醒出任何错都不能影响 watch
+            alerts, statuses, actions = [], [], {}
+        state["actions"] = actions   # 命令变了也要换上，哪怕底部文字没变
+        annotate_notice_actions(alerts, actions)
+        items.extend(alerts)          # 会话在前（等得最久的排最前），然后才是 alert（按文件名）
+        key = [(w.get("src"), w.get("sid"), w.get("kind"), w.get("ts"), w.get("what"), str(w.get("qs")),
+                w.get("rid"), w.get("title"), w.get("text"), w.get("action"), w.get("action_label"),
+                w.get("action_key")) for w in items]
+        status_key = [(w.get("title"), tuple(w.get("lines") or ()), w.get("ts")) for w in statuses]
+        if key == state.get("attention_key") and status_key == state.get("status_key"):
             return False
         state["attention"], state["attention_key"] = items, key
+        state["statuses"], state["status_key"] = statuses, status_key
         return True
 
     def set_pet_mood():
@@ -5198,11 +5425,15 @@ def main():
         else:
             note = state.get("update_hint")
         sync_focus()
+        width = max(1, size.columns - 1)
         calls = "\n".join(attention_lines(state.get("attention") or [], focus=focused(),
                                           qi=state["qi"], picks=state["picks"]))
         msg   = state.get("decide_msg")
-        if msg and time.time() - msg[1] < 15:
+        if msg and (time.time() - msg[1] < 15 or state.get("action_running")):
             calls = (calls + "\n" if calls else "") + msg[0]
+        status = "\n".join(status_notice_lines(state.get("statuses") or [], width))
+        if status:
+            calls = (calls + "\n" if calls else "") + status
         state["attention_min"] = int(time.time() // 60)
         footer = f"🔄 每 {interval_min} 分钟刷新 · {tab_name} · t 切换{keys} · r 刷新 · q 退出"
         if tab == "sessions":
@@ -5215,9 +5446,8 @@ def main():
             if state.get("busy"):
                 extra += 1
             # 会话页不清屏重画，每行后面跟 \033[K。一行写满最后一列时，光标停在待换行，
-            # \033[K 会把最后一个字擦掉。宽度只在这里定一次：表格交给 session_lines
+            # \033[K 会把最后一个字擦掉。宽度只在上面定一次：表格交给 session_lines
             # （它保证每行 ≤ width，单元格只裁一次），底部的提醒、更新提示、正在刷新另收。
-            width = max(1, size.columns - 1)
             body = "\n".join(session_lines(state.get("sessions") or [], width,
                                             max(1, size.lines - extra),
                                             filt=state.get("sessions_filt") or None))
@@ -5328,10 +5558,77 @@ def main():
         set_pet_mood()
         paint()
 
+    def _notice_action_for_key(ch):
+        """当前显示的 alert 里，绑了这个键的动作名。选中的那条优先。没有返回 ""。"""
+        if not ch:
+            return ""
+        actions, found, current = state.get("actions") or {}, "", focused()
+        for w in state.get("attention") or []:
+            if not w.get("notice"):
+                continue
+            name = w.get("action") or ""
+            act = actions.get(name)
+            if not act or act.get("key") != ch:
+                continue
+            if w is current:
+                return name
+            if not found:
+                found = name
+        return found
+
+    def _finish_notice_action():
+        """后台动作跑完了：换上结果那句，并马上再读一遍提醒。"""
+        if "action_result" not in state:
+            return
+        text = state.pop("action_result")
+        state["action_running"] = None
+        state["decide_msg"] = (_clip(_clean(text), _watch_width()), time.time())
+        refresh_attention()
+        if not state.get("busy"):   # 刷新余额时宠物停在“正在刷新”，别被这里改掉
+            set_pet_mood()
+        paint()
+
+    def start_notice_action(name):
+        """跑一个已登记的动作。没挂在正在显示的 alert 上、或上一个还没跑完，就什么都不做。"""
+        if not name or state.get("action_running") or "action_result" in state:
+            return False
+        act = (state.get("actions") or {}).get(name)
+        if not act:
+            return False
+        if not any(w.get("notice") and w.get("action") == name for w in (state.get("attention") or [])):
+            return False
+        state["action_running"] = name
+        label, cmd, timeout = act["label"], list(act["cmd"]), act["timeout"]
+        state["decide_msg"] = (_clip(f"⏳ 正在{label}…", _watch_width()), time.time())
+
+        def work():
+            try:
+                proc = subprocess.run(cmd, timeout=timeout, stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, errors="replace")
+            except subprocess.TimeoutExpired:
+                text = _action_message(label, False, "timeout")
+            except Exception as e:
+                text = _action_message(label, False, _clip(_clean(str(e)), 200))
+            else:
+                if proc.returncode == 0:
+                    text = _action_message(label, True, _clip(_clean(_output_line(proc.stdout)), 200))
+                else:
+                    detail = _output_line(proc.stderr) or _output_line(proc.stdout)
+                    text = _action_message(label, False, _clip(_clean(detail), 200))
+            state["action_result"] = text
+
+        threading.Thread(target=work, daemon=True).start()
+        paint()
+        return True
+
     def decide_key(ch):
-        """数字选选项 / 允许拒绝，回车提交多选，Tab 换下一个会话。交出了决定返回 True。"""
+        """数字选选项 / 允许拒绝，回车提交多选，Tab 换下一个会话。交出了决定返回 True。
+        外部 alert 不能用数字决定；选中它时回车触发它登记的动作。"""
         items = state.get("attention") or []
-        if not items or (ch != "\t" and time.time() < state.get("cooldown", 0)):
+        if not items:
+            return False
+        if ch != "\t" and time.time() < state.get("cooldown", 0):
+            # 冷却挡住决定键和回车，免得连按落到下一个会话，或误触发外部提醒
             return False
         sync_focus()
         w = focused()
@@ -5342,6 +5639,10 @@ def main():
             set_pet_mood()
             paint()
             return False
+        if w.get("notice"):
+            if ch in ("\r", "\n"):
+                start_notice_action(w.get("action"))
+            return False   # 数字键对外部提醒不起作用
         if not decidable(w):
             return False
         if not w.get("qs"):
@@ -5372,6 +5673,9 @@ def main():
     def pump(timeout):
         """推进一帧宠物动画，再等按键最多 timeout 秒。返回 "quit" / "refresh" / None。"""
         now = time.time()
+        if "action_result" in state:   # 动作刚跑完：马上换结果，并重读提醒
+            _finish_notice_action()
+            now = time.time()
         if update_mode:
             poll_update(now)
         if state["attention_on"] and now - state.get("alive_at", 0) >= 1:
@@ -5381,18 +5685,19 @@ def main():
             except OSError:
                 pass
         msg = state.get("decide_msg")
-        if msg and now - msg[1] >= 15 and not state.get("busy"):
+        if (msg and now - msg[1] >= 15 and not state.get("busy")
+                and not state.get("action_running")):   # 动作还在跑时，“正在…”一直留着
             state["decide_msg"] = None
             paint()
-        if state["attention_on"] and now - state.get("attention_at", 0) >= 1 and not state.get("busy"):
-            state["attention_at"] = now   # 会话提醒要及时：每秒看一眼日志，不等下一次刷新
+        if now - state.get("attention_at", 0) >= 1 and not state.get("busy"):
+            state["attention_at"] = now   # 会话提醒和外部提醒都在这一拍读，不等下一次刷新
             if refresh_attention():
                 set_pet_mood()
                 paint()
             elif state.get("attention") and int(now // 60) != state.get("attention_min"):
                 paint()               # 底部“等了多久”按分钟走
             elif len(state.get("attention") or []) > 1:
-                set_pet_mood()        # 气泡轮到下一个会话（没到点就不变）
+                set_pet_mood()        # 气泡轮到下一个（没到点就不变）
         if not state.get("attention") and not state.get("busy") and now - state.get("mood_at", 0) >= 1:
             state["mood_at"] = now    # 用量提醒该说或该停了（没到点就不变）
             set_pet_mood()
@@ -5452,6 +5757,8 @@ def main():
                 save_state(full)
                 if state["place"]:
                     pet_draw(state["pet"].frame(), *state["place"])
+            if "a" <= ch <= "z":   # 占用键在 load_actions 里已经摘掉，这里不会撞上 q/u/k/n/r/t/p/s
+                start_notice_action(_notice_action_for_key(ch))
         return None
 
     def wait_interactive(seconds):
@@ -5577,9 +5884,10 @@ def main():
             if pet_mode and sys.stdout.isatty():
                 body = pet_merge_static(body, state["pet"].frame(), shutil.get_terminal_size().columns)
             print(body)
-            calls = attention_lines(state.get("attention") or [])
-            if calls:
-                print("\n" + "\n".join(calls))
+            block = list(attention_lines(state.get("attention") or []))
+            block += status_notice_lines(state.get("statuses") or [], _watch_width())
+            if block:
+                print("\n" + "\n".join(block))
             if hint and not compact:
                 print("\n" + hint)
         if watch_mode and (redraw or not state.get("footer_shown")):
