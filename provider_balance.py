@@ -3048,7 +3048,7 @@ ATTENTION_MAX_AGE = 12 * 3600          # 超过这么久还没动静的提醒（
 ATTENTION_ROTATE  = 1024 * 1024        # 日志超过这么大就换新文件（旧的留一份 .old）
 # 外部提醒：别的本机程序写 JSON，宠物才看得到。不建这些文件就跟以前一样。
 NOTICES_DIR         = STATE_FILE.parent / "notices"       # 一个文件一条；删掉文件这条就消失
-SLACK_SENT_DIR      = STATE_FILE.parent / "slack-sent"    # 一条已发过的 Slack 提醒一个空文件
+SLACK_SENT_DIR      = STATE_FILE.parent / "slack-sent"    # 每条提醒一个文件：写了 sent 才算发过，空的是在发或没发成
 SLACK_DELAY_DEFAULT = 60                                  # 等这么多秒还没处理才发
 SLACK_RETRY         = 300                                 # 发送失败后多久再试（秒）
 ACTIONS_FILE        = STATE_FILE.parent / "actions.json"  # 只有这里登记过的命令能被按键跑
@@ -3839,9 +3839,9 @@ def status_notice_lines(items, width):
 #
 # --watch 看到有事在等你、而且已经等够久，才用 Incoming Webhook 发一条。
 # 只写谁在等、等的是哪一类。问题、选项、命令、路径、计划标题、提醒正文都不出门。
-# 发过的在 SLACK_SENT_DIR 留一个空文件，几个 watch 进程也不会重复发。
+# marker 在 SLACK_SENT_DIR：空文件是在发或没发成（mtime 是上次尝试），写了 sent 才算发过。
+# 几个 watch 靠这个文件认，不会发重。失败或发到一半退出，过 SLACK_RETRY 由先到的再试。
 
-_SLACK_RETRY_AT = {}   # key → 失败后最早能再试的 time.time()
 _SLACK_PRUNE_AT = 0.0  # 上次清理 marker 的时间；一小时最多一次
 
 
@@ -3886,7 +3886,7 @@ def notify_slack(items, url, delay, now=None):
         if not url:
             return
         now = time.time() if now is None else now
-        if now - _SLACK_PRUNE_AT >= 3600:   # 比提醒寿命还久一小时的 marker 可以丢
+        if now - _SLACK_PRUNE_AT >= 3600:   # 比提醒寿命还久一小时的 marker 和 *.claim 可以丢
             _SLACK_PRUNE_AT = now
             try:
                 cutoff = now - (ATTENTION_MAX_AGE + 3600)
@@ -3904,29 +3904,58 @@ def notify_slack(items, url, delay, now=None):
                 if now - float(w["ts"]) < delay:
                     continue
                 key = _slack_key(w)
-                if _SLACK_RETRY_AT.get(key, 0) > time.time():
-                    continue
                 text = slack_text(w, now)
                 SLACK_SENT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
                 path = SLACK_SENT_DIR / key
                 try:
                     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    os.close(fd)
                 except FileExistsError:
-                    continue   # 这个进程或另一个 watch 已经发过
-                os.close(fd)
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    if st.st_size > 0:   # 已经发出去了
+                        if now - st.st_mtime > 3600:   # 还活着就续上 mtime，免得清掉后又发
+                            try:
+                                os.utime(path)
+                            except OSError:
+                                pass
+                        continue
+                    if now - st.st_mtime < SLACK_RETRY:
+                        continue   # 正在发，或失败后还在冷却。SLACK_RETRY 远大于 HTTP_TIMEOUT
+                    # 空着且过了冷却：上次没成，或发到一半进程没了。按这一代 mtime 抢 O_EXCL 锁。
+                    try:
+                        fd = os.open(SLACK_SENT_DIR / f"{key}.{st.st_mtime_ns}.claim",
+                                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    except (FileExistsError, OSError):
+                        continue   # 同一代只有一个赢家；claim 留着，清理按 mtime 删
+                    os.close(fd)
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        os.close(fd)
+                    except FileExistsError:
+                        continue
 
-                def send(url=url, text=text, key=key, path=path):
+                def send(url=url, text=text, path=path):
                     try:
                         ok, _err = slack_post(url, text)
                     except Exception:
                         ok = False
                     if ok:
+                        try:
+                            _write_atomic(path, "sent", mode=0o600)
+                        except OSError:
+                            pass
                         return
                     try:
-                        path.unlink()
+                        os.utime(path)   # 留着空文件；冷却从现在起，别的进程和重启都认
                     except OSError:
                         pass
-                    _SLACK_RETRY_AT[key] = time.time() + SLACK_RETRY
 
                 threading.Thread(target=send, daemon=True).start()
             except Exception:
