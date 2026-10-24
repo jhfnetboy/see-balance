@@ -20,6 +20,7 @@ Usage:
   python3 provider_balance.py --sessions       # print the live session table once, no API calls
   python3 provider_balance.py --update         # install the latest version from upstream main now
   python3 provider_balance.py --version        # print the version
+  python3 provider_balance.py --slack-test     # send a test message to SLACK_WEBHOOK_URL
   python3 provider_balance.py --no-update      # skip the daily update check (or SEE_BALANCE_UPDATE=0)
   python3 provider_balance.py --install-hooks  # pet reminds you when a Claude Code / Grok session waits for you
   python3 provider_balance.py --uninstall-hooks
@@ -29,13 +30,13 @@ Usage:
   u installs a downloaded update and restarts, q quits.
 
 Config:
-  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, SEE_BALANCE_SESSIONS, and proxy settings here
+  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, SEE_BALANCE_SESSIONS, SLACK_WEBHOOK_URL, and proxy settings here
   State cached at:     ~/.see-balance/state.json
 
 No secrets ever leave this machine.
 """
 
-import base64, http.client, io, json, math, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
+import base64, hashlib, http.client, io, json, math, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +47,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.6.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.7.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -194,6 +195,33 @@ def load_env_sessions():
                 val = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
     return [p.strip() for p in (val or "").split(",") if p.strip()]
+
+def load_slack_webhook():
+    """SLACK_WEBHOOK_URL。环境变量优先，空着再看 ~/.see-balance.env。不是 https://hooks.slack.com/ 开头就当没配。"""
+    val = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not val and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SLACK_WEBHOOK_URL="):
+                val = line.split("=", 1)[1]
+                break
+    val = (val or "").strip().strip('"').strip("'")
+    return val if val.startswith("https://hooks.slack.com/") else ""
+
+def load_slack_delay():
+    """SEE_BALANCE_SLACK_DELAY（秒，整数 ≥ 0）。没设或写错就用 SLACK_DELAY_DEFAULT。"""
+    val = os.environ.get("SEE_BALANCE_SLACK_DELAY", "")
+    if not val and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SEE_BALANCE_SLACK_DELAY="):
+                val = line.split("=", 1)[1]
+                break
+    try:
+        n = int((val or "").strip().strip('"').strip("'"))
+    except (TypeError, ValueError):
+        return SLACK_DELAY_DEFAULT
+    return n if n >= 0 else SLACK_DELAY_DEFAULT
 
 def load_state():
     if STATE_FILE.exists():
@@ -3020,6 +3048,9 @@ ATTENTION_MAX_AGE = 12 * 3600          # 超过这么久还没动静的提醒（
 ATTENTION_ROTATE  = 1024 * 1024        # 日志超过这么大就换新文件（旧的留一份 .old）
 # 外部提醒：别的本机程序写 JSON，宠物才看得到。不建这些文件就跟以前一样。
 NOTICES_DIR         = STATE_FILE.parent / "notices"       # 一个文件一条；删掉文件这条就消失
+SLACK_SENT_DIR      = STATE_FILE.parent / "slack-sent"    # 每条提醒一个文件：写了 sent 才算发过，空的是在发或没发成
+SLACK_DELAY_DEFAULT = 60                                  # 等这么多秒还没处理才发
+SLACK_RETRY         = 300                                 # 发送失败后多久再试（秒）
 ACTIONS_FILE        = STATE_FILE.parent / "actions.json"  # 只有这里登记过的命令能被按键跑
 NOTICE_MAX_BYTES    = 16 * 1024     # 再大的提醒文件不读
 NOTICE_STATUS_MAX   = 3             # 底部状态最多同时几条
@@ -3802,6 +3833,136 @@ def status_notice_lines(items, width):
             out.append(_clip("   " + _clean(line), width))
             shown += 1
     return out
+
+
+# ── Slack 提醒 ────────────────────────────────────────────────────────────────
+#
+# --watch 看到有事在等你、而且已经等够久，才用 Incoming Webhook 发一条。
+# 只写谁在等、等的是哪一类。问题、选项、命令、路径、计划标题、提醒正文都不出门。
+# marker 在 SLACK_SENT_DIR：空文件是在发或没发成（mtime 是上次尝试），写了 sent 才算发过。
+# 几个 watch 靠这个文件认，不会发重。失败或发到一半退出，过 SLACK_RETRY 由先到的再试。
+
+_SLACK_PRUNE_AT = 0.0  # 上次清理 marker 的时间；一小时最多一次
+
+
+def _slack_escape(text):
+    """Slack 把 & < > 当标记。先换成实体。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def slack_text(w, now):
+    """会话：谁的哪一类。外部提醒：只有标题。已等时长用 fmt_countdown。"""
+    host = socket.gethostname().split(".")[0]
+    ago  = fmt_countdown(now - w["ts"])
+    if w.get("notice"):
+        title = _clean(w.get("title")) or "外部提醒"
+        text  = f"🔔 [{host}] {title}（已等 {ago}）"
+    else:
+        tool  = w.get("tool") or ""
+        extra = f"（{tool}）" if tool and tool not in DECIDE_KINDS else ""
+        text  = f"🔔 [{host}] {_attention_name(w)} 在等你{w['kind']}{extra}（已等 {ago}）"
+    return _slack_escape(_clean(text))
+
+
+def _slack_key(w):
+    """同一条等待的稳定 id。src / sid / ts / rid 没变就是同一条。"""
+    blob = json.dumps([w.get("src"), w.get("sid"), w.get("ts"), w.get("rid")])
+    return hashlib.sha1(blob.encode()).hexdigest()[:24]
+
+
+def slack_post(url, text):
+    """发一条。Slack 成功回纯文本 ok，所以 http_post 是 (200, None)。返回 (成了没, 失败原因)。"""
+    status, body = http_post(url, headers={"Content-Type": "application/json"}, body={"text": text})
+    if status == 200:
+        return True, ""
+    err = str(body.get("_transport_error") or "") if isinstance(body, dict) else ""
+    return False, err or f"HTTP {status}"
+
+
+def notify_slack(items, url, delay, now=None):
+    """等够 delay 秒的每条最多发一次；HTTP 放进守护线程，不挡住 watch。任何错都不抛出。"""
+    global _SLACK_PRUNE_AT
+    try:
+        if not url:
+            return
+        now = time.time() if now is None else now
+        for w in items or []:
+            try:
+                if now - float(w["ts"]) < delay:
+                    continue
+                key = _slack_key(w)
+                text = slack_text(w, now)
+                SLACK_SENT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                path = SLACK_SENT_DIR / key
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    os.close(fd)
+                except FileExistsError:
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    if st.st_size > 0:   # 已经发出去了
+                        if now - st.st_mtime > 3600:   # 还活着就续上 mtime，免得清掉后又发
+                            try:
+                                os.utime(path)
+                            except OSError:
+                                pass
+                        continue
+                    if now - st.st_mtime < SLACK_RETRY:
+                        continue   # 正在发，或失败后还在冷却。SLACK_RETRY 远大于 HTTP_TIMEOUT
+                    # 空着且过了冷却：上次没成，或发到一半进程没了。按这一代 mtime 抢 O_EXCL 锁。
+                    try:
+                        fd = os.open(SLACK_SENT_DIR / f"{key}.{st.st_mtime_ns}.claim",
+                                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    except (FileExistsError, OSError):
+                        continue   # 同一代只有一个赢家；claim 留着，清理按 mtime 删
+                    os.close(fd)
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                        os.close(fd)
+                    except FileExistsError:
+                        continue
+
+                def send(url=url, text=text, path=path):
+                    try:
+                        ok, _err = slack_post(url, text)
+                    except Exception:
+                        ok = False
+                    if ok:
+                        try:
+                            _write_atomic(path, "sent", mode=0o600)
+                        except OSError:
+                            pass
+                        return
+                    try:
+                        os.utime(path)   # 留着空文件；冷却从现在起，别的进程和重启都认
+                    except OSError:
+                        pass
+
+                threading.Thread(target=send, daemon=True).start()
+            except Exception:
+                continue
+        if now - _SLACK_PRUNE_AT >= 3600:   # 比提醒寿命还久一小时的 marker 和 *.claim 可以丢。
+            # 放在上面那轮之后：还活着的提醒先续上 mtime，watch 停了很久再开也不会被清掉重发
+            _SLACK_PRUNE_AT = now
+            try:
+                cutoff = now - (ATTENTION_MAX_AGE + 3600)
+                for name in os.listdir(SLACK_SENT_DIR):
+                    path = SLACK_SENT_DIR / name
+                    try:
+                        if path.stat().st_mtime < cutoff:
+                            path.unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+    except Exception:
+        return
 
 
 # ── 会话页（进行中的会话和它派出的子 agent）──────────────────────────────────
@@ -5315,6 +5476,15 @@ def main():
     if "--version" in args:
         print(f"see-balance v{__version__}")
         return
+    if "--slack-test" in args:
+        url = load_slack_webhook()
+        if not url:
+            print("把 SLACK_WEBHOOK_URL=https://hooks.slack.com/... 写进 ~/.see-balance.env")
+            sys.exit(1)
+        host = socket.gethostname().split(".")[0]
+        ok, err = slack_post(url, _slack_escape(_clean(f"🔔 [{host}] see-balance：Slack 提醒测试")))
+        print("✓ 已发到 Slack" if ok else f"⚠ 发送失败：{err}")
+        sys.exit(0 if ok else 1)
     if "--update" in args:
         upd  = check_update(load_state().get("update"), force=True)
         full = load_state()   # 查更新要几秒，期间别的终端可能写过 state：重新读，只改 update 段
@@ -5352,7 +5522,9 @@ def main():
              "pet_visible": True, "size": None, "place": None,
              "attention_on": not json_mode and not compact and hooks_installed(),
              "focus": None, "qi": 0, "picks": {}, "pick_for": None, "decided": set(), "touched": 0.0,
-             "tab": "usage", "paint_tab": None, "sessions": [], "sessions_at": 0.0, "sessions_filt": ""}
+             "tab": "usage", "paint_tab": None, "sessions": [], "sessions_at": 0.0, "sessions_filt": "",
+             "slack": ((load_slack_webhook(), load_slack_delay())
+                       if watch_mode and not json_mode and not compact else ("", 0))}
 
     def update_prompt():
         """要不要弹升级选项：有下载好的新版本，这次没跳过，这个版本也没说过“不要提醒”。"""
@@ -5698,6 +5870,8 @@ def main():
                 paint()               # 底部“等了多久”按分钟走
             elif len(state.get("attention") or []) > 1:
                 set_pet_mood()        # 气泡轮到下一个（没到点就不变）
+            if state["slack"][0]:    # 刚在宠物上决定的已经从 attention 里拿掉了
+                notify_slack(state.get("attention") or [], *state["slack"])
         if not state.get("attention") and not state.get("busy") and now - state.get("mood_at", 0) >= 1:
             state["mood_at"] = now    # 用量提醒该说或该停了（没到点就不变）
             set_pet_mood()
@@ -5932,7 +6106,21 @@ def main():
     if watch_mode:
         try:
             while True:
-                time.sleep(interval_min * 60)
+                if state["slack"][0]:
+                    # 没开交互终端时也盯着“在等你”。按小步睡，发失败也不能把循环弄断
+                    deadline = time.time() + interval_min * 60
+                    while True:
+                        left = deadline - time.time()
+                        if left <= 0:
+                            break
+                        time.sleep(min(5, left))
+                        try:
+                            notify_slack((attention_items() if state["attention_on"] else [])
+                                         + external_notices()[0], *state["slack"])
+                        except Exception:
+                            pass
+                else:
+                    time.sleep(interval_min * 60)
                 state["full"] = load_state()
                 do_query()
         except KeyboardInterrupt:

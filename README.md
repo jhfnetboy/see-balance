@@ -23,6 +23,9 @@ DEEPSEEK_API_KEY=sk-your-key-here
 # XAI_API_KEY=xai-your-key-here
 # 可选：查 opencode 那个 Anthropic key 的过期时间
 # ANTHROPIC_ADMIN_KEY=sk-ant-admin-your-key-here
+# 可选：有事在等你时发 Slack（见「Slack 提醒」）
+# SLACK_WEBHOOK_URL=https://hooks.slack.com/...
+# SEE_BALANCE_SLACK_DELAY=60
 
 # 如需代理（VPN 场景）：
 # HTTPS_PROXY=http://127.0.0.1:7890
@@ -67,6 +70,7 @@ python3 ~/bin/provider_balance.py --pet-demo   # 不查接口，演示宠物的�
 python3 ~/bin/provider_balance.py --sessions   # 只画一帧「会话」页，不查余额
 python3 ~/bin/provider_balance.py --update     # 马上检查并安装上游最新版
 python3 ~/bin/provider_balance.py --version    # 看当前版本
+python3 ~/bin/provider_balance.py --slack-test # 发一条测试消息到 Slack，确认 webhook 可用
 python3 ~/bin/provider_balance.py --no-update  # 这次不检查更新（或设 SEE_BALANCE_UPDATE=0）
 python3 ~/bin/provider_balance.py --install-hooks    # 开启会话提醒（见下）
 python3 ~/bin/provider_balance.py --uninstall-hooks  # 关掉会话提醒
@@ -148,6 +152,38 @@ EOF
 `key` 只能是一个小写字母，而且不能占已有的快捷键（`q` `u` `k` `n` `r` `t` `p` `s`，以及数字、Tab、回车）。占了的话动作还在，只是只能按回车触发。两个动作写了同一个键时，文件里靠后的那个同样只能按回车。
 
 这几条是为了不让别的用户、或一条提醒本身，借宠物的手跑命令：提醒文件必须是你自己的（符号链接不算）；`actions.json` 必须是你自己的，而且群组和其他人不能写；`cmd` 必须是非空的字符串列表，第一个是本机上存在、并且你能执行的绝对路径。对不上的动作整条忽略。
+
+## Slack 提醒
+
+`--watch` 发现有事在等你决定（会话提醒，或 `level` 为 `alert` 的外部提醒），并且这件事已经连续等了至少 60 秒还没变，就用 Slack 的 Incoming Webhook 发一条。你可能几秒内就在终端里处理了，所以不满 60 秒不发。一次性查询不发。
+
+建一个 Slack app，打开 Incoming Webhooks，选一个频道（例如只有你自己在的私有频道），把拿到的 URL 写进 `~/.see-balance.env`：
+
+```bash
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+URL 必须以 `https://hooks.slack.com/` 开头，不然当成没配。想先确认能发出去：`python3 provider_balance.py --slack-test`。
+
+等多久可以改，单位是秒：
+
+```bash
+SEE_BALANCE_SLACK_DELAY=60
+```
+
+没写、或写的不是 ≥ 0 的整数，就还是 60 秒。这两项只在启动时读，改完要重启 `--watch`。
+
+每条只发一次。发过的在 `~/.see-balance/slack-sent/` 里留一个文件（写上 `sent` 才算发过），所以同时开好几个 `--watch` 也不会发重。发送失败，或者 `--watch` 发到一半退出，就过 5 分钟再试，哪个 `--watch` 先到就由它发。
+
+消息里只有：这台机器的短主机名、哪个项目的哪个会话在等、等你的是哪一类（选择、确认、批准计划、回复这些）、已经等了多久。工具名只有在不是「选择 / 批准计划」时才带上（这两类名字里已经写了）。外部提醒只带标题，没有标题就写「外部提醒」。
+
+不会带上：问题原文、选项、命令、文件路径、计划标题、会话里最后那句问话，以及外部提醒的正文。
+
+```
+🔔 [my-mac] see-balance「待确认项手机推送」的 Claude 在等你选择（已等 0h01m）
+🔔 [my-mac] see-balance「CI 修复」的 Claude 在等你确认（Bash）（已等 0h03m）
+🔔 [my-mac] PR 要看（已等 0h02m）
+```
 
 ## 会话视图
 
@@ -289,6 +325,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.7.0 | Slack 提醒：`--watch` 发现有事等你超过 60 秒（`SEE_BALANCE_SLACK_DELAY` 可改）就用 Incoming Webhook（`SLACK_WEBHOOK_URL`）发一条，只写谁在等、等哪一类，不带问题、命令和提醒正文；每条只发一次；`--slack-test` 测试 webhook |
 | 1.6.0 | 外部提醒：别的本机程序往 `~/.see-balance/notices/` 放 JSON，宠物可以叫你（alert）或只在底部显示状态（status）；按键动作只来自你自己的 `~/.see-balance/actions.json`，提醒文件里不能带命令 |
 | 1.5.0 | `--watch` 按 `t` 切换「用量 / 会话」。会话页用一张进程表列出进行中的 Claude Code 会话和它派出的子 agent（Grok 只有会话本身），能看到状态、在做什么、时长；`SEE_BALANCE_SESSIONS` 按目录过滤；`--sessions` 只画一帧、不查余额 |
 | 1.4.0 | 会话提醒显示决策内容（问题和选项、命令 / 文件、计划标题）和会话标题，宠物气泡依次轮播；`--watch` 里可以直接在宠物上做决定（数字选选项、1 允许 / 2 拒绝、Tab 换会话），决定交回对应的会话继续执行；Claude 的 5h / 7d 实测消耗和建议各自紧跟在自己那个窗口下面；宠物的用量提醒不再一直挂着（先说 20 秒，之后每 3 分钟说 10 秒），劝歇只提醒、不再推荐别家 |
