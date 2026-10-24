@@ -3886,19 +3886,6 @@ def notify_slack(items, url, delay, now=None):
         if not url:
             return
         now = time.time() if now is None else now
-        if now - _SLACK_PRUNE_AT >= 3600:   # 比提醒寿命还久一小时的 marker 和 *.claim 可以丢
-            _SLACK_PRUNE_AT = now
-            try:
-                cutoff = now - (ATTENTION_MAX_AGE + 3600)
-                for name in os.listdir(SLACK_SENT_DIR):
-                    path = SLACK_SENT_DIR / name
-                    try:
-                        if path.stat().st_mtime < cutoff:
-                            path.unlink()
-                    except OSError:
-                        pass
-            except OSError:
-                pass
         for w in items or []:
             try:
                 if now - float(w["ts"]) < delay:
@@ -3960,6 +3947,20 @@ def notify_slack(items, url, delay, now=None):
                 threading.Thread(target=send, daemon=True).start()
             except Exception:
                 continue
+        if now - _SLACK_PRUNE_AT >= 3600:   # 比提醒寿命还久一小时的 marker 和 *.claim 可以丢。
+            # 放在上面那轮之后：还活着的提醒先续上 mtime，watch 停了很久再开也不会被清掉重发
+            _SLACK_PRUNE_AT = now
+            try:
+                cutoff = now - (ATTENTION_MAX_AGE + 3600)
+                for name in os.listdir(SLACK_SENT_DIR):
+                    path = SLACK_SENT_DIR / name
+                    try:
+                        if path.stat().st_mtime < cutoff:
+                            path.unlink()
+                    except OSError:
+                        pass
+            except OSError:
+                pass
     except Exception:
         return
 
