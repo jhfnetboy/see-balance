@@ -5921,7 +5921,8 @@ def main():
                 reload_sessions()
             paint()          # 文本没变时 paint 自己会跳过写入
         elif pet_mode and state["pet_visible"]:
-            if not state.get("busy") and now - state.get("work_at", 0) >= PET_WORK_SCAN_SEC:
+            # 终端太窄、宠物躲起来时（place 为空）不扫
+            if state["place"] and not state.get("busy") and now - state.get("work_at", 0) >= PET_WORK_SCAN_SEC:
                 state["work_at"] = now   # 用量页也扫会话，宠物才知道谁在干活；会话页自己有 reload_sessions
                 # bash_limit=0：不往回翻 transcript 找命令说明（只用缓存），免得卡住动画
                 try:
