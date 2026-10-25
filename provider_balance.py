@@ -47,7 +47,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.8.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.9.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -3060,7 +3060,7 @@ SLACK_RETRY         = 300                                 # 发送失败后多�
 ACTIONS_FILE        = STATE_FILE.parent / "actions.json"  # 只有这里登记过的命令能被按键跑
 NOTICE_MAX_BYTES    = 16 * 1024     # 再大的提醒文件不读
 NOTICE_STATUS_MAX   = 3             # 底部状态最多同时几条
-NOTICE_STATUS_LINES = 4             # 每条状态最多几行正文
+NOTICE_STATUS_LINES = 6             # 每条状态最多几行正文
 ACTION_TIMEOUT      = 60            # actions.json 没写 timeout 时用这个
 _ACTION_KEY_TAKEN   = set("quknrtps")  # q u k n r t p s；再绑这些键就只能按回车。数字、Tab、回车不是小写字母
 CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
@@ -3151,6 +3151,27 @@ elif ev == "Stop":               # 最后一句是不是在问你：之后的“
     tail = str(e.get("last_assistant_message") or "")[-400:].rstrip().rstrip("\"'”’)）】*_` ")[-300:]   # 先截短：长文本上正则会很慢
     m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
     rec["ask"] = m.group(0).strip()[-120:] if m else ""
+    rec["promise"] = ""          # 在问你的时候不算「等你叫醒」
+    if not rec["ask"]:           # 最后一段是不是说了等某事回来再做
+        chunk = str(e.get("last_assistant_message") or "")[-2000:]
+        para = ""
+        for part in re.split(r"\n\s*\n", chunk):
+            if part.strip():
+                para = part
+        para = para[-300:]
+        m = re.search(r"(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)了?(?:之后|以后|后)[^。！!\n]{0,60}(?:我|再|接着|继续)|等[^。！!？?\n]{1,40}?(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)了?(?:之后|以后|后)?[^。！!\n]{0,60}?(?:我|再|接着|继续|就)|(?:稍后|待会儿?|回头)[^。！!\n]{0,10}(?:我|再)|\b(?:once|when|after)\b[^.!\n]{1,80}\b(?:I'll|I will|I'm going to)\b|\bI'll (?:wait|check back|continue|resume)\b|\bwaiting (?:for|on)\b", para, re.I)
+        if m:                    # 命中所在的那一句，strip 后留最后 120 字
+            start = 0
+            for i in range(m.start() - 1, -1, -1):
+                if para[i] in "。！!？?\n":
+                    start = i + 1
+                    break
+            end = len(para)
+            for i in range(m.end(), len(para)):
+                if para[i] in "。！!\n":
+                    end = i + 1
+                    break
+            rec["promise"] = para[start:end].strip()[-120:]
 try:
     fd = os.open(__LOG__, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode())
@@ -3432,11 +3453,473 @@ def _answered_since(transcript, offset):
         return False
 
 
+_WAKE_CACHE = {}  # path → ((st_size, st_mtime_ns), (到点时间或 None, [剩下的 Cron]))；Cron 每项 {recurring, created, fire}；同一文件只留最新一份
+_WAKE_CRON = {}   # path → {"off": 已读字节, "done": 扫到文件末尾没有, "jobs": [...], "creates": {tool_use id: job}, "deletes": {tool_use id: 要删的 id}, "gone": 剪枝时记下的 job id}
+WAKE_CRON_BUDGET = 16 << 20  # 每次最多往后扫这么多字节，扫不完下次接着扫
+_WAKE_WEEK = 7 * 24 * 3600
+_WAKE_DAY = 24 * 3600   # 一次性 Cron 的时间算不出来（日、月带 * 等）时，创建后这么久内仍算挂着
+_WAKE_CHUNK = 8 << 20
+_CRON_ID_RE = re.compile(r"(?i)\b(?:job\s*)?id\b\W{0,3}([A-Za-z0-9][A-Za-z0-9_-]{3,})")
+_CRON_NAME_NEEDLES = (b'"name":"CronCreate"', b'"name":"CronDelete"',
+                      b'"name": "CronCreate"', b'"name": "CronDelete"')
+_WAKE_NAME_NEEDLES = (b'"name":"ScheduleWakeup"', b'"name": "ScheduleWakeup"')
+
+
+def _oneshot_fire(created_ts, cron):
+    """一次性 Cron 的触发时间（unix 秒）。cron 前四段（分 时 日 月）都是纯数字时，
+    按本地时区、创建那年拼出 datetime；已经早于创建时间就加一年。算不出来返回 None。"""
+    if not created_ts or not isinstance(cron, str):
+        return None
+    parts = cron.split()
+    if len(parts) != 5 or not all(part.isdigit() for part in parts[:4]):
+        return None
+    try:
+        minute, hour, day, month = (int(part) for part in parts[:4])
+        created = datetime.fromtimestamp(created_ts)
+        fire = datetime(created.year, month, day, hour, minute)
+        if fire.timestamp() < created_ts:
+            fire = datetime(created.year + 1, month, day, hour, minute)
+        return fire.timestamp()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _cron_new_state():
+    return {"off": 0, "jobs": [], "creates": {}, "deletes": {}, "gone": set()}
+
+
+def _byte_line_starts(block, needles):
+    """块里被这些标记命中的行首（字节偏移）。同一行只留一次。"""
+    found = set()
+    for needle in needles:
+        if not needle:
+            continue
+        start, nlen = 0, len(needle)
+        while True:
+            i = block.find(needle, start)
+            if i < 0:
+                break
+            found.add(block.rfind(b"\n", 0, i) + 1)
+            start = i + nlen
+    return found
+
+
+def _line_at(block, start):
+    end = block.find(b"\n", start)
+    if end < 0:
+        end = len(block)
+    return block[start:end]
+
+
+def _loads_line(raw):
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        rec = json.loads(text.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _message_content(rec):
+    msg = rec.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    return content if isinstance(content, list) else None
+
+
+def _cron_result_text(item):
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _cron_job_id(rec, item):
+    """先看 toolUseResult 的 id / jobId（字符串），没有再从结果文本里认第一个。"""
+    tur = rec.get("toolUseResult")
+    if isinstance(tur, dict):
+        for key_name in ("id", "jobId"):
+            val = tur.get(key_name)
+            if isinstance(val, str) and val:
+                return val
+    found = _CRON_ID_RE.search(_cron_result_text(item))
+    return found.group(1) if found else None
+
+
+def _tool_use_ids(raw, names):
+    """这一行里指定工具的 tool_use id（字节串）。用来在同一块里把结果行也找出来。"""
+    if not any(needle in raw for needle in names):
+        return []
+    rec = _loads_line(raw)
+    content = _message_content(rec) if rec and rec.get("type") == "assistant" else None
+    if content is None:
+        return []
+    ids = []
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        if item.get("name") not in ("CronCreate", "CronDelete", "ScheduleWakeup"):
+            continue
+        if names is _CRON_NAME_NEEDLES and item.get("name") == "ScheduleWakeup":
+            continue
+        if names is _WAKE_NAME_NEEDLES and item.get("name") != "ScheduleWakeup":
+            continue
+        use = item.get("id")
+        if isinstance(use, str) and use:
+            ids.append(use.encode("utf-8"))
+    return ids
+
+
+def _cron_prune(state, now):
+    """返回前去掉过期任务。循环看 created 早于一周；一次性看 fire 已过 120 秒，fire 算不出来时看 created 早于一天。
+    剪掉时已经认出的 job id 记进 gone，免得之后的 CronDelete 退回去删掉别的还没认出 id 的任务。"""
+    kept = []
+    gone = state["gone"]
+    week = now - _WAKE_WEEK
+    for job in state["jobs"]:
+        if job["recurring"]:
+            drop = job["created"] < week
+        else:
+            fire = job["fire"]
+            drop = job["created"] < now - _WAKE_DAY if fire is None else fire + 120 <= now
+        if not drop:
+            kept.append(job)
+            continue
+        jid = job.get("job")
+        if isinstance(jid, str) and jid:
+            gone.add(jid)
+    state["jobs"] = kept
+
+
+def _cron_consume(block, state):
+    """一块完整的行：只 json.loads 命中 CronCreate / CronDelete、或还在等结果的 tool_use id 的那些行。"""
+    jobs, creates, deletes, gone = state["jobs"], state["creates"], state["deletes"], state["gone"]
+    needles = list(_CRON_NAME_NEEDLES)
+    for tid in list(creates) + list(deletes):
+        if isinstance(tid, str) and tid:
+            needles.append(tid.encode("utf-8"))
+    starts = _byte_line_starts(block, needles)
+    extra = []
+    for ls in sorted(starts):
+        extra.extend(_tool_use_ids(_line_at(block, ls), _CRON_NAME_NEEDLES))
+    if extra:
+        starts |= _byte_line_starts(block, extra)
+
+    def drop_cron(delete_id):
+        """删掉 job 等于这个 id 的任务；id 已经剪枝进 gone 就忽略。对不上就删最早一个还没认出 id 的。"""
+        if isinstance(delete_id, str) and delete_id and delete_id in gone:
+            return
+        if isinstance(delete_id, str) and delete_id:
+            for i, job in enumerate(jobs):
+                if job.get("job") == delete_id:
+                    del jobs[i]
+                    return
+        earliest = None
+        for i, job in enumerate(jobs):
+            if job.get("job") is None:
+                rank = (job["created"], i)
+                if earliest is None or rank < earliest[0]:
+                    earliest = (rank, i)
+        if earliest is not None:
+            del jobs[earliest[1]]
+
+    def apply_result(rec, item):
+        tid = item.get("tool_use_id")
+        if not isinstance(tid, str) or not tid:
+            return
+        err = bool(item.get("is_error"))
+        if tid in creates:
+            job = creates.pop(tid)
+            if err:
+                if job in jobs:
+                    jobs.remove(job)
+            else:
+                job["job"] = _cron_job_id(rec, item)
+                if job not in jobs:   # 结果晚于剪枝：id 补进 gone，别让后面的删除走退路
+                    jid = job.get("job")
+                    if isinstance(jid, str) and jid:
+                        gone.add(jid)
+            return
+        if tid in deletes:
+            delete_id = deletes.pop(tid)
+            if not err:
+                drop_cron(delete_id)
+
+    for ls in sorted(starts):
+        rec = _loads_line(_line_at(block, ls))
+        if rec is None:
+            continue
+        content = _message_content(rec)
+        if content is None:
+            continue
+        if rec.get("type") == "user":
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    apply_result(rec, item)
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_use":
+                continue
+            name = item.get("name")
+            inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+            if name == "CronDelete":
+                use = item.get("id")
+                if isinstance(use, str) and use:
+                    did = inp.get("id")
+                    deletes[use] = did if isinstance(did, str) else None
+            elif name == "CronCreate":
+                created = _parse_time(rec.get("timestamp"))
+                recurring = inp.get("recurring") is not False
+                fire = None if recurring else _oneshot_fire(created, inp.get("cron"))
+                job = {"recurring": recurring, "created": created, "fire": fire,
+                       "job": None, "use": item.get("id")}
+                jobs.append(job)
+                use = item.get("id")
+                if isinstance(use, str) and use:
+                    creates[use] = job
+
+
+def _cron_scan(fh, state, size):
+    """从 off 起按 8MB 一块读，这次最多 WAKE_CRON_BUDGET 字节。最后一行不完整就留到下次，off 停在最后一个换行之后。读到末尾 done 为 True。
+    一整行比预算还长时，越过预算读到这一行的换行为止，免得 off 永远停在原地。"""
+    start = state["off"]
+    if start >= size:
+        state["done"] = True
+        return
+    fh.seek(start)
+    buf, read_at, eof, consumed = b"", start, False, False
+    limit = min(size, start + WAKE_CRON_BUDGET)
+    while read_at < limit or (not consumed and read_at < size):
+        chunk = fh.read(min(_WAKE_CHUNK, limit - read_at) if read_at < limit else _WAKE_CHUNK)
+        if not chunk:
+            eof = True
+            break
+        read_at += len(chunk)
+        buf += chunk
+        nl = buf.rfind(b"\n")
+        if nl < 0:
+            continue
+        _cron_consume(buf[:nl + 1], state)
+        buf, consumed = buf[nl + 1:], True
+    state["off"] = read_at - len(buf)
+    state["done"] = eof or read_at >= size
+
+
+def _schedule_due(raw):
+    """尾部窗口里最后一次 ScheduleWakeup 的到点时间。没有就是 None。"""
+    if not raw:
+        return None
+    needles = list(_WAKE_NAME_NEEDLES)
+    starts = _byte_line_starts(raw, needles)
+    extra = []
+    for ls in sorted(starts):
+        extra.extend(_tool_use_ids(_line_at(raw, ls), _WAKE_NAME_NEEDLES))
+    if extra:
+        starts |= _byte_line_starts(raw, extra)
+
+    wake_id, wake_ts, wake_inp = None, None, None
+    wake_due, wake_fallback, wake_stop = None, None, False
+
+    def apply_result(rec, item):
+        nonlocal wake_due
+        tid = item.get("tool_use_id")
+        if not isinstance(tid, str) or not tid or tid != wake_id:
+            return
+        err = bool(item.get("is_error"))
+        if wake_stop or err:
+            wake_due = None
+            return
+        tur = rec.get("toolUseResult")
+        due = None
+        if isinstance(tur, dict) and "scheduledFor" in tur:
+            try:
+                due = float(tur.get("scheduledFor")) / 1000
+            except (TypeError, ValueError):
+                due = None
+        wake_due = wake_fallback if due is None else due
+
+    for ls in sorted(starts):
+        rec = _loads_line(_line_at(raw, ls))
+        if rec is None:
+            continue
+        content = _message_content(rec)
+        if content is None:
+            continue
+        if rec.get("type") == "user":
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "tool_result":
+                    apply_result(rec, item)
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_use" or item.get("name") != "ScheduleWakeup":
+                continue
+            inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+            wake_id = item.get("id")
+            wake_ts = rec.get("timestamp")
+            wake_inp = inp
+            wake_stop = bool(wake_inp.get("stop"))
+            wake_fallback = None
+            wake_due = None
+            if not wake_stop:
+                try:
+                    wake_fallback = _parse_time(wake_ts) + float(wake_inp.get("delaySeconds"))
+                except (TypeError, ValueError):
+                    wake_fallback = None
+                wake_due = wake_fallback
+    return wake_due
+
+
+def _wake_tail(path):
+    """transcript 解析结果，文件没变就不重读。
+
+    返回 (最后一次 ScheduleWakeup 的到点时间或 None, 还在的 Cron 列表, 这次 Cron 扫完没有)。
+    ScheduleWakeup 仍只看尾部窗口（它总在末尾）。到点时间优先用结果里的 scheduledFor
+    （毫秒除以 1000）；结果是错误则不算；没有结果或没有 scheduledFor 时用 timestamp + delaySeconds。
+    input.stop 为真是 None。比较时再加原来的 300 秒。
+    Cron 看整个文件，从 _WAKE_CRON 的 off 接着读，一次最多 WAKE_CRON_BUDGET 字节。
+    没扫完不写入 _WAKE_CACHE，文件没变也接着扫；扫完以后仍按 size/mtime_ns 缓存。
+    每项是 {recurring, created, fire}：
+    循环还是一次性要和 now 比，所以这里留创建时间和触发时间，不把窗口算死。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (None, [], True)
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _WAKE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1] + (True,)
+    size = st.st_size
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - SESSIONS_TAIL_BIG))
+            raw = fh.read()
+    except OSError:
+        raw = b""
+    if size > SESSIONS_TAIL_BIG:   # 窗口从半截记录切开，丢掉第一行残段
+        nl = raw.find(b"\n")
+        raw = raw[nl + 1:] if nl >= 0 else b""
+    wake_due = _schedule_due(raw)
+
+    state = _WAKE_CRON.get(path)
+    if state is None or size < state["off"]:   # 文件被截短重写：从头再认
+        state = _cron_new_state()
+        _WAKE_CRON[path] = state
+    try:
+        with open(path, "rb") as fh:
+            _cron_scan(fh, state, size)
+    except OSError:
+        pass
+    _cron_prune(state, time.time())
+    parsed = (wake_due, [{"recurring": job["recurring"], "created": job["created"], "fire": job["fire"]}
+                         for job in state["jobs"]])
+    done = state.get("done", True)
+    if done:   # 没扫完不缓存，否则文件不变就永远停在半截
+        _WAKE_CACHE[path] = (key, parsed)
+    return parsed + (done,)
+
+
+def _wake_sub_live(session_dir, now):
+    """subagents/ 里有没有还在跑的子 agent。
+
+    只认 mtime 在 SESSIONS_SUB_SEC 内的 agent-<id>.jsonl。完成的认法和 _subagent_tree 一样：
+    读同名的 agent-<id>.meta.json，是对象且 finished 为真就算完成，不算挂着。
+    """
+    if not session_dir:
+        return False
+    subdir = os.path.join(session_dir, "subagents")
+    for ent in _safe_scandir(subdir):
+        name = ent.name
+        if not name.startswith("agent-") or not name.endswith(".jsonl") or name.endswith(".meta.json"):
+            continue
+        try:
+            st = ent.stat()
+        except OSError:
+            continue
+        if now - st.st_mtime > SESSIONS_SUB_SEC:
+            continue
+        aid = name[len("agent-"):-len(".jsonl")]
+        meta_path = os.path.join(subdir, f"agent-{aid}.meta.json")
+        meta = {}
+        try:   # 和 _subagent_tree 同一套：先 stat 再读，读坏或不存在就当没有 meta
+            os.stat(meta_path)
+            with open(meta_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (OSError, ValueError):
+            meta = {}
+        if not meta.get("finished"):
+            return True
+    return False
+
+
+def _wake_armed(w, now, regs=None):
+    """这个会话还有没有东西会把它叫醒。有就返回 True，「等你叫醒」不显示。
+
+    只看 Claude，Grok 返回 False。regs 是注册表；None 时自己读。依次看这几处，有一处算数就停：
+    注册表里这个 sid 的进程还在，而且 status 是 busy 或 shell；
+    subagents/ 里有还没标完成、记录也还新的子 agent；
+    记录末尾最后一次 ScheduleWakeup 还没到点（input.stop 为真的不算，到点后再留 300 秒；
+    结果里有 scheduledFor 就用它，出错的结果不算）；
+    还在的循环 Cron（recurring 不是 False，默认就是循环）创建时间在 7 天内；
+    还在的一次性 Cron（recurring 是 False）触发时间不为空、加 120 秒还没过。
+    Cron 这次没扫完也算挂着，宁可晚一点提醒，也不要误报。
+    删掉的不在列表里，所以删一次性任务不会把循环任务一起算没了。
+    读的时候遇到 OSError / ValueError 就当没挂。
+    """
+    try:
+        if w["src"] != "claude":
+            return False
+        if regs is None:
+            regs = _load_claude_registry()
+        if regs is not None:
+            for rec in regs:
+                if (rec.get("sessionId") == w["sid"] and _pid_alive(rec.get("pid"))
+                        and rec.get("status") in ("busy", "shell")):
+                    return True
+        path = w.get("transcript") or ""
+        if isinstance(path, str) and path.endswith(".jsonl"):
+            if _wake_sub_live(path[:-len(".jsonl")], now):
+                return True
+            wake_due, jobs, done = _wake_tail(path)
+            if not done:   # 还没扫完：先当挂着，宁可晚一点提醒，也不要误报
+                return True
+            if wake_due is not None and wake_due + 300 > now:
+                return True
+            for job in jobs:
+                if job["recurring"]:
+                    if job["created"] >= now - _WAKE_WEEK:
+                        return True
+                elif job["fire"] is None:
+                    if job["created"] >= now - _WAKE_DAY:   # 时间算不出来：宁可晚提醒，创建后一天内算挂着
+                        return True
+                elif job["fire"] + 120 > now:
+                    return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def attention_items(now=None):
     """现在还在等你的会话，按等待时间从早到晚：[{src, sid, cwd, kind, ts, msg}]。
 
     等你：决策框（PermissionRequest：权限确认、选择题、批准计划，带上具体内容）、表单（Notification 的对应类型），
-    或者最后一句在问你、之后一直空闲（idle_prompt）。
+    最后一句在问你、之后一直空闲（idle_prompt，等你回复），
+    或者最后一段说了等某事回来再做、之后一直空闲且没有会叫醒它的东西（idle_prompt，等你叫醒）。
     不再等：你回了话（UserPromptSubmit）、这一轮结束（Stop）、会话关了（SessionEnd），
     或者会话记录在提醒之后又有了新内容（你在终端里已经处理了）。
     """
@@ -3448,13 +3931,17 @@ def attention_items(now=None):
             continue
         if not isinstance(r, dict) or not r.get("sid"):
             continue
-        s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": "", "pid": ""}), r.get("ev")
+        s, ev = sessions.setdefault((r.get("src"), r["sid"]),
+                                    {"wait": None, "ask": "", "promise": "", "pid": "", "idle": None}), r.get("ev")
         w, pid = s["wait"], r.get("pid") or ""
         if ev == "UserPromptSubmit" and pid:
             s["pid"] = pid            # 记住这个会话最新的一轮
         if ev in ("Stop", "StopCancelled", "StopFailure", "SessionEnd") and r.get("sub"):
             if w and w.get("sub"):    # 子 agent 这一轮结束 / 子会话关了：只清它自己弹的提醒
                 s["wait"] = None
+                if s["idle"] is not None:   # 底下还压着主会话的回复/叫醒，决策框没了就把它放回来
+                    s["wait"] = s["idle"]
+                    s["idle"] = None
             continue
         if ev in ("Stop", "StopCancelled", "StopFailure"):
             latest = s["pid"] or (w or {}).get("pid") or ""
@@ -3469,37 +3956,65 @@ def attention_items(now=None):
                          "transcript": r.get("transcript") or "", "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Notification":
             typ  = r.get("type") or ""
-            kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
+            kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else
+                                           "叫醒" if typ == "idle_prompt" and s["promise"] else None)
+
+            def note():
+                msg = (s["ask"] or s["promise"]) if typ == "idle_prompt" else (r.get("msg") or "")
+                return {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
+                        "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or "",
+                        "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
+
             if (typ == "permission_prompt" and w and w.get("tool") and w["sub"] == bool(r.get("sub"))
                     and float(r.get("ts") or 0) - w["ts"] < 30):
                 pass                  # 同一个决策框几秒后的提醒：前面已经记下了具体内容
+            elif typ == "idle_prompt" and w and w.get("tool"):
+                if kind:              # 决策框还在：先记下回复/叫醒，等决策框处理完再放回来。kind 为空就不动
+                    s["idle"] = note()
             elif kind:
-                msg = s["ask"] if typ == "idle_prompt" else (r.get("msg") or "")
-                s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
-                             "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or "",
-                             "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
+                s["wait"] = note()
+                s["idle"] = None
         elif ev == "Stop":
-            s["wait"], s["ask"] = None, r.get("ask") or ""
+            s["wait"], s["ask"], s["promise"], s["idle"] = None, r.get("ask") or "", r.get("promise") or "", None
         elif ev in ("StopCancelled", "StopFailure"):   # 拒绝 / 取消了权限框，或出错，这一轮就此结束
-            s["wait"], s["ask"] = None, ""
+            s["wait"], s["ask"], s["promise"], s["idle"] = None, "", "", None
         elif ev in ("UserPromptSubmit", "SessionEnd"):
-            s["wait"], s["ask"] = None, ""
-    items = []
-    for s in sessions.values():
-        w = s["wait"]
+            s["wait"], s["ask"], s["promise"], s["idle"] = None, "", "", None
+    items, regs, regs_loaded = [], None, False
+
+    def keep_wait(w):
+        """现有过滤。'answered' 是带 tsize 的决策框已经处理完；'keep' 时 title 已写上。"""
+        nonlocal regs, regs_loaded
         if not w or now - w["ts"] > ATTENTION_MAX_AGE:
-            continue
+            return "drop"
         if isinstance(w.get("tsize"), int):   # 决策框：记录里出现了 user 条目（工具结果、打断、新输入）才算处理完
             if _answered_since(w["transcript"], w["tsize"]):
-                continue
+                return "answered"
         else:
             try:   # 会话记录在提醒之后又写了东西：你已经在终端里处理过了
                 if w["transcript"] and os.stat(w["transcript"]).st_mtime > w["ts"] + 1:
-                    continue
+                    return "drop"
             except OSError:
                 pass
+        if w["kind"] == "叫醒":
+            if not regs_loaded:   # 没有叫醒候选就不读；读不到时传空列表，None 会让 _wake_armed 再读一次
+                regs = _load_claude_registry()
+                regs_loaded = True
+            if _wake_armed(w, now, [] if regs is None else regs):   # 还有东西会叫醒它，不算等你
+                return "drop"
         w["title"] = session_title(w["transcript"]) if w["src"] == "claude" else ""
-        items.append(w)
+        return "keep"
+
+    for s in sessions.values():
+        w, fallback = s["wait"], True
+        while True:
+            verdict = keep_wait(w)
+            if verdict == "answered" and fallback and s["idle"] is not None:
+                w, fallback = s["idle"], False   # 决策框答完了：改用压着的回复/叫醒，再走一遍后面的规则
+                continue
+            break
+        if verdict == "keep":
+            items.append(w)
     return sorted(items, key=lambda w: w["ts"])
 
 
@@ -3589,6 +4104,8 @@ def attention_bubble(items, now=None, pick=None):
     title = _clean(w.get("title"))
     head = (f"等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
             + f"：{_project(w)}" + (f"·{title}" if title else ""))
+    if w.get("kind") == "叫醒" and not w.get("notice") and w.get("msg"):
+        return f"{head}\n{_clip(_clean(w['msg']), PET_MSG_MAX)}"
     detail = [_clean(w["qs"][0].get("q"))] if w.get("qs") else attention_detail(w)
     return f"{head}\n{detail[0] if detail else '快去看看 ♥'}"
 
@@ -3859,7 +4376,7 @@ def _alert_notice_lines(w, now, focused, width):
 
 
 def status_notice_lines(items, width):
-    """底部状态块。最多 3 条、每条 4 行，每行裁到 width 列，不换行。"""
+    """底部状态块。最多 3 条、每条 6 行，每行裁到 width 列，不换行。"""
     width = max(1, int(width or 1))
     out = []
     for item in (items or [])[:NOTICE_STATUS_MAX]:
