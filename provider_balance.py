@@ -3594,20 +3594,32 @@ def attention_bubble(items, now=None, pick=None):
 
 
 def work_sessions(sessions):
-    """从进行中的会话里挑出正在干活的（运行、思考、等子 agent），等你和空闲不要，按紧急程度稳定排序。"""
+    """从进行中的会话里挑出正在干活的（运行、⚙ 命令、思考、等子 agent），等你和空闲不要，按紧急程度稳定排序。Grok 只有挂着 ⚙ 命令时才算。"""
     return sorted([s for s in sessions if 1 <= _session_rank(s) <= 3], key=_session_rank)
+
+
+def _work_doing(s):
+    """气泡第二行：先用会话头的在做什么；是「—」或空就找第一个正在跑的命令或工具，找不到就写思考中。"""
+    doing = _session_group(s)[0]["doing"]
+    if doing == "—" or not doing:
+        doing = "思考中…"
+        for node in _walk_nodes(s.get("children")):
+            kind = _node_kind(node)
+            if kind in ("运行", "命令", "外部"):
+                if kind in ("命令", "外部"):
+                    doing = "⚙ " + _row_name(node)
+                else:
+                    doing = f"{_row_name(node)}：{_doing_text(node)}"
+                break
+    return doing
 
 
 def work_bubble(sessions, now=None):
     """宠物气泡（两行）：有会话在干活时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个，写着项目、标题和在做什么。"""
     i = int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(sessions)
     s, n = sessions[i], len(sessions)
-    title = _clean(s.get("title"))
-    head = ("工作中" + (f" {i + 1}/{n}" if n > 1 else "")
-            + f"：{_project(s)}" + (f"·{title}" if title else ""))
-    doing = _session_group(s)[0]["doing"]
-    if doing == "—" or not doing:
-        doing = "思考中…"
+    head = "工作中" + (f" {i + 1}/{n}" if n > 1 else "") + f"：{_row_name(s)}"
+    doing = _work_doing(s)
     return f"{head}\n{doing}"
 
 
@@ -5911,8 +5923,9 @@ def main():
         elif pet_mode and state["pet_visible"]:
             if not state.get("busy") and now - state.get("work_at", 0) >= PET_WORK_SCAN_SEC:
                 state["work_at"] = now   # 用量页也扫会话，宠物才知道谁在干活；会话页自己有 reload_sessions
+                # bash_limit=0：不往回翻 transcript 找命令说明（只用缓存），免得卡住动画
                 try:
-                    state["work"] = work_sessions(live_sessions(decided=state["decided"]))
+                    state["work"] = work_sessions(live_sessions(decided=state["decided"], bash_limit=0))
                 except Exception:     # 扫会话出任何错都不能影响 watch
                     state["work"] = []
                 if not state.get("attention"):
