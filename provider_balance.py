@@ -3454,7 +3454,8 @@ def _answered_since(transcript, offset):
 
 
 _WAKE_CACHE = {}  # path → ((st_size, st_mtime_ns), (到点时间或 None, [剩下的 Cron]))；Cron 每项 {recurring, created, fire}；同一文件只留最新一份
-_WAKE_CRON = {}   # path → {"off": 已读字节, "jobs": [...], "creates": {tool_use id: job}, "deletes": {tool_use id: 要删的 id}, "gone": 剪枝时记下的 job id}
+_WAKE_CRON = {}   # path → {"off": 已读字节, "done": 扫到文件末尾没有, "jobs": [...], "creates": {tool_use id: job}, "deletes": {tool_use id: 要删的 id}, "gone": 剪枝时记下的 job id}
+WAKE_CRON_BUDGET = 16 << 20  # 每次最多往后扫这么多字节，扫不完下次接着扫
 _WAKE_WEEK = 7 * 24 * 3600
 _WAKE_CHUNK = 8 << 20
 _CRON_ID_RE = re.compile(r"(?i)\b(?:job\s*)?id\b\W{0,3}([A-Za-z0-9][A-Za-z0-9_-]{3,})")
@@ -3689,15 +3690,19 @@ def _cron_consume(block, state):
 
 
 def _cron_scan(fh, state, size):
-    """从 off 起按 8MB 读到文件末尾。最后一行不完整就留到下次，off 停在最后一个换行之后。"""
+    """从 off 起按 8MB 一块读，这次最多 WAKE_CRON_BUDGET 字节。最后一行不完整就留到下次，off 停在最后一个换行之后。读到末尾 done 为 True。
+    一整行比预算还长时，越过预算读到这一行的换行为止，免得 off 永远停在原地。"""
     start = state["off"]
     if start >= size:
+        state["done"] = True
         return
     fh.seek(start)
-    buf, read_at = b"", start
-    while read_at < size:
-        chunk = fh.read(min(_WAKE_CHUNK, size - read_at))
+    buf, read_at, eof, consumed = b"", start, False, False
+    limit = min(size, start + WAKE_CRON_BUDGET)
+    while read_at < limit or (not consumed and read_at < size):
+        chunk = fh.read(min(_WAKE_CHUNK, limit - read_at) if read_at < limit else _WAKE_CHUNK)
         if not chunk:
+            eof = True
             break
         read_at += len(chunk)
         buf += chunk
@@ -3705,8 +3710,9 @@ def _cron_scan(fh, state, size):
         if nl < 0:
             continue
         _cron_consume(buf[:nl + 1], state)
-        buf = buf[nl + 1:]
+        buf, consumed = buf[nl + 1:], True
     state["off"] = read_at - len(buf)
+    state["done"] = eof or read_at >= size
 
 
 def _schedule_due(raw):
@@ -3778,21 +3784,23 @@ def _schedule_due(raw):
 def _wake_tail(path):
     """transcript 解析结果，文件没变就不重读。
 
-    返回 (最后一次 ScheduleWakeup 的到点时间或 None, 还在的 Cron 列表)。
+    返回 (最后一次 ScheduleWakeup 的到点时间或 None, 还在的 Cron 列表, 这次 Cron 扫完没有)。
     ScheduleWakeup 仍只看尾部窗口（它总在末尾）。到点时间优先用结果里的 scheduledFor
     （毫秒除以 1000）；结果是错误则不算；没有结果或没有 scheduledFor 时用 timestamp + delaySeconds。
     input.stop 为真是 None。比较时再加原来的 300 秒。
-    Cron 看整个文件，从 _WAKE_CRON 的 off 接着读。每项是 {recurring, created, fire}：
+    Cron 看整个文件，从 _WAKE_CRON 的 off 接着读，一次最多 WAKE_CRON_BUDGET 字节。
+    没扫完不写入 _WAKE_CACHE，文件没变也接着扫；扫完以后仍按 size/mtime_ns 缓存。
+    每项是 {recurring, created, fire}：
     循环还是一次性要和 now 比，所以这里留创建时间和触发时间，不把窗口算死。
     """
     try:
         st = os.stat(path)
     except OSError:
-        return (None, [])
+        return (None, [], True)
     key = (st.st_size, st.st_mtime_ns)
     hit = _WAKE_CACHE.get(path)
     if hit and hit[0] == key:
-        return hit[1]
+        return hit[1] + (True,)
     size = st.st_size
     try:
         with open(path, "rb") as fh:
@@ -3817,8 +3825,10 @@ def _wake_tail(path):
     _cron_prune(state, time.time())
     parsed = (wake_due, [{"recurring": job["recurring"], "created": job["created"], "fire": job["fire"]}
                          for job in state["jobs"]])
-    _WAKE_CACHE[path] = (key, parsed)
-    return parsed
+    done = state.get("done", True)
+    if done:   # 没扫完不缓存，否则文件不变就永远停在半截
+        _WAKE_CACHE[path] = (key, parsed)
+    return parsed + (done,)
 
 
 def _wake_sub_live(session_dir, now):
@@ -3866,6 +3876,7 @@ def _wake_armed(w, now, regs=None):
     结果里有 scheduledFor 就用它，出错的结果不算）；
     还在的循环 Cron（recurring 不是 False，默认就是循环）创建时间在 7 天内；
     还在的一次性 Cron（recurring 是 False）触发时间不为空、加 120 秒还没过。
+    Cron 这次没扫完也算挂着，宁可晚一点提醒，也不要误报。
     删掉的不在列表里，所以删一次性任务不会把循环任务一起算没了。
     读的时候遇到 OSError / ValueError 就当没挂。
     """
@@ -3883,7 +3894,9 @@ def _wake_armed(w, now, regs=None):
         if isinstance(path, str) and path.endswith(".jsonl"):
             if _wake_sub_live(path[:-len(".jsonl")], now):
                 return True
-            wake_due, jobs = _wake_tail(path)
+            wake_due, jobs, done = _wake_tail(path)
+            if not done:   # 还没扫完：先当挂着，宁可晚一点提醒，也不要误报
+                return True
             if wake_due is not None and wake_due + 300 > now:
                 return True
             for job in jobs:
