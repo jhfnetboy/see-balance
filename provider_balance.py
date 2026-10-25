@@ -3599,7 +3599,7 @@ def work_sessions(sessions):
 
 
 def _work_doing(s):
-    """气泡第二行：先用会话头的在做什么；是「—」或空就找第一个正在跑的命令或工具，找不到就写思考中。"""
+    """气泡第二行：先用会话头的在做什么；是「—」或空就找第一个正在跑的命令或工具，找不到就写思考中。命令还没对上说明时写命令本身。"""
     doing = _session_group(s)[0]["doing"]
     if doing == "—" or not doing:
         doing = "思考中…"
@@ -3607,7 +3607,10 @@ def _work_doing(s):
             kind = _node_kind(node)
             if kind in ("运行", "命令", "外部"):
                 if kind in ("命令", "外部"):
-                    doing = "⚙ " + _row_name(node)
+                    name = _row_name(node)
+                    if name == "后台命令" or (kind == "外部" and " · " not in name):   # 还没对上说明：用命令本身
+                        name = _doing_text(node)
+                    doing = "⚙ " + name
                 else:
                     doing = f"{_row_name(node)}：{_doing_text(node)}"
                 break
