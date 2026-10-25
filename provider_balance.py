@@ -47,7 +47,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.8.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.9.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -3151,6 +3151,27 @@ elif ev == "Stop":               # 最后一句是不是在问你：之后的“
     tail = str(e.get("last_assistant_message") or "")[-400:].rstrip().rstrip("\"'”’)）】*_` ")[-300:]   # 先截短：长文本上正则会很慢
     m    = re.search(r"[^\n。！!?？]*[?？]$", tail)    # 只认以问号结尾的最后一句，正文里的 URL?q= 不算
     rec["ask"] = m.group(0).strip()[-120:] if m else ""
+    rec["promise"] = ""          # 在问你的时候不算「等你叫醒」
+    if not rec["ask"]:           # 最后一段是不是说了等某事回来再做
+        chunk = str(e.get("last_assistant_message") or "")[-2000:]
+        para = ""
+        for part in re.split(r"\n\s*\n", chunk):
+            if part.strip():
+                para = part
+        para = para[-300:]
+        m = re.search(r"(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)(?:之后|以后|后)[^。！!\n]{0,60}(?:我|再|接着|继续)|(?:稍后|待会儿?|回头)[^。！!\n]{0,10}(?:我|再)|\b(?:once|when|after)\b[^.!\n]{1,80}\b(?:I'll|I will|I'm going to)\b|\bI'll (?:wait|check back|continue|resume)\b|\bwaiting (?:for|on)\b", para, re.I)
+        if m:                    # 命中所在的那一句，strip 后留最后 120 字
+            start = 0
+            for i in range(m.start() - 1, -1, -1):
+                if para[i] in "。！!？?\n":
+                    start = i + 1
+                    break
+            end = len(para)
+            for i in range(m.end(), len(para)):
+                if para[i] in "。！!\n":
+                    end = i + 1
+                    break
+            rec["promise"] = para[start:end].strip()[-120:]
 try:
     fd = os.open(__LOG__, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     os.write(fd, (json.dumps(rec, ensure_ascii=False) + "\n").encode())
@@ -3432,11 +3453,98 @@ def _answered_since(transcript, offset):
         return False
 
 
+def _wake_armed(w, now):
+    """这个会话还有没有东西会把它叫醒。有就返回 True，「等你叫醒」不显示。
+
+    只看 Claude，Grok 返回 False。依次看三处，有一处算数就停：
+    注册表里这个 sid 的进程还在，而且 status 是 busy 或 shell；
+    transcript 去掉 .jsonl 后的 subagents 里有 mtime 距现在不到 SESSIONS_SUB_SEC 的 jsonl；
+    记录末尾最后一次 ScheduleWakeup 还没到点（input.stop 为真的不算），
+    或者 CronCreate 出现在最后一次 CronDelete 之后。
+    读的时候遇到 OSError / ValueError 就当没挂。
+    """
+    try:
+        if w["src"] != "claude":
+            return False
+        regs = _load_claude_registry()
+        if regs is not None:
+            for rec in regs:
+                if (rec.get("sessionId") == w["sid"] and _pid_alive(rec.get("pid"))
+                        and rec.get("status") in ("busy", "shell")):
+                    return True
+        path = w.get("transcript") or ""
+        if isinstance(path, str) and path.endswith(".jsonl"):
+            session_dir = path[:-len(".jsonl")]
+            if session_dir:
+                try:
+                    entries = list(os.scandir(os.path.join(session_dir, "subagents")))
+                except OSError:
+                    entries = []
+                for ent in entries:
+                    try:
+                        if ent.name.endswith(".jsonl") and now - ent.stat().st_mtime < SESSIONS_SUB_SEC:
+                            return True
+                    except OSError:
+                        continue
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    size = fh.tell()
+                    fh.seek(max(0, size - SESSIONS_TAIL_BIG))
+                    raw = fh.read()
+            except OSError:
+                raw, size = b"", 0
+            text = raw.decode("utf-8", "replace")
+            if size > SESSIONS_TAIL_BIG:   # 窗口从半截记录切开，丢掉第一行残段
+                nl = text.find("\n")
+                text = text[nl + 1:] if nl >= 0 else ""
+            last_wake, cron_live = None, False
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "assistant":
+                    continue
+                msg = rec.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                        continue
+                    name = item.get("name")
+                    inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+                    if name == "ScheduleWakeup":
+                        last_wake = (rec.get("timestamp"), inp)
+                    elif name == "CronDelete":
+                        cron_live = False
+                    elif name == "CronCreate":
+                        cron_live = True
+            if last_wake is not None:
+                ts, inp = last_wake
+                if not inp.get("stop"):
+                    try:
+                        if _parse_time(ts) + float(inp.get("delaySeconds")) + 300 > now:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+            if cron_live:
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def attention_items(now=None):
     """现在还在等你的会话，按等待时间从早到晚：[{src, sid, cwd, kind, ts, msg}]。
 
     等你：决策框（PermissionRequest：权限确认、选择题、批准计划，带上具体内容）、表单（Notification 的对应类型），
-    或者最后一句在问你、之后一直空闲（idle_prompt）。
+    最后一句在问你、之后一直空闲（idle_prompt，等你回复），
+    或者最后一段说了等某事回来再做、之后一直空闲且没有会叫醒它的东西（idle_prompt，等你叫醒）。
     不再等：你回了话（UserPromptSubmit）、这一轮结束（Stop）、会话关了（SessionEnd），
     或者会话记录在提醒之后又有了新内容（你在终端里已经处理了）。
     """
@@ -3448,7 +3556,8 @@ def attention_items(now=None):
             continue
         if not isinstance(r, dict) or not r.get("sid"):
             continue
-        s, ev = sessions.setdefault((r.get("src"), r["sid"]), {"wait": None, "ask": "", "pid": ""}), r.get("ev")
+        s, ev = sessions.setdefault((r.get("src"), r["sid"]),
+                                    {"wait": None, "ask": "", "promise": "", "pid": ""}), r.get("ev")
         w, pid = s["wait"], r.get("pid") or ""
         if ev == "UserPromptSubmit" and pid:
             s["pid"] = pid            # 记住这个会话最新的一轮
@@ -3469,21 +3578,22 @@ def attention_items(now=None):
                          "transcript": r.get("transcript") or "", "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Notification":
             typ  = r.get("type") or ""
-            kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else None)
+            kind = WAIT_KINDS.get(typ) or ("回复" if typ == "idle_prompt" and s["ask"] else
+                                           "叫醒" if typ == "idle_prompt" and s["promise"] else None)
             if (typ == "permission_prompt" and w and w.get("tool") and w["sub"] == bool(r.get("sub"))
                     and float(r.get("ts") or 0) - w["ts"] < 30):
                 pass                  # 同一个决策框几秒后的提醒：前面已经记下了具体内容
             elif kind:
-                msg = s["ask"] if typ == "idle_prompt" else (r.get("msg") or "")
+                msg = (s["ask"] or s["promise"]) if typ == "idle_prompt" else (r.get("msg") or "")
                 s["wait"] = {"src": r.get("src"), "sid": r["sid"], "cwd": r.get("cwd") or "", "kind": kind,
                              "ts": float(r.get("ts") or 0), "msg": msg, "transcript": r.get("transcript") or "",
                              "pid": r.get("pid") or "", "sub": bool(r.get("sub"))}
         elif ev == "Stop":
-            s["wait"], s["ask"] = None, r.get("ask") or ""
+            s["wait"], s["ask"], s["promise"] = None, r.get("ask") or "", r.get("promise") or ""
         elif ev in ("StopCancelled", "StopFailure"):   # 拒绝 / 取消了权限框，或出错，这一轮就此结束
-            s["wait"], s["ask"] = None, ""
+            s["wait"], s["ask"], s["promise"] = None, "", ""
         elif ev in ("UserPromptSubmit", "SessionEnd"):
-            s["wait"], s["ask"] = None, ""
+            s["wait"], s["ask"], s["promise"] = None, "", ""
     items = []
     for s in sessions.values():
         w = s["wait"]
@@ -3498,6 +3608,8 @@ def attention_items(now=None):
                     continue
             except OSError:
                 pass
+        if w["kind"] == "叫醒" and _wake_armed(w, now):   # 还有东西会叫醒它，不算等你
+            continue
         w["title"] = session_title(w["transcript"]) if w["src"] == "claude" else ""
         items.append(w)
     return sorted(items, key=lambda w: w["ts"])
@@ -3589,6 +3701,8 @@ def attention_bubble(items, now=None, pick=None):
     title = _clean(w.get("title"))
     head = (f"等你{w['kind']}" + (f" {i + 1}/{n}" if n > 1 else "")
             + f"：{_project(w)}" + (f"·{title}" if title else ""))
+    if w.get("kind") == "叫醒" and not w.get("notice") and w.get("msg"):
+        return f"{head}\n{_clip(_clean(w['msg']), PET_MSG_MAX)}"
     detail = [_clean(w["qs"][0].get("q"))] if w.get("qs") else attention_detail(w)
     return f"{head}\n{detail[0] if detail else '快去看看 ♥'}"
 

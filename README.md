@@ -105,7 +105,7 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
   - 原理：宠物开着时每秒摸一下 `~/.see-balance/pet.alive`；决策框弹出时 hook 看到宠物开着，就等宠物上的决定（写到 `~/.see-balance/decisions/`）。你先在终端答了、宠物关了超过 30 秒、或者等满 590 秒，hook 都会不输出地退出，照常走终端的对话框。宠物没开时 hook 不等，和以前一样。
   - 只管 Claude Code 的决策框；Grok 会话、“最后一句在问你”这类提醒还是回终端处理。
 
-- **算“等你”的**：弹出权限确认 / MCP 表单（子 agent 弹的也算）；或者最后一句话在问你（以 `?` / `？` 结尾，正文中间的问号不算），之后一直没动静。干完活单纯空闲的不算。
+- **算“等你”的**：弹出权限确认 / MCP 表单（子 agent 弹的也算）；或者最后一句话在问你（以 `?` / `？` 结尾，正文中间的问号不算），之后一直没动静。干完活单纯空闲的不算。最后一段说了「等 X 回来后我再做 Y」、之后一直没动静，而且没有后台命令、后台子 agent、ScheduleWakeup 或 Cron 会叫醒它，算等你叫醒。
 - **自动消失**：你回了话、这一轮结束（包括出错结束、在 Grok 里拒绝权限）、会话关了，或者会话在提醒之后又有了新进展（你已经在终端里处理了）。超过 12 小时的提醒也不再显示。上一轮迟到的结束事件不会清掉这一轮的提醒；子 agent 这一轮结束只清它自己弹的提醒。
 - **开启**：运行一次 `--install-hooks`。它会写一个只记录的 hook（`~/.see-balance/hook.py`），挂到 `~/.claude/settings.json` 的 `Notification` / `PermissionRequest` / `UserPromptSubmit` / `Stop` / `StopFailure` / `SessionEnd` 上。之前开过提醒的，升级后第一次运行会自动换上新的 hook 脚本、补挂新加的事件（别的 hook 不动）。Grok CLI 默认也读这个文件，所以两边都能覆盖；另外在 `~/.grok/hooks/see-balance.json` 挂一个只有 Grok 认识的 `StopCancelled`（在 Grok 里拒绝权限时用来清掉提醒）。新开的会话开始生效。`--uninstall-hooks` 只摘掉它自己装的那几条（看不懂的结构、你自己的 hook、原本就空的事件都不动）。
   - 改文件前备份为 `*.see-balance.bak`；已有的 hook 不动；`settings.json` 是符号链接（dotfiles）时改的是链接目标，权限不变。
