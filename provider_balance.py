@@ -3457,6 +3457,7 @@ _WAKE_CACHE = {}  # path → ((st_size, st_mtime_ns), (到点时间或 None, [�
 _WAKE_CRON = {}   # path → {"off": 已读字节, "done": 扫到文件末尾没有, "jobs": [...], "creates": {tool_use id: job}, "deletes": {tool_use id: 要删的 id}, "gone": 剪枝时记下的 job id}
 WAKE_CRON_BUDGET = 16 << 20  # 每次最多往后扫这么多字节，扫不完下次接着扫
 _WAKE_WEEK = 7 * 24 * 3600
+_WAKE_DAY = 24 * 3600   # 一次性 Cron 的时间算不出来（日、月带 * 等）时，创建后这么久内仍算挂着
 _WAKE_CHUNK = 8 << 20
 _CRON_ID_RE = re.compile(r"(?i)\b(?:job\s*)?id\b\W{0,3}([A-Za-z0-9][A-Za-z0-9_-]{3,})")
 _CRON_NAME_NEEDLES = (b'"name":"CronCreate"', b'"name":"CronDelete"',
@@ -3579,7 +3580,7 @@ def _tool_use_ids(raw, names):
 
 
 def _cron_prune(state, now):
-    """返回前去掉过期任务。循环看 created 早于一周；一次性看 fire 已过 120 秒，或 fire 算不出来。
+    """返回前去掉过期任务。循环看 created 早于一周；一次性看 fire 已过 120 秒，fire 算不出来时看 created 早于一天。
     剪掉时已经认出的 job id 记进 gone，免得之后的 CronDelete 退回去删掉别的还没认出 id 的任务。"""
     kept = []
     gone = state["gone"]
@@ -3589,7 +3590,7 @@ def _cron_prune(state, now):
             drop = job["created"] < week
         else:
             fire = job["fire"]
-            drop = fire is None or fire + 120 <= now
+            drop = job["created"] < now - _WAKE_DAY if fire is None else fire + 120 <= now
         if not drop:
             kept.append(job)
             continue
@@ -3903,7 +3904,10 @@ def _wake_armed(w, now, regs=None):
                 if job["recurring"]:
                     if job["created"] >= now - _WAKE_WEEK:
                         return True
-                elif job["fire"] is not None and job["fire"] + 120 > now:
+                elif job["fire"] is None:
+                    if job["created"] >= now - _WAKE_DAY:   # 时间算不出来：宁可晚提醒，创建后一天内算挂着
+                        return True
+                elif job["fire"] + 120 > now:
                     return True
         return False
     except (OSError, ValueError):
