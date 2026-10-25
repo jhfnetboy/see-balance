@@ -3060,7 +3060,7 @@ SLACK_RETRY         = 300                                 # 发送失败后多�
 ACTIONS_FILE        = STATE_FILE.parent / "actions.json"  # 只有这里登记过的命令能被按键跑
 NOTICE_MAX_BYTES    = 16 * 1024     # 再大的提醒文件不读
 NOTICE_STATUS_MAX   = 3             # 底部状态最多同时几条
-NOTICE_STATUS_LINES = 4             # 每条状态最多几行正文
+NOTICE_STATUS_LINES = 6             # 每条状态最多几行正文
 ACTION_TIMEOUT      = 60            # actions.json 没写 timeout 时用这个
 _ACTION_KEY_TAKEN   = set("quknrtps")  # q u k n r t p s；再绑这些键就只能按回车。数字、Tab、回车不是小写字母
 CLAUDE_SETTINGS   = Path(os.environ.get("SEE_BALANCE_CLAUDE_SETTINGS")
@@ -3159,7 +3159,7 @@ elif ev == "Stop":               # 最后一句是不是在问你：之后的“
             if part.strip():
                 para = part
         para = para[-300:]
-        m = re.search(r"(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)(?:之后|以后|后)[^。！!\n]{0,60}(?:我|再|接着|继续)|(?:稍后|待会儿?|回头)[^。！!\n]{0,10}(?:我|再)|\b(?:once|when|after)\b[^.!\n]{1,80}\b(?:I'll|I will|I'm going to)\b|\bI'll (?:wait|check back|continue|resume)\b|\bwaiting (?:for|on)\b", para, re.I)
+        m = re.search(r"(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)了?(?:之后|以后|后)[^。！!\n]{0,60}(?:我|再|接着|继续)|等[^。！!？?\n]{1,40}?(?:回来|出来|好了|结束|完成|跑完|审完|评完|合入|合并|通过|变绿|就绪|到了)了?(?:之后|以后|后)?[^。！!\n]{0,60}?(?:我|再|接着|继续|就)|(?:稍后|待会儿?|回头)[^。！!\n]{0,10}(?:我|再)|\b(?:once|when|after)\b[^.!\n]{1,80}\b(?:I'll|I will|I'm going to)\b|\bI'll (?:wait|check back|continue|resume)\b|\bwaiting (?:for|on)\b", para, re.I)
         if m:                    # 命中所在的那一句，strip 后留最后 120 字
             start = 0
             for i in range(m.start() - 1, -1, -1):
@@ -3453,20 +3453,148 @@ def _answered_since(transcript, offset):
         return False
 
 
-def _wake_armed(w, now):
+_WAKE_CACHE = {}  # path → ((st_size, st_mtime_ns), (到点时间或 None, [循环创建时间], CronDelete 次数, [一次性触发时间]))；同一文件只留最新一份
+_WAKE_WEEK = 7 * 24 * 3600
+
+
+def _oneshot_fire(created_ts, cron):
+    """一次性 Cron 的触发时间（unix 秒）。cron 前四段（分 时 日 月）都是纯数字时，
+    按本地时区、创建那年拼出 datetime；已经早于创建时间就加一年。算不出来返回 None。"""
+    if not created_ts or not isinstance(cron, str):
+        return None
+    parts = cron.split()
+    if len(parts) != 5 or not all(part.isdigit() for part in parts[:4]):
+        return None
+    try:
+        minute, hour, day, month = (int(part) for part in parts[:4])
+        created = datetime.fromtimestamp(created_ts)
+        fire = datetime(created.year, month, day, hour, minute)
+        if fire.timestamp() < created_ts:
+            fire = datetime(created.year + 1, month, day, hour, minute)
+        return fire.timestamp()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def _wake_tail(path):
+    """transcript 尾部解析结果，文件没变就不重读。
+
+    返回 (最后一次 ScheduleWakeup 的到点时间或 None, 循环 Cron 的创建时间,
+    CronDelete 次数, 一次性 Cron 的触发时间)。循环的剩余数要和 now 比，所以这里留创建时间，
+    不把 7 天窗口算死。到点时间是 timestamp + delaySeconds，比较时再加原来的 300 秒。
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (None, [], 0, [])
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _WAKE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    size = st.st_size
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - SESSIONS_TAIL_BIG))
+            raw = fh.read()
+    except OSError:
+        raw = b""
+    text = raw.decode("utf-8", "replace")
+    if size > SESSIONS_TAIL_BIG:   # 窗口从半截记录切开，丢掉第一行残段
+        nl = text.find("\n")
+        text = text[nl + 1:] if nl >= 0 else ""
+    wake_due, recurring, deletes, oneshots = None, [], 0, []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_use":
+                continue
+            name = item.get("name")
+            inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+            if name == "ScheduleWakeup":
+                wake_due = None
+                if not inp.get("stop"):
+                    try:
+                        wake_due = _parse_time(rec.get("timestamp")) + float(inp.get("delaySeconds"))
+                    except (TypeError, ValueError):
+                        wake_due = None
+            elif name == "CronDelete":
+                deletes += 1
+            elif name == "CronCreate":
+                created = _parse_time(rec.get("timestamp"))
+                if inp.get("recurring") is False:
+                    fire = _oneshot_fire(created, inp.get("cron"))
+                    if fire is not None:
+                        oneshots.append(fire)
+                elif created:
+                    recurring.append(created)
+    parsed = (wake_due, recurring, deletes, oneshots)
+    _WAKE_CACHE[path] = (key, parsed)
+    return parsed
+
+
+def _wake_sub_live(session_dir, now):
+    """subagents/ 里有没有还在跑的子 agent。
+
+    只认 mtime 在 SESSIONS_SUB_SEC 内的 agent-<id>.jsonl。完成的认法和 _subagent_tree 一样：
+    读同名的 agent-<id>.meta.json，是对象且 finished 为真就算完成，不算挂着。
+    """
+    if not session_dir:
+        return False
+    subdir = os.path.join(session_dir, "subagents")
+    for ent in _safe_scandir(subdir):
+        name = ent.name
+        if not name.startswith("agent-") or not name.endswith(".jsonl") or name.endswith(".meta.json"):
+            continue
+        try:
+            st = ent.stat()
+        except OSError:
+            continue
+        if now - st.st_mtime > SESSIONS_SUB_SEC:
+            continue
+        aid = name[len("agent-"):-len(".jsonl")]
+        meta_path = os.path.join(subdir, f"agent-{aid}.meta.json")
+        meta = {}
+        try:   # 和 _subagent_tree 同一套：先 stat 再读，读坏或不存在就当没有 meta
+            os.stat(meta_path)
+            with open(meta_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (OSError, ValueError):
+            meta = {}
+        if not meta.get("finished"):
+            return True
+    return False
+
+
+def _wake_armed(w, now, regs=None):
     """这个会话还有没有东西会把它叫醒。有就返回 True，「等你叫醒」不显示。
 
-    只看 Claude，Grok 返回 False。依次看三处，有一处算数就停：
+    只看 Claude，Grok 返回 False。regs 是注册表；None 时自己读。依次看这几处，有一处算数就停：
     注册表里这个 sid 的进程还在，而且 status 是 busy 或 shell；
-    transcript 去掉 .jsonl 后的 subagents 里有 mtime 距现在不到 SESSIONS_SUB_SEC 的 jsonl；
-    记录末尾最后一次 ScheduleWakeup 还没到点（input.stop 为真的不算），
-    或者 CronCreate 出现在最后一次 CronDelete 之后。
+    subagents/ 里有还没标完成、记录也还新的子 agent；
+    记录末尾最后一次 ScheduleWakeup 还没到点（input.stop 为真的不算，到点后再留 300 秒）；
+    循环 Cron（recurring 不是 False，默认就是循环）创建时间在 7 天内的个数，减去 CronDelete 的次数
+    （不低于 0）后还大于 0；一次性 Cron（recurring 是 False）不参与这个减法，触发时间加 120 秒还没过就算。
     读的时候遇到 OSError / ValueError 就当没挂。
     """
     try:
         if w["src"] != "claude":
             return False
-        regs = _load_claude_registry()
+        if regs is None:
+            regs = _load_claude_registry()
         if regs is not None:
             for rec in regs:
                 if (rec.get("sessionId") == w["sid"] and _pid_alive(rec.get("pid"))
@@ -3474,65 +3602,15 @@ def _wake_armed(w, now):
                     return True
         path = w.get("transcript") or ""
         if isinstance(path, str) and path.endswith(".jsonl"):
-            session_dir = path[:-len(".jsonl")]
-            if session_dir:
-                try:
-                    entries = list(os.scandir(os.path.join(session_dir, "subagents")))
-                except OSError:
-                    entries = []
-                for ent in entries:
-                    try:
-                        if ent.name.endswith(".jsonl") and now - ent.stat().st_mtime < SESSIONS_SUB_SEC:
-                            return True
-                    except OSError:
-                        continue
-            try:
-                with open(path, "rb") as fh:
-                    fh.seek(0, os.SEEK_END)
-                    size = fh.tell()
-                    fh.seek(max(0, size - SESSIONS_TAIL_BIG))
-                    raw = fh.read()
-            except OSError:
-                raw, size = b"", 0
-            text = raw.decode("utf-8", "replace")
-            if size > SESSIONS_TAIL_BIG:   # 窗口从半截记录切开，丢掉第一行残段
-                nl = text.find("\n")
-                text = text[nl + 1:] if nl >= 0 else ""
-            last_wake, cron_live = None, False
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict) or rec.get("type") != "assistant":
-                    continue
-                msg = rec.get("message")
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if not isinstance(content, list):
-                    continue
-                for item in content:
-                    if not isinstance(item, dict) or item.get("type") != "tool_use":
-                        continue
-                    name = item.get("name")
-                    inp = item.get("input") if isinstance(item.get("input"), dict) else {}
-                    if name == "ScheduleWakeup":
-                        last_wake = (rec.get("timestamp"), inp)
-                    elif name == "CronDelete":
-                        cron_live = False
-                    elif name == "CronCreate":
-                        cron_live = True
-            if last_wake is not None:
-                ts, inp = last_wake
-                if not inp.get("stop"):
-                    try:
-                        if _parse_time(ts) + float(inp.get("delaySeconds")) + 300 > now:
-                            return True
-                    except (TypeError, ValueError):
-                        pass
-            if cron_live:
+            if _wake_sub_live(path[:-len(".jsonl")], now):
+                return True
+            wake_due, recurring, deletes, oneshots = _wake_tail(path)
+            if wake_due is not None and wake_due + 300 > now:
+                return True
+            recent = sum(1 for ts in recurring if ts >= now - _WAKE_WEEK)
+            if max(0, recent - deletes) > 0:
+                return True
+            if any(fire + 120 > now for fire in oneshots):
                 return True
         return False
     except (OSError, ValueError):
@@ -3594,7 +3672,7 @@ def attention_items(now=None):
             s["wait"], s["ask"], s["promise"] = None, "", ""
         elif ev in ("UserPromptSubmit", "SessionEnd"):
             s["wait"], s["ask"], s["promise"] = None, "", ""
-    items = []
+    items, regs, regs_loaded = [], None, False
     for s in sessions.values():
         w = s["wait"]
         if not w or now - w["ts"] > ATTENTION_MAX_AGE:
@@ -3608,8 +3686,12 @@ def attention_items(now=None):
                     continue
             except OSError:
                 pass
-        if w["kind"] == "叫醒" and _wake_armed(w, now):   # 还有东西会叫醒它，不算等你
-            continue
+        if w["kind"] == "叫醒":
+            if not regs_loaded:   # 没有叫醒候选就不读；读不到时传空列表，None 会让 _wake_armed 再读一次
+                regs = _load_claude_registry()
+                regs_loaded = True
+            if _wake_armed(w, now, [] if regs is None else regs):   # 还有东西会叫醒它，不算等你
+                continue
         w["title"] = session_title(w["transcript"]) if w["src"] == "claude" else ""
         items.append(w)
     return sorted(items, key=lambda w: w["ts"])
@@ -3973,7 +4055,7 @@ def _alert_notice_lines(w, now, focused, width):
 
 
 def status_notice_lines(items, width):
-    """底部状态块。最多 3 条、每条 4 行，每行裁到 width 列，不换行。"""
+    """底部状态块。最多 3 条、每条 6 行，每行裁到 width 列，不换行。"""
     width = max(1, int(width or 1))
     out = []
     for item in (items or [])[:NOTICE_STATUS_MAX]:
