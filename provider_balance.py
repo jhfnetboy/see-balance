@@ -47,7 +47,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.7.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.8.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -1976,6 +1976,11 @@ PET_FRAMES = {
     # 有新版本，举着牌子等你选
     "update":    [_pf(m="▽", hl="ノ", h="! ", x1="NEW"),
                   _pf(el="^", er="^", m="▽", hl="ノ", h="! ", x2="  NEW", dy=-1)],
+    # 有会话在干活：敲键盘，气泡轮播各会话在做什么
+    "work":      [_pf(hl="つ", h="==", hr="と", x1="ｶﾀ"),
+                  _pf(hl="つ", h="==", hr="と", x2="  ｶﾀｶﾀ"),
+                  _pf(hl="つ", h="==", hr="と", x1="ｶﾀ", dx=1),
+                  _pf(el="-", er="-", hl="つ", h="==", hr="と")],
     # 刷新取数中（后台线程在拉数据，动画照常跑）
     "busy":      [_pf(m="o", x1="."), _pf(x1=".."), _pf(m="o", x1="..."), _pf(x1="...")],
 }
@@ -2732,7 +2737,8 @@ def pet_demo():
              ("angry", "上周白白浪费了 35%！哼！"), ("encourage", "剩 45% 要过期啦，试试 Opus？"),
              ("encourage", "还剩 62% 呢，多用用嘛～加油！"),
              ("update", "新版本 v1.3.0！u 立即升级\nk 跳过本次 · n 不要提醒"),
-             ("call", "see-balance 等你确认 1/2\nBash：git push origin main")]
+             ("call", "see-balance 等你确认 1/2\nBash：git push origin main"),
+             ("work", "工作中 1/2：see-balance·宠物轮播\nBash：python3 -m py_compile")]
     shows += [("idle", i) for i in range(len(PET_IDLE))]
     if not sys.stdout.isatty():
         for i, (mood, arg) in enumerate(shows):
@@ -3072,6 +3078,7 @@ WAIT_KINDS        = {"permission_prompt": "确认", "elicitation_dialog": "填�
 # 决策框弹出的是哪个工具 → 等你做什么；其余工具都是权限确认
 DECIDE_KINDS      = {"AskUserQuestion": "选择", "ExitPlanMode": "批准计划"}
 ATTENTION_ROTATE_SEC = 4               # 好几个会话在等时，宠物气泡每隔几秒换下一个
+PET_WORK_SCAN_SEC    = 5               # 用量页宠物开着时，隔这么久扫一遍进行中的会话，气泡轮播它们在干什么
 # 在宠物上做决定：--watch 每秒摸一下 PET_ALIVE；hook 看它新鲜，就在决策框弹出时等宠物上的决定（DECISION_DIR 里一框一个文件），
 # 等到了交回会话。终端里的对话框照常显示，哪边先答算哪边。
 PET_ALIVE         = STATE_FILE.parent / "pet.alive"
@@ -3584,6 +3591,24 @@ def attention_bubble(items, now=None, pick=None):
             + f"：{_project(w)}" + (f"·{title}" if title else ""))
     detail = [_clean(w["qs"][0].get("q"))] if w.get("qs") else attention_detail(w)
     return f"{head}\n{detail[0] if detail else '快去看看 ♥'}"
+
+
+def work_sessions(sessions):
+    """从进行中的会话里挑出正在干活的（运行、思考、等子 agent），等你和空闲不要，按紧急程度稳定排序。"""
+    return sorted([s for s in sessions if 1 <= _session_rank(s) <= 3], key=_session_rank)
+
+
+def work_bubble(sessions, now=None):
+    """宠物气泡（两行）：有会话在干活时，每隔 ATTENTION_ROTATE_SEC 秒轮到下一个，写着项目、标题和在做什么。"""
+    i = int((now or time.time()) // ATTENTION_ROTATE_SEC) % len(sessions)
+    s, n = sessions[i], len(sessions)
+    title = _clean(s.get("title"))
+    head = ("工作中" + (f" {i + 1}/{n}" if n > 1 else "")
+            + f"：{_project(s)}" + (f"·{title}" if title else ""))
+    doing = _session_group(s)[0]["doing"]
+    if doing == "—" or not doing:
+        doing = "思考中…"
+    return f"{head}\n{doing}"
 
 
 def decision_lines(w, n, qi=0, picks=None):
@@ -5523,6 +5548,7 @@ def main():
              "attention_on": not json_mode and not compact and hooks_installed(),
              "focus": None, "qi": 0, "picks": {}, "pick_for": None, "decided": set(), "touched": 0.0,
              "tab": "usage", "paint_tab": None, "sessions": [], "sessions_at": 0.0, "sessions_filt": "",
+             "work": [], "work_at": 0.0,
              "slack": ((load_slack_webhook(), load_slack_delay())
                        if watch_mode and not json_mode and not compact else ("", 0))}
 
@@ -5554,7 +5580,7 @@ def main():
         return True
 
     def set_pet_mood():
-        """会话在等你最优先，其次升级选项（选完就让开），其余按用量；git checkout 里闲着时提一句底下有更新提示。"""
+        """优先级：会话在等你 > 升级选项 > 用量情绪（轮到说时）> 在干活的会话 > 其余。"""
         if state.get("attention"):   # 刚按过键：固定显示选中的那个会话，不轮播
             # 有能在宠物上决定的框：气泡固定显示 👉 选中的那个，数字键按的就是气泡上这个；都不能决定时才轮播
             w    = focused()
@@ -5571,6 +5597,9 @@ def main():
         age = now - state["usage_since"]
         if mood[0] != "idle" and age >= USAGE_MOOD_FIRST and (age - USAGE_MOOD_FIRST) % USAGE_MOOD_EVERY >= USAGE_MOOD_SHOW:
             mood = ("idle", None)                # 没轮到就做日常小动作
+        if mood[0] == "idle" and state.get("work"):   # 用量情绪没轮到说时，轮播在干活的会话
+            state["pet"].set_mood("work", work_bubble(state["work"]))
+            return
         if mood[0] == "idle" and state.get("update_hint") and not state.get("can_update"):
             mood = ("encourage", "有新版本啦，看看底下～")
         state["pet"].set_mood(*mood)
@@ -5880,6 +5909,14 @@ def main():
                 reload_sessions()
             paint()          # 文本没变时 paint 自己会跳过写入
         elif pet_mode and state["pet_visible"]:
+            if not state.get("busy") and now - state.get("work_at", 0) >= PET_WORK_SCAN_SEC:
+                state["work_at"] = now   # 用量页也扫会话，宠物才知道谁在干活；会话页自己有 reload_sessions
+                try:
+                    state["work"] = work_sessions(live_sessions(decided=state["decided"]))
+                except Exception:     # 扫会话出任何错都不能影响 watch
+                    state["work"] = []
+                if not state.get("attention"):
+                    set_pet_mood()
             if shutil.get_terminal_size() != state["size"]:
                 paint()      # 终端尺寸变了：整屏重排
             elif state["place"]:
