@@ -3,7 +3,7 @@
 see-balance — query usage/balance for AI providers.
 
   DeepSeek    : GET  api.deepseek.com/user/balance            (API key)
-  Codex       : GET  chatgpt.com/backend-api/wham/usage       (~/.codex/auth.json)
+  Codex       : GET  chatgpt.com/backend-api/wham/usage       (~/.codex/auth.json; optional remote via ssh)
   Claude      : GET  api.anthropic.com/api/oauth/usage        (Keychain OAuth)
   Antigravity : POST daily-cloudcode-pa.googleapis.com        (Keychain / Google OAuth)
   Grok (xAI)  : GET  cli-chat-proxy.grok.com/v1/billing       (~/.grok/auth.json or XAI_API_KEY)
@@ -30,10 +30,10 @@ Usage:
   u installs a downloaded update and restarts, q quits.
 
 Config:
-  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, SEE_BALANCE_SESSIONS, SLACK_WEBHOOK_URL, and proxy settings here
+  ~/.see-balance.env   — put DEEPSEEK_API_KEY, XAI_API_KEY, SEE_BALANCE_SESSIONS, SLACK_WEBHOOK_URL, SEE_BALANCE_CODEX_REMOTE, and proxy settings here
   State cached at:     ~/.see-balance/state.json
 
-No secrets ever leave this machine.
+No secrets ever leave this machine. A remote Codex access token is read and sent only on that host.
 """
 
 import base64, hashlib, http.client, io, json, math, os, random, re, select, shlex, shutil, signal, socket, ssl, stat, subprocess, sys, tempfile, threading, time, unicodedata
@@ -47,7 +47,7 @@ try:
 except ImportError:
     termios = tty = None
 
-__version__ = "1.8.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
+__version__ = "1.9.0"   # 自动更新拿上游 main 上的这个号比新旧：要推给用户的改动记得调大
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 STATE_FILE = Path(os.environ.get("SEE_BALANCE_STATE") or (Path.home() / ".see-balance" / "state.json"))   # 可用 SEE_BALANCE_STATE 覆盖（测试/多账号）
@@ -80,7 +80,9 @@ if _PROXY_URL:
     _handlers.insert(0, ProxyHandler({"https": _PROXY_URL, "http": _PROXY_URL}))
 install_opener(build_opener(*_handlers))
 
-HTTP_TIMEOUT           = 15
+HTTP_TIMEOUT             = 15
+CODEX_REMOTE_TTL         = 60   # 秒。--watch 里 collect 若在这一分钟内又跑，远程结果直接复用，不每次干等 ssh
+CODEX_REMOTE_SSH_TIMEOUT = 20
 CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_CODE_USER_AGENT = "claude-code/2.1.121"
 AGY_CLIENT_ID          = os.environ.get("AGY_CLIENT_ID") or bytes([b ^ 0x5a for b in bytes.fromhex("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")]).decode()
@@ -222,6 +224,55 @@ def load_slack_delay():
     except (TypeError, ValueError):
         return SLACK_DELAY_DEFAULT
     return n if n >= 0 else SLACK_DELAY_DEFAULT
+
+# 拒绝会让 ssh 把参数当成选项、或经 shell 转义的写法。调用走参数列表，不用 shell。
+_CODEX_REMOTE_META = frozenset(";&|<>`$\\\"'*?[]{}!#~()")
+
+def _codex_remote_piece_ok(s):
+    """user / host / label：非空、不以 - 开头、没有空白或 shell 元字符。"""
+    if not s or s[0] == "-":
+        return False
+    for ch in s:
+        if ch.isspace() or ch in _CODEX_REMOTE_META or ord(ch) < 32:
+            return False
+    return True
+
+def load_codex_remotes():
+    """SEE_BALANCE_CODEX_REMOTE：`[label=]user@host`，逗号分隔。
+
+    环境变量优先，空着再看 ~/.see-balance.env。没设或空着返回 []（功能关闭）。
+    label 省略时用 host。某一段不合法就记成 error，不连那一台。
+    """
+    val = os.environ.get("SEE_BALANCE_CODEX_REMOTE", "")
+    if not val and ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("SEE_BALANCE_CODEX_REMOTE="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not (val or "").strip():
+        return []
+    out = []
+    for part in val.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        label, target = None, part
+        if "=" in part:
+            label, target = part.split("=", 1)
+            label, target = label.strip(), target.strip()
+        user = host = ""
+        if target.count("@") == 1:
+            user, host = target.split("@", 1)
+        ok = (_codex_remote_piece_ok(target) and _codex_remote_piece_ok(user)
+              and _codex_remote_piece_ok(host)
+              and (label is None or _codex_remote_piece_ok(label)))
+        if not ok:
+            shown = label if label and _codex_remote_piece_ok(label) else "invalid"
+            out.append({"label": shown, "error": "invalid SEE_BALANCE_CODEX_REMOTE"})
+            continue
+        out.append({"label": host if label is None else label, "target": target})
+    return out
 
 def load_state():
     if STATE_FILE.exists():
@@ -610,6 +661,29 @@ def fetch_deepseek():
 
 # ── Codex ─────────────────────────────────────────────────────────────────────
 
+def _parse_codex_usage(obj, tokens):
+    """把 wham/usage 按窗口时长归进 5h / 7d。tokens 只用来补 email，远程调用传 {}。
+
+    按窗口长度而不是位置分类：套餐不同，窗口也不同（例如 prolite 只把 7d 放在
+    primary_window，secondary_window 为 null），所以 primary/secondary ≠ 5h/7d。
+    """
+    rl = obj.get("rate_limit") or {}
+    windows = {}
+    for key in ("primary_window", "secondary_window"):
+        d = rl.get(key)
+        if not isinstance(d, dict): continue
+        secs = d.get("limit_window_seconds")
+        if secs == 5 * 3600:        slot = "five_hour"
+        elif secs == 7 * 24 * 3600: slot = "weekly"
+        elif secs is None:          slot = "five_hour" if key == "primary_window" else "weekly"
+        else:                       continue
+        pct = d.get("used_percent", 0) or 0
+        windows[slot] = {"pct": round(max(0.0, min(100.0, float(pct))), 1),
+                         "reset_at": parse_reset(d.get("reset_at"))}
+    tokens = tokens or {}
+    return {"plan": obj.get("plan_type"), "account": obj.get("email") or _jwt_email(tokens.get("id_token")),
+            "five_hour": windows.get("five_hour"), "weekly": windows.get("weekly")}
+
 def fetch_codex():
     path = os.path.expanduser("~/.codex/auth.json")
     try:
@@ -627,25 +701,7 @@ def fetch_codex():
         raw = obj.get("_transport_error", f"http {status}") if isinstance(obj, dict) else f"http {status}"
         err = "timeout (需要代理访问 chatgpt.com)" if "timed out" in raw else raw
         return {"error": err}
-
-    # Classify windows by their length, not by position: plans differ in which
-    # windows they have (e.g. prolite returns only a 7d window as primary_window
-    # and secondary_window=null), so primary/secondary ≠ 5h/7d.
-    rl = obj.get("rate_limit") or {}
-    windows = {}
-    for key in ("primary_window", "secondary_window"):
-        d = rl.get(key)
-        if not isinstance(d, dict): continue
-        secs = d.get("limit_window_seconds")
-        if secs == 5 * 3600:        slot = "five_hour"
-        elif secs == 7 * 24 * 3600: slot = "weekly"
-        elif secs is None:          slot = "five_hour" if key == "primary_window" else "weekly"
-        else:                       continue
-        pct = d.get("used_percent", 0) or 0
-        windows[slot] = {"pct": round(max(0.0, min(100.0, float(pct))), 1),
-                         "reset_at": parse_reset(d.get("reset_at"))}
-    return {"plan": obj.get("plan_type"), "account": obj.get("email") or _jwt_email(tokens.get("id_token")),
-            "five_hour": windows.get("five_hour"), "weekly": windows.get("weekly")}
+    return _parse_codex_usage(obj, tokens)
 
 def _jwt_email(token):
     """只解码 JWT payload 取 email 用于显示，不校验签名。"""
@@ -655,6 +711,111 @@ def _jwt_email(token):
         return claims.get("email") if isinstance(claims, dict) else None
     except (AttributeError, IndexError, ValueError):
         return None
+
+# 在远程机器上跑：读它自己的 ~/.codex/auth.json，请求 wham/usage，只把 JSON 打到 stdout。
+# access token 不回传。给 python3 - 用，所以顶格、兼容 3.9。
+_CODEX_REMOTE_PY = """\
+import json, os, urllib.request
+from urllib.error import HTTPError, URLError
+
+path = os.path.expanduser("~/.codex/auth.json")
+try:
+    with open(path) as f:
+        token = (json.load(f).get("tokens") or {}).get("access_token")
+except (OSError, ValueError, AttributeError):
+    token = None
+if not token:
+    print(json.dumps({"error": "no codex auth (run: codex login)"}))
+    raise SystemExit(0)
+req = urllib.request.Request(
+    "https://chatgpt.com/backend-api/wham/usage",
+    headers={"Authorization": "Bearer " + token},
+)
+try:
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        raw, status = resp.read(), resp.getcode()
+except HTTPError as e:
+    raw, status = e.read(), e.code
+except (URLError, OSError, TimeoutError) as e:
+    msg = str(getattr(e, "reason", e))
+    err = "timeout" if "timed out" in msg.lower() else msg
+    print(json.dumps({"error": err}))
+    raise SystemExit(0)
+if status == 401:
+    print(json.dumps({"error": "codex auth expired (run: codex login)"}))
+    raise SystemExit(0)
+try:
+    obj = json.loads(raw.decode("utf-8", "replace"))
+except (ValueError, AttributeError):
+    obj = None
+if status != 200 or not isinstance(obj, dict):
+    print(json.dumps({"error": "http %s" % status}))
+else:
+    print(json.dumps(obj))
+"""
+
+_codex_remote_cache = {}   # target -> (monotonic, 解析后的用量或 {"error"})
+
+def _codex_remote_err(text, fallback):
+    line = ""
+    for ln in reversed(str(text or "").splitlines()):
+        ln = "".join(ch for ch in ln.strip() if ch.isprintable())
+        ln = " ".join(ln.split())
+        if ln:
+            line = ln
+            break
+    if len(line) > 200:
+        line = line[:200]
+    return line or fallback
+
+def _fetch_codex_remote_once(target):
+    """ssh 到 target，stdin 送脚本，stdout 的用量 JSON 在本地用 _parse_codex_usage 解析。"""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "StrictHostKeyChecking=yes", target, "python3", "-"]
+    try:
+        proc = subprocess.run(cmd, input=_CODEX_REMOTE_PY, capture_output=True, text=True,
+                              errors="replace", timeout=CODEX_REMOTE_SSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return {"error": "ssh timeout"}
+    except (OSError, ValueError) as e:
+        return {"error": _codex_remote_err(e, "ssh failed")}
+    if proc.returncode != 0:
+        return {"error": _codex_remote_err(proc.stderr, f"ssh exit {proc.returncode}")}
+    try:
+        obj = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return {"error": "remote output not json"}
+    if not isinstance(obj, dict):
+        return {"error": "remote output not json"}
+    if "error" in obj and "rate_limit" not in obj:
+        return {"error": _codex_remote_err(obj.get("error"), "remote error")}
+    try:
+        return _parse_codex_usage(obj, {})
+    except (TypeError, ValueError, AttributeError):
+        return {"error": "bad usage json"}
+
+def fetch_codex_remotes():
+    """没配置返回 None（collect 不写这个字段）。配了就逐台查，约 60 秒内复用内存缓存。"""
+    specs = load_codex_remotes()
+    if not specs:
+        return None
+    now, out = time.monotonic(), []
+    for spec in specs:
+        if "target" not in spec:
+            out.append({"label": spec.get("label") or "invalid",
+                        "error": spec.get("error") or "invalid SEE_BALANCE_CODEX_REMOTE"})
+            continue
+        target = spec["target"]
+        hit = _codex_remote_cache.get(target)
+        if hit and now - hit[0] < CODEX_REMOTE_TTL:
+            row = dict(hit[1])
+        else:
+            row = _fetch_codex_remote_once(target)
+            _codex_remote_cache[target] = (now, row)
+            row = dict(row)
+        row["label"] = spec["label"]
+        out.append(row)
+    return out
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 
@@ -1599,7 +1760,7 @@ def dispatch_advice(data, now=None, hist=None):
     return lines
 
 
-def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None, oc=None):
+def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None, oc=None, codex_remote=None):
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [f"══════════  Provider Balance  •  {now}  ══════════", ""]
 
@@ -1636,6 +1797,20 @@ def render_all(ds, cx, cl, agy, gr, prev_snap, today_bl: dict, hist=None, oc=Non
         if b: lines.append(b)
         if a: lines.append(a)
     lines.append("")
+
+    for item in codex_remote or []:
+        label = item.get("label") or "?"
+        lines.append(f"  🟢 Codex @{label}")
+        if "error" in item:
+            lines.append(f"     ⚠ {item['error']}")
+        else:
+            if item.get("account"): lines.append(f"     account     {item['account']}")
+            if item.get("plan"): lines.append(f"     plan        {item['plan']}")
+            lines.append(f"     5h used     {window_pct_bar(item.get('five_hour')) if item.get('five_hour') else '— (当前套餐无 5h 窗口)'}")
+            lines.append(f"     7d used     {window_pct_bar(item.get('weekly')) if item.get('weekly') else '— (当前套餐无 7d 窗口)'}")
+            p = pace_line(item.get("weekly") or {}, 7 * 24 * 3600)
+            if p: lines.append(p)
+        lines.append("")
 
     lines.append("  🟣 Claude Code (Max 200)")
     if "error" in cl:
@@ -1816,6 +1991,28 @@ def opencode_lines(oc):
     lines.append("     note        " + (oc.get("note") or "按 opencode 本地记录估算；余额请到 console.anthropic.com 查看"))
     return lines
 
+def _print_codex_remote_compact(item):
+    """紧凑行，样子跟 CX 一样，但不走历史速率 / 当日基线。"""
+    label = item.get("label") or "?"
+    if "error" in item:
+        print(f"CX@{label} ⚠ {item['error']}")
+        return
+    plan = f"[{item.get('plan', '?')}]" if item.get("plan") else ""
+    parts = [f"CX@{label} {plan}".strip()]
+    has_window = False
+    for key, lbl, total in (("five_hour", "5h", 5 * 3600), ("weekly", "7d", 7 * 24 * 3600)):
+        w = item.get(key)
+        if not w or w.get("pct") is None:
+            continue
+        has_window = True
+        left = fmt_countdown(w["reset_at"] - time.time() if w.get("reset_at") else 0)
+        p = pace_line(w, total)
+        pace = (" " + p.strip()) if p else ""
+        parts.append(f"{lbl}: {w['pct']}% ({left}){pace}")
+    if not has_window:
+        parts.append("✓ online")
+    print("  ".join(parts))
+
 def render_compact(data, prev_snap, today_bl: dict, hist=None):
     ds  = data.get("deepseek", {})
     cx  = data.get("codex", {})
@@ -1891,6 +2088,9 @@ def render_compact(data, prev_snap, today_bl: dict, hist=None):
             if provider.get("warning"):
                 parts.append(f"⚠ {provider['warning']}")
             print("  ".join(parts))
+        if pkey == "codex":
+            for item in data.get("codex_remote") or []:
+                _print_codex_remote_compact(item)
 
     oc = data.get("opencode")
     if oc is not None:
@@ -5486,6 +5686,11 @@ def collect(update=True):
         "grok":     fetch_grok(),
         "opencode": fetch_opencode(),
     }
+    # 未设置 SEE_BALANCE_CODEX_REMOTE 时不写这个字段，json / 状态文件都和以前一样。
+    # --watch 的动画拍不调用 collect（只在刷新时调用）；60 秒缓存盖住短间隔和连按 r。
+    remotes = fetch_codex_remotes()
+    if remotes is not None:
+        data["codex_remote"] = remotes
     if update:
         data["update"] = check_update(load_state().get("update"))
     return data
@@ -6102,7 +6307,8 @@ def main():
                 body = buf.getvalue().rstrip("\n")
             else:
                 body = render_all(data["deepseek"], data["codex"], data["claude"], data["agy"], data["grok"],
-                                  prev_data, today_bl, hist, oc=data.get("opencode"))
+                                  prev_data, today_bl, hist, oc=data.get("opencode"),
+                                  codex_remote=data.get("codex_remote"))
             if interactive:
                 state["body"] = body
                 paint()
