@@ -26,13 +26,15 @@ DEEPSEEK_API_KEY=sk-your-key-here
 # 可选：有事在等你时发 Slack（见「Slack 提醒」）
 # SLACK_WEBHOOK_URL=https://hooks.slack.com/...
 # SEE_BALANCE_SLACK_DELAY=60
+# 可选：另一台机器的 Codex 额度（见「远程 Codex」）。token 留在那台机器上。
+# SEE_BALANCE_CODEX_REMOTE=jason@100.107.243.106
 
 # 如需代理（VPN 场景）：
 # HTTPS_PROXY=http://127.0.0.1:7890
 ```
 
 - **DeepSeek key**：[platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
-- **Codex**：自动读取 `~/.codex/auth.json`（运行 `codex login` 生成）
+- **Codex**：自动读取 `~/.codex/auth.json`（运行 `codex login` 生成）。另一台机器的额度见「远程 Codex」。
 - **Claude Code**：自动读取 macOS Keychain（`claude /login` 登录后自动写入）；Keychain 条目缺失或为空时回退到 `~/.claude/.credentials.json`（遵循 `CLAUDE_CONFIG_DIR`）
 - **Grok (xAI)**：自动读取 `~/.grok/auth.json`（运行 `grok` / `grok login` 生成）或 `XAI_API_KEY`，直连 `cli-chat-proxy.grok.com` 查询：
   - **主周池**（Chat · Imagine · Voice · Build）：7d 使用百分比、进度与重置倒计时；
@@ -53,6 +55,21 @@ DEEPSEEK_API_KEY=sk-your-key-here
 
 配额单位是 `remainingFraction`（**按 token 成本扣，不是请求次数**）。官方从没公布 5h 的数值阈值，只说过 *"refreshed every five hours until the weekly limit is reached"*。
 > ⚠️ 旧版本会把 free-tier 推销文案里的 “1,500 requests/day with Gemini CLI” 当成 AGY 配额 —— 那是 Gemini CLI / Code Assist 的口径，与 Antigravity agent 的配额不是一回事，已在 2026-10-03 修正。本地日志统计的请求数现在单独列为「本地计数」，仅作参考。
+
+## 远程 Codex
+
+看另一台已经登录 Codex 的机器的额度，显示在本机 Codex 旁边（完整视图是 `🟢 Codex @label`，紧凑视图是 `CX@label`）。没设下面这个变量时不连接，输出和以前一样。
+
+环境变量或 `~/.see-balance.env`，格式是 `[label=]user@host`，多台用逗号分隔。label 省略时用 host：
+
+```bash
+SEE_BALANCE_CODEX_REMOTE=jason@100.107.243.106
+SEE_BALANCE_CODEX_REMOTE=box=jason@100.107.243.106,other=user@host
+```
+
+值不能以 `-` 开头，也不能含空格或 shell 元字符；不合法的那一段显示 ⚠，其余照常查。
+
+查询在远程机器上执行：本机通过 `ssh` 把一段 Python 送到远程的 `python3 -`，由远程读取它自己的 `~/.codex/auth.json`，再请求 `https://chatgpt.com/backend-api/wham/usage`。access token 不会拷到这台机器，也不会出现在输出里；本机只解析用量 JSON。连不上、超时、401、远程没有 Codex 登录时，该行显示 ⚠，不影响其余 provider。`--watch` 里大约 60 秒内的再次刷新会沿用上一次的远程结果。
 
 ## 使用
 
@@ -307,6 +324,7 @@ SEE_BALANCE_SLACK_DELAY=60
 | `SEE_BALANCE_UPDATE_URL` | 换一个更新源（测试用） |
 | `SEE_BALANCE_CLAUDE_SETTINGS` | `--install-hooks` 改哪个 settings 文件（默认 `~/.claude/settings.json`，测试用） |
 | `SEE_BALANCE_CNY_DAILY_CAP` | DeepSeek 当日人民币闸门（例 `9`），设了就会给「安全 / 会超」判定 |
+| `SEE_BALANCE_CODEX_REMOTE` | 远程 Codex 额度，`[label=]user@host`，逗号分隔多台。查询在远程执行，token 不离开那台机器。没设则关闭 |
 | `HTTPS_PROXY` | 访问 api.deepseek.com / chatgpt.com 的代理 |
 
 速率的可信度取决于采样密度：`--watch 15` 下几小时内就很准；只跑两次相隔 1 分钟是看不到速率的（跨度 < 3 分钟直接不出值，避免噪声）。
@@ -326,6 +344,7 @@ python3 ~/bin/provider_balance.py --version   # 看当前版本
 
 | 版本 | 内容 |
 |---|---|
+| 1.9.0 | 远程 Codex 额度：`SEE_BALANCE_CODEX_REMOTE` 经 ssh 在那台机器上查 wham/usage，token 不拷到本机；完整视图和紧凑视图各加一块。没设则和以前一样 |
 | 1.8.0 | 宠物轮播工作中的会话：用量页有 Claude Code / Grok 会话在跑工具、思考或等子 agent 时，宠物敲键盘，气泡每 4 秒换一个会话，显示项目、标题和在做什么 |
 | 1.7.0 | Slack 提醒：`--watch` 发现有事等你超过 60 秒（`SEE_BALANCE_SLACK_DELAY` 可改）就用 Incoming Webhook（`SLACK_WEBHOOK_URL`）发一条，只写谁在等、等哪一类，不带问题、命令和提醒正文；每条只发一次；`--slack-test` 测试 webhook |
 | 1.6.0 | 外部提醒：别的本机程序往 `~/.see-balance/notices/` 放 JSON，宠物可以叫你（alert）或只在底部显示状态（status）；按键动作只来自你自己的 `~/.see-balance/actions.json`，提醒文件里不能带命令 |
