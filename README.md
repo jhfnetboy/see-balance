@@ -1,6 +1,6 @@
 # see-balance
 
-查看 DeepSeek / Codex / Claude Code / Antigravity (AGY) / Grok (xAI) / OpenCode (Anthropic API key) 六个 AI provider 的余额和用量。
+查看 DeepSeek / Codex / Claude Code / Grok (xAI) / OpenCode (Anthropic API key) 五个 AI provider 的余额和用量。
 
 ## 安装
 
@@ -44,17 +44,6 @@ DEEPSEEK_API_KEY=sk-your-key-here
   - **花费**：从 opencode 本地库 `opencode.db` 只读累加 Anthropic 回复记下的 cost / tokens，显示今天 / 近 7 天 / 近 30 天（只算这台机器上 opencode 的用量，同一个 key 在别处的消耗不在内）；
   - **过期时间（可选）**：在 `~/.see-balance.env` 里加 `ANTHROPIC_ADMIN_KEY=sk-ant-admin...`（[Console → Admin keys](https://platform.claude.com/settings/admin-keys) 创建，需要组织 admin 权限），就会用 Admin API 按 key 的前后缀对上这个 key，显示名称和到期时间，离过期不足 7 天时标 ⚠。普通 API key 查不了自己的过期时间；
   - 用 Claude 订阅（OAuth）登录的，额度和 Claude Code 共用，只显示本地花费估算。
-- **Antigravity (AGY)**：自动读取 macOS Keychain / Google OAuth 凭据，识别 `paidTier` 套餐；直连服务端 `retrieveUserQuotaSummary` 读真实配额。
-
-两个互不相通的池，各自带 **5h + weekly** 两个窗口：
-
-| 池 | bucketId | 覆盖 |
-|---|---|---|
-| Gemini 池 | `gemini-5h` / `gemini-weekly` | Gemini Flash / Pro |
-| Claude·GPT 池（3P） | `3p-5h` / `3p-weekly` | Claude Opus / Sonnet / GPT-OSS |
-
-配额单位是 `remainingFraction`（**按 token 成本扣，不是请求次数**）。官方从没公布 5h 的数值阈值，只说过 *"refreshed every five hours until the weekly limit is reached"*。
-> ⚠️ 旧版本会把 free-tier 推销文案里的 “1,500 requests/day with Gemini CLI” 当成 AGY 配额 —— 那是 Gemini CLI / Code Assist 的口径，与 Antigravity agent 的配额不是一回事，已在 2026-10-03 修正。本地日志统计的请求数现在单独列为「本地计数」，仅作参考。
 
 ## 远程 Codex
 
@@ -130,7 +119,7 @@ Claude Code / Grok CLI 的会话在等你做决定时，宠物会挥手提醒你
 - hook 只往 `~/.see-balance/attention.jsonl` 追加一行：会话 id、目录、事件类型和一小段说明（权限提示文字或最后那句问话）。决策框另记要你决定的内容：问题和选项、命令 / 文件路径 / 网址，或计划的第一行，每项截到 200 字以内；不记工具输出，也不记计划全文。日志文件只有你能读（0600）。显示前会去掉其中的控制字符，会话里的文字改不了你的终端。
 - 宠物上的优先级：会话提醒 > 升级选项 > 用量情绪 > 工作中的会话 > 日常小动作。
 - 日志超过 1MB 时轮换，只保留 12 小时内的记录，还在等的提醒不会丢。
-- Codex、Antigravity 暂时没有可靠的“在等你”信号，还不支持。
+- Codex 暂时没有可靠的“在等你”信号，还不支持。
 
 ## 外部提醒
 
@@ -287,13 +276,13 @@ SEE_BALANCE_SLACK_DELAY=60
 ![screenshot](screenshot.jpg)
 
 每个 provider 显示进度条与节奏分析：
-- **5h used / 7d used** — 各窗口用量（AGY 按池分开显示 G-5h / G-7d / 3P-5h / 3P-7d）
+- **5h used / 7d used** — 各窗口用量
 - **进度应达** — 线性时间进度应达百分比 + 当前进度超前/还差评估
 - **节奏评估** — 🟢 节奏正常 / 🟡 偏快需注意 / 🔴 超速需节约 / 🔴 偏慢可加速（附已过时间、当前消耗与到期预计）
 - **实测消耗** — 从历史快照算出的真实速率：`+1.4%/h`（额度窗口）或 `¥0.69/h`（DeepSeek 现金）；紧跟在哪个窗口（5h / 7d）下面，说的就是哪个窗口
 - **建议** — 把速率翻译成结论：**能不能撑到重置**（`⚠ 2.6h 后见底，比重置早 56h`）或在闸门内（`今日将花 ¥13.52（闸门 ¥9.00 ⚠ 会超）`）
 - **增量消费** — 两次查询之间的新增消费
-- **🧭 调度建议** — 把几家订阅（Claude / Codex / Grok 主池 / AGY 两个池）的 7d 窗口放一起看，只在有话可说时出现：
+- **🧭 调度建议** — 把几家订阅（Claude / Codex / Grok 主池）的 7d 窗口放一起看，只在有话可说时出现：
   - `⚠` 某家照这样到期要超 120%，或 `⛔` 周额度 / 5h 额度用光 → 推荐一家有余量的订阅试试（快重置还剩很多的优先，其次看到期能空出多少）
   - `⏰` 不到 24h 就重置、照现在的速度会空着 ≥ 20% → 建议放开用：高 effort、最强模型、`/fast` 加速、多开并行 agent
   - `💤` 预计到期只用 ≤ 75% 且还剩 ≥ 30% → 建议多给它点活儿
